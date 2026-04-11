@@ -110,6 +110,7 @@ def run_llm_opportunity_pipeline(
     for m in markets:
         s = summarize_market_row(m)
         ticker = s.ticker
+        print(f"llm-trade: {ticker} …", flush=True)
         try:
             ob = get_orderbook(client, ticker)
         except Exception as exc:  # noqa: BLE001

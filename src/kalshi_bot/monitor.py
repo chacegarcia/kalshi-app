@@ -198,8 +198,6 @@ def start_dashboard(settings: Settings) -> threading.Thread | None:
     if not settings.dashboard_enabled:
         return None
 
-    app = _create_app()
-
     def _run() -> None:
         app.run(
             host=settings.dashboard_host,
@@ -221,3 +219,7 @@ def start_dashboard(settings: Settings) -> threading.Thread | None:
 def heartbeat(note: str = "") -> None:
     """Optional periodic ping so the page shows activity even without orders."""
     record_event("heartbeat", note=note or "running")
+
+
+# WSGI entrypoint for gunicorn / uwsgi. Same Flask instance as ``start_dashboard`` (in-memory events).
+app = _create_app()
