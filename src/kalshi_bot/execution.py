@@ -151,7 +151,8 @@ def execute_intent(
             log.info(
                 "notional_sweep_step",
                 ticker=intent.ticker,
-                target_usd=min_n,
+                min_notional_usd=min_n,
+                cap_notional_usd=max_n,
                 sweep=settings.trade_notional_sweep_usd,
             )
 

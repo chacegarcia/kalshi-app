@@ -16,7 +16,7 @@ from kalshi_bot.client import KalshiSdkClient
 
 from kalshi_bot.ssl_bundle import apply_certifi_ca_bundle
 from kalshi_bot.auth import AuthError, build_kalshi_auth
-from kalshi_bot.auto_sell import run_auto_sell_loop
+from kalshi_bot.auto_sell import auto_sell_scan_all_long_yes, run_auto_sell_loop
 from kalshi_bot.backtest import load_price_records_jsonl, parameter_sweep, run_rule_backtest, walk_forward_eval
 from kalshi_bot.config import Settings, get_settings, project_root
 from kalshi_bot.execution import (
@@ -25,7 +25,7 @@ from kalshi_bot.execution import (
     cancel_stale_orders,
     execute_intent,
 )
-from kalshi_bot.logger import get_logger
+from kalshi_bot.logger import StructuredLogger, get_logger
 from kalshi_bot.market_data import list_open_markets, summarize_market_row
 from kalshi_bot.metrics import NO_GUARANTEE_DISCLAIMER, fee_slippage_sensitivity
 from kalshi_bot.scanner import format_scan_report, scan_kalshi_opportunities
@@ -43,6 +43,27 @@ from kalshi_bot.ws import KalshiWS
 def _client_for_balance(settings: Settings, dash_client: KalshiSdkClient | None) -> KalshiSdkClient:
     """Reuse dashboard client or build one so balance prints even without --web."""
     return dash_client if dash_client is not None else build_sdk_client(settings)
+
+
+def _maybe_exit_scan_after_pass(settings: Settings, client: KalshiSdkClient, log: StructuredLogger) -> None:
+    """After a trading pass summary, optionally scan all long YES and submit take-profit sells (TRADE_EXIT_*)."""
+    if not settings.trade_auto_sell_after_each_pass:
+        return
+    try:
+        n, lines = auto_sell_scan_all_long_yes(
+            client, settings, cli_min_yes_bid_cents=None, log=log
+        )
+    except ValueError as exc:
+        print(f"exit-scan skipped: {exc}", flush=True)
+        return
+    print("--- exit scan (take-profit) ---", flush=True)
+    if n == 0 and not lines:
+        print(
+            "exit-scan: no sells (no long YES, or bid/entry rules not met — tune TRADE_EXIT_* / TRADE_TAKE_PROFIT_*).",
+            flush=True,
+        )
+    for line in lines:
+        print(line, flush=True)
 
 
 def cmd_llm_trade(
@@ -88,7 +109,9 @@ def cmd_llm_trade(
             print(f"Orders submitted this run (0 = none or scan-only): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
-            print_portfolio_balance_line(_client_for_balance(settings, dash_client))
+            bal_client = _client_for_balance(settings, dash_client)
+            print_portfolio_balance_line(bal_client)
+            _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
@@ -138,7 +161,9 @@ def cmd_discover_trade(
             print(f"Orders submitted this run (0 = none): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
-            print_portfolio_balance_line(_client_for_balance(settings, dash_client))
+            bal_client = _client_for_balance(settings, dash_client)
+            print_portfolio_balance_line(bal_client)
+            _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
@@ -192,7 +217,9 @@ def cmd_tape_trade(
             print(f"Orders submitted this run (0 = none): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
-            print_portfolio_balance_line(_client_for_balance(settings, dash_client))
+            bal_client = _client_for_balance(settings, dash_client)
+            print_portfolio_balance_line(bal_client)
+            _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)

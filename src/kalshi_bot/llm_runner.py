@@ -35,6 +35,7 @@ class LLMTradeRunStats:
     skip_no_bids: int = 0
     llm_no_verdict: int = 0
     llm_declined: int = 0
+    llm_fair_ask_override: int = 0
     bot_math_rejected: int = 0
     skip_low_volume: int = 0
     momentum_llm_bypass: int = 0
@@ -52,6 +53,7 @@ class LLMTradeRunStats:
             f"  skip (no YES/NO bids):        {self.skip_no_bids}",
             f"  LLM no JSON / API fail:       {self.llm_no_verdict}",
             f"  LLM declined (approve/buy):   {self.llm_declined}  <-- usually #1 when this is high",
+            f"  LLM decline overridden (fair≈ask): {self.llm_fair_ask_override}",
             f"  blocked by bot math (edge):   {self.bot_math_rejected}",
             f"  skip (volume below min):      {self.skip_low_volume}",
             f"  momentum bypass (chart YES):  {self.momentum_llm_bypass}",
@@ -90,6 +92,40 @@ def _passes_bot_edge(
     if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
         return False
     return True
+
+
+def _passes_bot_math_for_llm(
+    settings: Settings,
+    *,
+    fair_yes: float,
+    yes_bid_dollars: float,
+    yes_ask_dollars: float,
+    contracts: int,
+    llm_decline_overridden: bool,
+) -> bool:
+    """Strict fee-edge check, or when LLM declined but fair is near ask, only book-quality checks."""
+    spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
+    if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
+        return False
+    if spread < settings.strategy_min_spread_dollars:
+        return False
+    if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
+        return False
+
+    if (
+        llm_decline_overridden
+        and settings.trade_llm_accept_when_fair_covers_ask
+        and fair_yes >= yes_ask_dollars - settings.trade_llm_fair_ask_slippage
+    ):
+        return True
+
+    return _passes_bot_edge(
+        settings,
+        fair_yes=fair_yes,
+        yes_bid_dollars=yes_bid_dollars,
+        yes_ask_dollars=yes_ask_dollars,
+        contracts=contracts,
+    )
 
 
 def run_llm_opportunity_pipeline(
@@ -275,25 +311,42 @@ def run_llm_opportunity_pipeline(
             reason=verdict.reason[:500],
         )
 
+        llm_decline_overridden = False
         if not verdict.approve or not verdict.buy_yes:
-            stats.llm_declined += 1
-            log.info(
-                "llm_trade_skip_llm_declined",
-                ticker=ticker,
-                approve=verdict.approve,
-                buy_yes=verdict.buy_yes,
-            )
-            continue
+            if (
+                settings.trade_llm_accept_when_fair_covers_ask
+                and verdict.fair_yes >= yes_ask_d - settings.trade_llm_fair_ask_slippage
+            ):
+                llm_decline_overridden = True
+                stats.llm_fair_ask_override += 1
+                log.info(
+                    "llm_trade_decline_overridden",
+                    ticker=ticker,
+                    fair_yes=verdict.fair_yes,
+                    yes_ask_dollars=yes_ask_d,
+                    slippage=settings.trade_llm_fair_ask_slippage,
+                    reason=verdict.reason[:300],
+                )
+            else:
+                stats.llm_declined += 1
+                log.info(
+                    "llm_trade_skip_llm_declined",
+                    ticker=ticker,
+                    approve=verdict.approve,
+                    buy_yes=verdict.buy_yes,
+                )
+                continue
 
         count = max(1, min(verdict.contracts, max_allowed, settings.max_contracts_per_market))
         limit_c = max(1, min(99, min(verdict.limit_yes_price_cents, yes_ask_c)))
 
-        if not _passes_bot_edge(
+        if not _passes_bot_math_for_llm(
             settings,
             fair_yes=verdict.fair_yes,
             yes_bid_dollars=yes_bid_d,
             yes_ask_dollars=yes_ask_d,
             contracts=count,
+            llm_decline_overridden=llm_decline_overridden,
         ):
             stats.bot_math_rejected += 1
             log.info("llm_trade_rejected_by_bot_math", ticker=ticker, fair_yes=verdict.fair_yes)

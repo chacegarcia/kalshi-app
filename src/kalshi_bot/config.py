@@ -148,13 +148,13 @@ class Settings(BaseSettings):
         ),
     )
     trade_min_order_notional_usd: float | None = Field(
-        default=3.0,
+        default=0.0,
         ge=0.0,
         validation_alias=AliasChoices(
             "TRADE_MIN_ORDER_NOTIONAL_USD",
             "trade_min_order_notional_usd",
         ),
-        description="Buy YES: bump contracts to at least this $ at limit (0 = no floor). Requires TRADE_MAX_ORDER_NOTIONAL_USD ≥ this.",
+        description="Buy YES: bump contracts to at least this $ at limit (0 = no floor). Requires TRADE_MAX_ORDER_NOTIONAL_USD ≥ this when both positive.",
     )
     trade_max_order_notional_usd: float | None = Field(
         default=10.0,
@@ -163,15 +163,15 @@ class Settings(BaseSettings):
             "TRADE_MAX_ORDER_NOTIONAL_USD",
             "trade_max_order_notional_usd",
         ),
-        description="Cap buy-YES $ at limit price. Default 10 (pair with min 3 for a 3–10 band); set 0 to disable cap only.",
+        description="Cap buy-YES $ at limit price. Default 10; min default 0 (no floor). Set max 0 to disable cap only.",
     )
     trade_notional_sweep_usd: str | None = Field(
-        default="3,5,7,10",
+        default="1,3,5,7,10",
         validation_alias=AliasChoices(
             "TRADE_NOTIONAL_SWEEP_USD",
             "trade_notional_sweep_usd",
         ),
-        description="Comma-separated USD targets; each buy-Y uses the next value as both min and max notional (round-robin). Empty = use TRADE_MIN/MAX_ORDER_NOTIONAL_USD only.",
+        description="Comma-separated USD caps per order (round-robin); min floor is only TRADE_MIN_ORDER_NOTIONAL_USD. Empty = use TRADE_MIN/MAX_ORDER_NOTIONAL_USD only.",
     )
     strategy_limit_price_cents: int = Field(
         default=50,
@@ -265,12 +265,30 @@ class Settings(BaseSettings):
         description="If set, skip when (YES_ask − YES_bid) exceeds this. Higher = allow wider books (e.g. 0.20–0.35). Omit for no max-spread filter.",
     )
     trade_llm_relaxed_approval: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices(
             "TRADE_LLM_RELAXED_APPROVAL",
             "trade_llm_relaxed_approval",
         ),
-        description="If true, LLM may approve when fair_yes clears edge vs ask; default prompt requires a 'clear mispricing'.",
+        description="If true, more permissive LLM prompt (prefer approve on fair value / small edge). If false, still accumulation-biased but slightly stricter wording.",
+    )
+    trade_llm_accept_when_fair_covers_ask: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_ACCEPT_WHEN_FAIR_COVERS_ASK",
+            "trade_llm_accept_when_fair_covers_ask",
+        ),
+        description="If LLM sets approve/buy_yes false but fair_yes is within slippage of the implied YES ask, still proceed (bot checks book limits).",
+    )
+    trade_llm_fair_ask_slippage: float = Field(
+        default=0.04,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_FAIR_ASK_SLIPPAGE",
+            "trade_llm_fair_ask_slippage",
+        ),
+        description="Override LLM decline when fair_yes >= implied_YES_ask − this (e.g. 0.04 = 4¢).",
     )
     trade_llm_discovery_query: str | None = Field(
         default=None,
@@ -432,6 +450,14 @@ class Settings(BaseSettings):
             "auto_sell_poll_seconds",
         ),
     )
+    trade_auto_sell_after_each_pass: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_AUTO_SELL_AFTER_EACH_PASS",
+            "trade_auto_sell_after_each_pass",
+        ),
+        description="After each llm-trade / discover-trade / tape-trade pass, scan long YES positions and run take-profit (same rules as auto-sell).",
+    )
 
     # Exit quality: implied-% floor, optional profit-margin vs entry, IOC-style sells (Kalshi API TIF)
     trade_exit_take_profit_min_yes_bid_pct: float = Field(
@@ -565,9 +591,11 @@ class Settings(BaseSettings):
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
         "trade_llm_relaxed_approval",
+        "trade_llm_accept_when_fair_covers_ask",
         "trade_discover_auto_execute",
         "trade_tape_auto_execute",
         "trade_balance_sizing_enabled",
+        "trade_auto_sell_after_each_pass",
         mode="before",
     )
     @classmethod

@@ -68,6 +68,129 @@ def _should_fire_exit(
     return False, "wait"
 
 
+def try_auto_sell_exit_for_ticker(
+    client: KalshiSdkClient,
+    settings: Settings,
+    risk: RiskManager,
+    ledger: DryRunLedger | None,
+    ticker: str,
+    *,
+    cli_min_yes_bid_cents: int | None,
+    log: StructuredLogger,
+    log_waits: bool = False,
+) -> str:
+    """One take-profit attempt for ``ticker``. Returns a short outcome tag (e.g. ``sold``, ``wait``, ``no_long_yes``)."""
+    snap = fetch_portfolio_snapshot(client, ticker=ticker)
+    signed = snap.positions_by_ticker.get(ticker, 0.0)
+    if signed <= 0:
+        if log_waits:
+            log.info("auto_sell_skip", reason="no_long_yes", ticker=ticker, signed=signed)
+        return "no_long_yes"
+
+    entry_ref = _resolve_entry_reference_yes_cents(settings, client, ticker, log)
+    if (
+        settings.trade_exit_min_profit_cents_per_contract is not None
+        and entry_ref is None
+        and not settings.trade_exit_only_profit_margin
+    ):
+        log.warning(
+            "auto_sell_no_entry_reference",
+            ticker=ticker,
+            hint="set TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS or enable TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO",
+        )
+
+    ob = get_orderbook(client, ticker)
+    best = best_yes_bid_cents(ob)
+    if best is None:
+        if log_waits:
+            log.info("auto_sell_skip", reason="no_yes_bids", ticker=ticker)
+        return "no_yes_bids"
+
+    fire, reason = _should_fire_exit(
+        best_bid_cents=best,
+        settings=settings,
+        cli_min_yes_bid_cents=cli_min_yes_bid_cents,
+        entry_ref_cents=entry_ref,
+    )
+    if not fire:
+        if log_waits:
+            eff = settings.auto_sell_effective_min_yes_bid_cents(cli_min_yes_bid_cents)
+            log.info(
+                "auto_sell_wait",
+                ticker=ticker,
+                best_yes_bid_cents=best,
+                effective_min_yes_bid_cents=eff,
+                entry_ref_yes_cents=entry_ref,
+                detail=reason,
+            )
+        return "wait"
+
+    count = min(int(signed), settings.max_contracts_per_market)
+    if count < 1:
+        return "zero_contracts"
+
+    limit_cents = max(1, best - settings.trade_exit_sell_aggression_cents)
+    tif = settings.trade_exit_sell_time_in_force
+
+    intent = make_limit_intent(
+        ticker=ticker,
+        side="yes",
+        action="sell",
+        count=count,
+        yes_price_cents=limit_cents,
+        time_in_force=tif,
+    )
+    log.info(
+        "auto_sell_fire",
+        ticker=ticker,
+        count=count,
+        limit_yes_price_cents=limit_cents,
+        best_yes_bid_cents=best,
+        time_in_force=tif,
+        trigger=reason,
+        aggression_cents=settings.trade_exit_sell_aggression_cents,
+    )
+    trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+    return "sold"
+
+
+def auto_sell_scan_all_long_yes(
+    client: KalshiSdkClient,
+    settings: Settings,
+    *,
+    cli_min_yes_bid_cents: int | None,
+    log: StructuredLogger,
+) -> tuple[int, list[str]]:
+    """For each market with a long YES position, run one take-profit check (same rules as ``auto-sell``).
+
+    Returns ``(sell_count, human_lines)`` for terminal summary.
+    """
+    if settings.trade_exit_only_profit_margin and settings.trade_exit_min_profit_cents_per_contract is None:
+        raise ValueError("TRADE_EXIT_ONLY_PROFIT_MARGIN=true requires TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT")
+
+    risk = RiskManager(settings)
+    ledger = DryRunLedger()
+    snap = fetch_portfolio_snapshot(client, ticker=None)
+    tickers = sorted(t for t, s in snap.positions_by_ticker.items() if s > 0)
+    sold = 0
+    lines: list[str] = []
+    for ticker in tickers:
+        tag = try_auto_sell_exit_for_ticker(
+            client,
+            settings,
+            risk,
+            ledger,
+            ticker,
+            cli_min_yes_bid_cents=cli_min_yes_bid_cents,
+            log=log,
+            log_waits=False,
+        )
+        if tag == "sold":
+            sold += 1
+            lines.append(f"exit-scan: take-profit sell submitted for {ticker}")
+    return sold, lines
+
+
 def run_auto_sell_loop(
     settings: Settings,
     *,
@@ -89,81 +212,25 @@ def run_auto_sell_loop(
 
     while max_cycles == 0 or cycle < max_cycles:
         cycle += 1
-        snap = fetch_portfolio_snapshot(client, ticker=ticker)
-        signed = snap.positions_by_ticker.get(ticker, 0.0)
-        if signed <= 0:
-            log.info("auto_sell_skip", reason="no_long_yes", ticker=ticker, signed=signed)
+        tag = try_auto_sell_exit_for_ticker(
+            client,
+            settings,
+            risk,
+            ledger,
+            ticker,
+            cli_min_yes_bid_cents=cli_min_yes_bid_cents,
+            log=log,
+            log_waits=True,
+        )
+        if tag == "no_long_yes":
             if stop_after_one_sell and sold_once:
                 return
             time.sleep(poll_seconds)
             continue
-
-        entry_ref = _resolve_entry_reference_yes_cents(settings, client, ticker, log)
-        if (
-            settings.trade_exit_min_profit_cents_per_contract is not None
-            and entry_ref is None
-            and not settings.trade_exit_only_profit_margin
-        ):
-            log.warning(
-                "auto_sell_no_entry_reference",
-                ticker=ticker,
-                hint="set TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS or enable TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO",
-            )
-
-        ob = get_orderbook(client, ticker)
-        best = best_yes_bid_cents(ob)
-        if best is None:
-            log.info("auto_sell_skip", reason="no_yes_bids", ticker=ticker)
-            time.sleep(poll_seconds)
-            continue
-
-        fire, reason = _should_fire_exit(
-            best_bid_cents=best,
-            settings=settings,
-            cli_min_yes_bid_cents=cli_min_yes_bid_cents,
-            entry_ref_cents=entry_ref,
-        )
-        if not fire:
-            eff = settings.auto_sell_effective_min_yes_bid_cents(cli_min_yes_bid_cents)
-            log.info(
-                "auto_sell_wait",
-                ticker=ticker,
-                best_yes_bid_cents=best,
-                effective_min_yes_bid_cents=eff,
-                entry_ref_yes_cents=entry_ref,
-                detail=reason,
-            )
-            time.sleep(poll_seconds)
-            continue
-
-        count = min(int(signed), settings.max_contracts_per_market)
-        if count < 1:
-            time.sleep(poll_seconds)
-            continue
-
-        limit_cents = max(1, best - settings.trade_exit_sell_aggression_cents)
-        tif = settings.trade_exit_sell_time_in_force
-
-        intent = make_limit_intent(
-            ticker=ticker,
-            side="yes",
-            action="sell",
-            count=count,
-            yes_price_cents=limit_cents,
-            time_in_force=tif,
-        )
-        log.info(
-            "auto_sell_fire",
-            ticker=ticker,
-            count=count,
-            limit_yes_price_cents=limit_cents,
-            best_yes_bid_cents=best,
-            time_in_force=tif,
-            trigger=reason,
-            aggression_cents=settings.trade_exit_sell_aggression_cents,
-        )
-        trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
-        sold_once = True
-        if stop_after_one_sell:
-            return
+        if tag == "sold":
+            sold_once = True
+            if stop_after_one_sell:
+                return
+        if tag in ("no_yes_bids", "wait", "zero_contracts"):
+            pass
         time.sleep(poll_seconds)

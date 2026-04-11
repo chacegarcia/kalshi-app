@@ -13,15 +13,29 @@ from kalshi_bot.config import Settings
 
 
 def _llm_approval_tail(settings: Settings) -> str:
-    """Last lines of the user prompt: strict (default) vs relaxed (more approvals, still re-checked in code)."""
+    """Approval instructions: default = accumulate small wins; relaxed = even more permissive."""
+    fair_tail = ""
+    if settings.trade_llm_accept_when_fair_covers_ask:
+        fair_tail = (
+            f" You may also approve when fair_yes is within about {settings.trade_llm_fair_ask_slippage:.2f} of the implied "
+            "YES ask (fairly priced favorites / high-confidence sides), not only when there is a large mispricing."
+        )
     if settings.trade_llm_relaxed_approval:
         return (
-            "Set approve=true and buy_yes=true when fair_yes exceeds the implied YES ask by at least the min net edge "
-            "(directional) in the parameters above (after fees), or when the ask is clearly too cheap for the outcome; "
-            "otherwise approve=false. Never invent facts not in the title."
+            "Prefer approve=true and buy_yes=true when fair_yes is at or above the implied YES ask, or when fair_yes clears "
+            "the min net edge after fees from the parameters, or when the ask looks even slightly cheap vs your fair_yes. "
+            "Reserve decline for junk/empty titles, incoherent prices, or when YES is clearly overpriced vs fair_yes. "
+            "Do not decline merely because the edge is small—small edges are the point. Never invent facts not in the title."
+            + fair_tail
         )
     return (
-        "Set approve=false unless you see a clear mispricing vs the book; never invent facts not in the title."
+        "Strategy: accumulate many small positive outcomes over time; the execution layer applies fee and risk checks. "
+        "Set approve=true and buy_yes=true when fair_yes supports buying at or near the implied ask—including modest edge, "
+        "fair value at the ask on favorites, or any reasonable case that is not an obvious overpay. "
+        "Decline only for unusable titles, nonsense prices, or when YES is clearly worse than the ask. "
+        "Bias toward approval when the setup is plausible; do not refuse good-enough trades in search of perfect mispricings. "
+        "Never invent facts not in the title."
+        + fair_tail
     )
 
 
@@ -69,9 +83,9 @@ def llm_evaluate_opportunity(
         return None
 
     bal_s = str(balance_cents) if balance_cents is not None else "unknown"
-    params = f"""Bot parameters (you must respect these in your reasoning; final approval is re-checked in code):
-- Min net edge after fees (directional): {settings.trade_min_net_edge_after_fees} (probability points, ~dollars)
-- Extra edge required near 50% mid: {settings.trade_edge_middle_extra_edge}
+    params = f"""Execution limits (the bot enforces these after your JSON; use them to guide fair_yes and approval, not to default to decline):
+- Target min net edge after fees (0–1 scale on $1 face): {settings.trade_min_net_edge_after_fees}
+- Extra edge suggested near 50% mid: {settings.trade_edge_middle_extra_edge}
 - Max YES ask (dollars): {settings.strategy_max_yes_ask_dollars}
 - Min spread (dollars): {settings.strategy_min_spread_dollars}
 - Max contracts this order (balance-scaled): {max_contracts_allowed}
@@ -84,7 +98,7 @@ Order book (YES): bid={yes_bid_cents}¢ implied ask≈{yes_ask_cents}¢ ({yes_as
 
 {params}
 
-Decide if a long YES is justified. Output ONLY valid JSON:
+Decide on a long YES for an accumulation strategy (many small wins, not only blockbuster mispricings). Output ONLY valid JSON:
 {{"approve": true/false, "fair_yes": 0.0-1.0, "buy_yes": true/false, "limit_yes_price_cents": 1-99, "contracts": 1-{max_contracts_allowed}, "reason": "short text"}}
 {_llm_approval_tail(settings)}"""
 
@@ -151,12 +165,12 @@ Output ONLY valid JSON: {{"watch": true/false, "reason": "short text"}}"""
 
 
 def _openai_chat_json_with_system(
-    api_key: str, model: str, *, system: str, user: str
+    api_key: str, model: str, *, system: str, user: str, temperature: float = 0.15
 ) -> dict[str, Any] | None:
     url = "https://api.openai.com/v1/chat/completions"
     body: dict[str, Any] = {
         "model": model,
-        "temperature": 0.15,
+        "temperature": temperature,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -193,10 +207,13 @@ def _openai_chat_json(api_key: str, model: str, user_content: str) -> dict[str, 
         api_key,
         model,
         system=(
-            "You evaluate Kalshi binary prediction markets. You only see the title and rough prices. "
-            "Be conservative; output strict JSON only."
+            "You evaluate Kalshi binary prediction markets from title and top-of-book prices only. "
+            "The operator wants to accumulate many small winning or fairly priced entries over time—bias toward approving "
+            "when fair_yes aligns with or modestly exceeds the implied ask, not toward declining unless the case is weak. "
+            "Output strict JSON only."
         ),
         user=user_content,
+        temperature=0.22,
     )
 
 

@@ -30,15 +30,25 @@ def parse_notional_sweep_usd(raw: str | None) -> list[float]:
 
 
 def next_buy_yes_notional_min_max(settings: Settings) -> tuple[float | None, float | None]:
-    """Return (min, max) USD notional for this buy-YES order. Sweep rotates targets when configured."""
+    """Return (min, max) USD notional for this buy-YES order.
+
+    When ``TRADE_NOTIONAL_SWEEP_USD`` is set, each step sets a **cap** (target max $ at limit); the **floor** always
+    comes from ``TRADE_MIN_ORDER_NOTIONAL_USD`` only (so 0 = no minimum, sweep does not re-impose a floor).
+    """
+    mn = settings.trade_min_order_notional_usd
+    mx = settings.trade_max_order_notional_usd
     vals = parse_notional_sweep_usd(settings.trade_notional_sweep_usd)
     if not vals:
-        return settings.trade_min_order_notional_usd, settings.trade_max_order_notional_usd
+        return mn, mx
     global _NOTIONAL_SWEEP_I
     with _LOCK:
         t = vals[_NOTIONAL_SWEEP_I % len(vals)]
         _NOTIONAL_SWEEP_I += 1
-    return (t, t)
+    if mx is not None and mx > 0:
+        cap = min(t, mx)
+    else:
+        cap = t
+    return (mn, cap)
 
 
 def effective_max_contracts(
