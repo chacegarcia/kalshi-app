@@ -10,6 +10,7 @@ from kalshi_bot.edge_math import implied_yes_ask_dollars, min_edge_threshold_for
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger, get_logger, maybe_clear_structured_log_after_tickers
 from kalshi_bot.market_data import (
+    TapeUniverseEntry,
     build_llm_trade_open_universe,
     build_tape_universe_for_llm,
     fetch_open_markets_unique_up_to,
@@ -207,14 +208,16 @@ def run_llm_opportunity_pipeline(
 
     rows: list[tuple[str, str]] = []
     open_volumes: dict[str, int | None] = {}
+    tape_entries: list[TapeUniverseEntry] | None = None
     if use_tape_universe:
-        rows, stats.tape_trades_fetched = build_tape_universe_for_llm(
+        tape_entries, stats.tape_trades_fetched = build_tape_universe_for_llm(
             client,
             max_trades_fetch=settings.trade_tape_max_trades_fetch,
             top_markets=settings.trade_tape_top_markets,
             min_flow_usd=settings.trade_tape_min_flow_usd,
             min_market_volume=settings.trade_min_market_volume,
         )
+        rows = [(e.ticker, e.title) for e in tape_entries]
         stats.markets = len(rows)
         log.info(
             "llm_trade_scan_start",
@@ -228,6 +231,12 @@ def run_llm_opportunity_pipeline(
         )
         if not rows:
             log.warning("llm_trade_tape_empty", note="no tickers after tape rank + filters")
+        else:
+            print(
+                f"llm-trade: tape mode — {len(rows)} markets after flow rank "
+                f"({stats.tape_trades_fetched} public prints in fetch window)",
+                flush=True,
+            )
     else:
         skip_pages = random.randint(0, max(0, settings.trade_llm_random_skip_pages_max))
         btc_priority = bool(
@@ -315,7 +324,22 @@ def run_llm_opportunity_pipeline(
 
     for i, (ticker, title) in enumerate(rows):
         try:
-            print(f"llm-trade: {ticker} …", flush=True)
+            te = tape_entries[i] if tape_entries is not None else None
+            if te:
+                print(
+                    f"llm-trade: {ticker} (tape flow≈${te.flow_usd_approx:.2f}, rank #{te.rank}/{len(tape_entries)}) …",
+                    flush=True,
+                )
+                log.info(
+                    "llm_trade_tape_row",
+                    ticker=ticker,
+                    flow_usd_approx=te.flow_usd_approx,
+                    public_trade_count=te.public_trade_count,
+                    rank=te.rank,
+                    tape_universe_size=len(tape_entries),
+                )
+            else:
+                print(f"llm-trade: {ticker} …", flush=True)
             if not use_tape_universe and settings.trade_min_market_volume is not None:
                 vol = open_volumes.get(ticker)
                 if vol is None or vol < settings.trade_min_market_volume:
@@ -440,6 +464,10 @@ def run_llm_opportunity_pipeline(
                 adaptive_extra_min_net_edge=ad_min,
                 adaptive_extra_mid_edge=ad_mid,
                 session_performance_note=wl_note,
+                tape_flow_usd_approx=te.flow_usd_approx if te else None,
+                tape_rank=te.rank if te else None,
+                tape_public_trade_count=te.public_trade_count if te else None,
+                tape_universe_size=len(tape_entries) if te else None,
             )
             if verdict is None:
                 stats.llm_no_verdict += 1

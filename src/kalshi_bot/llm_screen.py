@@ -161,8 +161,16 @@ def llm_evaluate_opportunity(
     adaptive_extra_min_net_edge: float = 0.0,
     adaptive_extra_mid_edge: float = 0.0,
     session_performance_note: str = "",
+    tape_flow_usd_approx: float | None = None,
+    tape_rank: int | None = None,
+    tape_public_trade_count: int | None = None,
+    tape_universe_size: int | None = None,
 ) -> LLMOpportunityVerdict | None:
-    """Ask the model to reason about a market; output must be JSON with ``shares`` (or legacy ``contracts``)."""
+    """Ask the model to reason about a market; output must be JSON with ``shares`` (or legacy ``contracts``).
+
+    When ``llm-trade --tape`` is used, pass tape fields so the model can weigh recent anonymous public flow
+    (liquidity / attention proxy) alongside price and edge.
+    """
     key = settings.openai_api_key
     if not key:
         return None
@@ -193,10 +201,24 @@ def llm_evaluate_opportunity(
         "Estimate fair_yes in [0,1]. The bot rejects trades that fail fee-aware edge vs mid. Prefer smaller `shares` "
         "when uncertain—many small wins, not home runs.\n"
     )
+    flow_block = ""
+    if (
+        tape_flow_usd_approx is not None
+        and tape_rank is not None
+        and tape_public_trade_count is not None
+        and tape_universe_size is not None
+    ):
+        flow_block = (
+            "Tape context (anonymous public prints in this fetch window): "
+            f"approx ${tape_flow_usd_approx:.2f} notional across {tape_public_trade_count} trade line(s); "
+            f"flow rank #{tape_rank} of {tape_universe_size} in this scan. "
+            "Higher flow often means more attention and easier exit liquidity, but it is not a guarantee of edge—"
+            "still compare fair_yes to the ask and avoid chasing.\n\n"
+        )
 
     user = f"""{ticker} | {title}
 YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
-{perf_block}{params}
+{flow_block}{perf_block}{params}
 {style_block}{odds_block}JSON only:
 {{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"shares":1-{max_contracts_allowed},"reason":"brief"}}
 {_llm_approval_tail(settings)}"""

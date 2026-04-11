@@ -23,7 +23,7 @@ _LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
 # Set when dashboard starts so /api/log_summary can locate JSONL without Settings in Flask context
 _STRUCTURED_LOG_PATH_FOR_STATS: Path | None = None
-# Time series for dashboard line chart (balance + exposure in cents)
+# Time series for dashboard line chart (cash balance, exposure, total = cash + exposure)
 _SERIES: deque[dict[str, Any]] = deque(maxlen=2000)
 # Closed-trade tally (auto-sell: estimated gross vs entry, or take-profit without basis)
 _WINS = 0
@@ -143,18 +143,31 @@ def win_loss_snapshot() -> dict[str, int]:
 
 
 def record_portfolio_series_point(balance_cents: int | float | None, exposure_cents: float) -> None:
-    """Append one point for the live line chart (thread-safe)."""
-    try:
-        bal = int(balance_cents) if balance_cents is not None else 0
-    except (TypeError, ValueError):
-        bal = 0
-    row = {
+    """Append one point for the live line chart (thread-safe).
+
+    ``total_account_cents`` is cash plus rounded exposure when cash is known; otherwise omitted.
+    """
+    exposure_f = float(exposure_cents)
+    balance_known = balance_cents is not None
+    bal = 0
+    if balance_known:
+        try:
+            bal = int(balance_cents)
+        except (TypeError, ValueError):
+            bal = 0
+            balance_known = False
+    total_cents: int | None = None
+    if balance_known:
+        total_cents = bal + int(round(exposure_f))
+    row: dict[str, Any] = {
         "unix": time.time(),
         "ts_iso": datetime.now(timezone.utc).isoformat(),
         "balance_cents": bal,
-        "balance_known": balance_cents is not None,
-        "exposure_cents": float(exposure_cents),
+        "balance_known": balance_known,
+        "exposure_cents": exposure_f,
     }
+    if total_cents is not None:
+        row["total_account_cents"] = total_cents
     with _LOCK:
         _SERIES.append(row)
 
@@ -221,10 +234,11 @@ _HTML = """<!DOCTYPE html>
   <div class="balance-banner" id="balanceBanner" style="display:none;">
     <span><strong>Cash</strong> <span id="balCash">—</span></span>
     <span><strong>Exposure</strong> <span id="balExp">—</span></span>
+    <span><strong>Total</strong> <span id="balTotal">—</span></span>
     <span class="muted" id="balTs"></span>
   </div>
   <div class="chart-wrap">
-    <h2>Balance &amp; exposure (USD)</h2>
+    <h2>Cash, exposure &amp; total account (USD)</h2>
     <canvas id="seriesChart" width="800" height="220"></canvas>
   </div>
   <div class="chart-wrap">
@@ -246,6 +260,7 @@ _HTML = """<!DOCTYPE html>
       });
       const bal = points.map(p => dollarsFromCents(p.balance_cents));
       const exp = points.map(p => dollarsFromCents(p.exposure_cents));
+      const total = points.map(p => (p.total_account_cents != null ? dollarsFromCents(p.total_account_cents) : null));
       const ctx = document.getElementById('seriesChart');
       if (!seriesChart) {
         seriesChart = new Chart(ctx, {
@@ -253,8 +268,9 @@ _HTML = """<!DOCTYPE html>
           data: {
             labels,
             datasets: [
-              { label: 'Balance', data: bal, borderColor: '#3ecf8e', backgroundColor: 'rgba(62,207,142,0.08)', tension: 0.2, fill: false, pointRadius: 0 },
-              { label: 'Exposure', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0 }
+              { label: 'Cash', data: bal, borderColor: '#3ecf8e', backgroundColor: 'rgba(62,207,142,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
+              { label: 'Exposure', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
+              { label: 'Total (cash + exposure)', data: total, borderColor: '#f5a623', backgroundColor: 'rgba(245,166,35,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false }
             ]
           },
           options: {
@@ -273,6 +289,7 @@ _HTML = """<!DOCTYPE html>
         seriesChart.data.labels = labels;
         seriesChart.data.datasets[0].data = bal;
         seriesChart.data.datasets[1].data = exp;
+        seriesChart.data.datasets[2].data = total;
         seriesChart.update('none');
       }
     }
@@ -317,15 +334,24 @@ _HTML = """<!DOCTYPE html>
           const last = pts[pts.length - 1];
           const cashEl = document.getElementById('balCash');
           const expEl = document.getElementById('balExp');
+          const totalEl = document.getElementById('balTotal');
           const tsEl = document.getElementById('balTs');
           const banner = document.getElementById('balanceBanner');
           const exp = dollarsFromCents(last.exposure_cents);
           expEl.textContent = '$' + exp.toFixed(2);
           if (last.balance_known === false) {
             cashEl.textContent = 'n/a';
+            if (totalEl) totalEl.textContent = 'n/a';
           } else {
             const cash = dollarsFromCents(last.balance_cents);
             cashEl.textContent = '$' + cash.toFixed(2);
+            if (totalEl) {
+              if (last.total_account_cents != null) {
+                totalEl.textContent = '$' + dollarsFromCents(last.total_account_cents).toFixed(2);
+              } else {
+                totalEl.textContent = 'n/a';
+              }
+            }
           }
           if (last.ts_iso) tsEl.textContent = 'as of ' + last.ts_iso;
           else tsEl.textContent = '';

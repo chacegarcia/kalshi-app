@@ -21,6 +21,21 @@ class MarketSummary:
     volume: int | None
 
 
+@dataclass(frozen=True)
+class TapeUniverseEntry:
+    """One market in the tape-ranked universe for ``llm-trade --tape``.
+
+    ``flow_usd_approx`` sums ``count × yes_price`` over recent **anonymous** public prints (see
+    ``rank_tickers_by_public_flow``). ``rank`` is 1-based among markets that pass min-flow / volume filters.
+    """
+
+    ticker: str
+    title: str
+    flow_usd_approx: float
+    public_trade_count: int
+    rank: int
+
+
 @with_rest_retry
 def fetch_public_trades(
     client: KalshiSdkClient,
@@ -74,12 +89,12 @@ def build_tape_universe_for_llm(
     top_markets: int,
     min_flow_usd: float,
     min_market_volume: int | None,
-) -> tuple[list[tuple[str, str]], int]:
-    """Tape-ranked tickers with titles for ``llm-trade --tape``. Returns ``(ticker, title)`` rows and trades fetched."""
+) -> tuple[list[TapeUniverseEntry], int]:
+    """Tape-ranked markets (flow + titles) for ``llm-trade --tape``. Returns entries and raw trades fetched."""
     raw = fetch_public_trades(client, max_trades=max_trades_fetch)
     ranked = rank_tickers_by_public_flow(raw)
-    out: list[tuple[str, str]] = []
-    for ticker, flow_usd, _n in ranked:
+    out: list[TapeUniverseEntry] = []
+    for ticker, flow_usd, n_trades in ranked:
         if len(out) >= top_markets:
             break
         if min_flow_usd > 0.0 and flow_usd < min_flow_usd:
@@ -98,7 +113,15 @@ def build_tape_universe_for_llm(
         except Exception:
             if min_market_volume is not None:
                 continue
-        out.append((ticker, title))
+        out.append(
+            TapeUniverseEntry(
+                ticker=ticker,
+                title=title,
+                flow_usd_approx=flow_usd,
+                public_trade_count=n_trades,
+                rank=len(out) + 1,
+            )
+        )
     return out, len(raw)
 
 
