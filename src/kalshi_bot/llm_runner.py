@@ -78,7 +78,7 @@ class LLMTradeRunStats:
                 f"  LLM decline overridden (fair≈ask): {self.llm_fair_ask_override}",
                 f"  blocked by bot math (edge):   {self.bot_math_rejected}",
                 f"  skip (volume below min):      {self.skip_low_volume}",
-                f"  skip (balance→0 contracts):   {self.blocked_zero_contracts_balance}",
+                f"  skip (balance→0 shares):      {self.blocked_zero_contracts_balance}",
                 f"  skip (verdict size 0):        {self.skip_zero_contracts_after_verdict}",
                 f"  skip (YES ask < min longshot): {self.skip_yes_ask_longshot}",
                 f"  momentum bypass (chart YES):  {self.momentum_llm_bypass}",

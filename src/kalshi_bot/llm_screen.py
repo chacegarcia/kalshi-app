@@ -94,8 +94,12 @@ class LLMOpportunityVerdict:
     fair_yes: float
     buy_yes: bool
     limit_yes_price_cents: int
-    contracts: int
+    contracts: int  # Kalshi API: YES contracts; trading-app synonym: shares
     reason: str
+
+    @property
+    def shares(self) -> int:
+        return self.contracts
 
 
 @dataclass
@@ -158,7 +162,7 @@ def llm_evaluate_opportunity(
     adaptive_extra_mid_edge: float = 0.0,
     session_performance_note: str = "",
 ) -> LLMOpportunityVerdict | None:
-    """Ask the model to reason about a market; output must be JSON matching ``LLMOpportunityVerdict`` shape."""
+    """Ask the model to reason about a market; output must be JSON with ``shares`` (or legacy ``contracts``)."""
     key = settings.openai_api_key
     if not key:
         return None
@@ -172,7 +176,7 @@ def llm_evaluate_opportunity(
     params = (
         f"Enforced in code: min_net_edge_after_fees={min_e}, mid_price_extra_edge={mid_x}, "
         f"max_yes_ask={settings.strategy_max_yes_ask_dollars}, min_spread={settings.strategy_min_spread_dollars}, "
-        f"max_contracts={max_contracts_allowed}, bal_cents={bal_s}"
+        f"max_shares={max_contracts_allowed}, bal_cents={bal_s}"
     )
     perf_block = ""
     if session_performance_note.strip():
@@ -185,16 +189,16 @@ def llm_evaluate_opportunity(
         else ""
     )
     style_block = (
-        "Style: Estimate fair_yes as a calibrated probability in [0,1] (not vibes). Compare fair_yes to the implied ask; "
-        "the bot rejects trades that fail fee-aware edge vs mid. Prefer smaller `contracts` when uncertain—goal is many "
-        "small wins, not home runs.\n"
+        "Style: Treat each YES as a share of a $1 binary (max payoff $1). Share price = implied probability (the ask in ¢). "
+        "Estimate fair_yes in [0,1]. The bot rejects trades that fail fee-aware edge vs mid. Prefer smaller `shares` "
+        "when uncertain—many small wins, not home runs.\n"
     )
 
     user = f"""{ticker} | {title}
 YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
 {perf_block}{params}
 {style_block}{odds_block}JSON only:
-{{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"contracts":1-{max_contracts_allowed},"reason":"brief"}}
+{{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"shares":1-{max_contracts_allowed},"reason":"brief"}}
 {_llm_approval_tail(settings)}"""
 
     raw = _openai_chat_json(key, settings.trade_llm_model, user)
@@ -205,7 +209,8 @@ YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
         fair_yes = float(raw.get("fair_yes", 0.5))
         buy_yes = bool(raw.get("buy_yes", False))
         limit_c = int(raw.get("limit_yes_price_cents", yes_ask_cents))
-        contracts = int(raw.get("contracts", 1))
+        raw_sz = raw.get("shares", raw.get("contracts", 1))
+        contracts = int(raw_sz)
         reason = str(raw.get("reason", ""))[:2000]
         fair_yes = max(0.0, min(1.0, fair_yes))
         limit_c = max(1, min(99, limit_c))

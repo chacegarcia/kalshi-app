@@ -1,4 +1,7 @@
-"""Scale max contracts and exposure caps from account balance (percentage of balance)."""
+"""Scale max YES shares (Kalshi contracts) and exposure from account balance.
+
+Share price = YES limit in cents; position size is in shares; notional ≈ shares × price.
+"""
 
 from __future__ import annotations
 
@@ -77,12 +80,12 @@ def effective_max_contracts(
     balance_cents: int | None,
     yes_price_cents: int,
 ) -> int:
-    """Cap order size in contracts.
+    """Cap buy size in YES shares (Kalshi contracts).
 
-    With balance sizing and a positive balance: ``floor(balance × TRADE_RISK_PCT_OF_BALANCE_PER_TRADE / price)``,
-    or ``0`` if that budget cannot cover one contract at the limit price.
+    With balance sizing and a positive balance: ``floor(balance × TRADE_RISK_PCT_OF_BALANCE_PER_TRADE / share_price)``,
+    or ``0`` if that budget cannot cover one share at the limit price.
 
-    Otherwise: ``MAX_CONTRACTS_PER_MARKET`` (static fallback when balance is unknown or sizing is off).
+    Otherwise: ``MAX_CONTRACTS_PER_MARKET`` / ``TRADE_MAX_SHARES_PER_MARKET`` (static fallback when balance is unknown or sizing is off).
     """
     base = settings.max_contracts_per_market
     if not settings.trade_balance_sizing_enabled or balance_cents is None or balance_cents <= 0:

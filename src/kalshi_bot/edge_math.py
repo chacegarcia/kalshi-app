@@ -1,4 +1,9 @@
-"""Fee-adjusted edge and intra-market boxed (YES+NO) surplus — Kalshi-only."""
+"""Fee-adjusted edge and intra-market boxed (YES+NO) surplus — Kalshi-only.
+
+Interpreting **YES as shares** (see ``trading_model``): ``net_edge_buy_yes_long`` is expected edge
+per **share** at the ask (dollars on the \$1 face); multiply by share count for total edge dollars
+before fees on a sized order.
+"""
 
 from __future__ import annotations
 
@@ -50,7 +55,7 @@ def net_edge_buy_yes_long(
     yes_ask_dollars: float,
     contracts: int = 1,
 ) -> float:
-    """fair − ask − taker fee per contract (all in dollars). Conservative long YES signal."""
+    """fair − ask − taker fee per share (all in dollars on \$1 face). ``contracts`` = share count for fee averaging."""
     fy = kalshi_general_taker_fee_usd(contracts=contracts, price_dollars=yes_ask_dollars)
     per = fy / max(1, contracts)
     return fair_yes - yes_ask_dollars - per

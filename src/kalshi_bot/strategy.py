@@ -1,5 +1,10 @@
 """Strategy interface and a research sample (threshold + spread + probability gap).
 
+**Share model:** Each Kalshi YES **contract** is treated as one **share** of a \$1 binary (see
+``kalshi_bot.trading_model``). Signals react to **implied YES price** (bid/ask in dollars 0–1) like
+a probability “stock”; filters (spread, gap from 50%, max ask) anticipate **price** and liquidity
+quality, not a different asset class.
+
 **Plug in your research here:** implement `Strategy` for live WebSocket use, or
 `signal_from_bar` / a custom factory for `backtest.run_rule_backtest`.
 
@@ -19,7 +24,7 @@ def skip_buy_yes_longshot(settings: Settings, yes_ask_cents: int) -> bool:
     """Return True to skip buy-YES when implied YES ask is below the effective floor.
 
     Uses the stricter of ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` and the minimum implied by
-    ``TRADE_ENTRY_MAX_AMERICAN_ODDS_YES`` (+200 → ~34¢; blocks +400/+600-style longshots).
+    ``TRADE_ENTRY_MAX_AMERICAN_ODDS_YES`` (+150 → ~40¢; +200 → ~34¢; blocks very long longshots).
     """
     need = settings.trade_entry_effective_min_yes_ask_cents
     if need <= 0:

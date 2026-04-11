@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from collections import deque
 from pathlib import Path
@@ -48,6 +51,70 @@ def record_trade_outcome(pnl_cents: float | None) -> None:
             _LOSSES += 1
         else:
             _TIES += 1
+
+
+def _apply_auto_sell_outcome_and_event(
+    *,
+    gross_profit_cents: int | None,
+    exit_reason: str,
+    event_payload: dict[str, Any],
+) -> None:
+    """Update W–L and append one dashboard row (in-process only)."""
+    record_event("auto_sell_profit_estimate", **event_payload)
+    record_auto_sell_outcome(gross_profit_cents=gross_profit_cents, exit_reason=exit_reason)
+
+
+def notify_auto_sell_outcome(
+    settings: Settings,
+    *,
+    gross_profit_cents: int | None,
+    exit_reason: str,
+    event_payload: dict[str, Any],
+) -> None:
+    """Update session W–L and the HTML feed for an auto-sell.
+
+    When the dashboard runs in another process (e.g. ``kalshi-bot run`` / ``llm-trade`` with ``--web``),
+    tries ``POST /api/ingest_auto_sell`` on ``127.0.0.1:{DASHBOARD_PORT}`` so counts and events stay in sync.
+    If nothing is listening or ``DASHBOARD_INGEST_AUTO_SELL=false``, applies updates in-process only.
+    """
+    if not settings.dashboard_ingest_auto_sell:
+        _apply_auto_sell_outcome_and_event(
+            gross_profit_cents=gross_profit_cents,
+            exit_reason=exit_reason,
+            event_payload=event_payload,
+        )
+        return
+
+    body = json.dumps(
+        {
+            "gross_profit_cents": gross_profit_cents,
+            "exit_reason": exit_reason,
+            "event_payload": event_payload,
+        },
+        default=str,
+    ).encode("utf-8")
+    url = f"http://127.0.0.1:{int(settings.dashboard_port)}/api/ingest_auto_sell"
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            if resp.status == 200:
+                return
+    except urllib.error.HTTPError:
+        # Non-2xx from server — do not assume ingest ran; fall back to in-process.
+        pass
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+
+    _apply_auto_sell_outcome_and_event(
+        gross_profit_cents=gross_profit_cents,
+        exit_reason=exit_reason,
+        event_payload=event_payload,
+    )
 
 
 def record_auto_sell_outcome(*, gross_profit_cents: int | None, exit_reason: str) -> None:
@@ -147,10 +214,10 @@ _HTML = """<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
-  <h1>Kalshi bot — order monitor</h1>
-  <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Chart polls every 2s; new points are added when the bot records snapshots (including periodic balance/exposure during long runs).</p>
+  <h1>Kalshi bot — trading monitor</h1>
+  <p class="sub">YES positions as <strong>shares</strong> (Kalshi contracts) at an implied <strong>share price</strong> in ¢. Live feed of orders and blocks; chart polls every 2s when the bot records balance/exposure snapshots.</p>
   <div class="status" id="status">Loading…</div>
-  <div class="status" id="wlBanner">W–L <strong id="wlStat">0–0</strong> <span class="muted" id="wlTies"></span> <span class="muted">(auto-sell take-profit; P/L from entry estimate when available)</span></div>
+  <div class="status" id="wlBanner">W–L <strong id="wlStat">0–0</strong> <span class="muted" id="wlTies"></span> <span class="muted">(auto-sell / exit-scan; P/L from entry estimate when available; separate CLI posts to this page)</span></div>
   <div class="balance-banner" id="balanceBanner" style="display:none;">
     <span><strong>Cash</strong> <span id="balCash">—</span></span>
     <span><strong>Exposure</strong> <span id="balExp">—</span></span>
@@ -291,7 +358,7 @@ _HTML = """<!DOCTYPE html>
 
 
 def _create_app() -> Any:
-    from flask import Flask, Response, jsonify
+    from flask import Flask, Response, jsonify, request
 
     from kalshi_bot.log_insights import aggregate_structured_log_tail
 
@@ -300,6 +367,30 @@ def _create_app() -> Any:
     @app.get("/")
     def index() -> Response:
         return Response(_HTML, mimetype="text/html")
+
+    @app.post("/api/ingest_auto_sell")
+    def ingest_auto_sell() -> Any:
+        """Accept auto-sell outcome from another process (e.g. ``kalshi-bot auto-sell``); localhost only."""
+        addr = request.environ.get("REMOTE_ADDR", "")
+        if addr not in ("127.0.0.1", "::1"):
+            return jsonify({"ok": False, "error": "forbidden"}), 403
+        data = request.get_json(force=True, silent=True) or {}
+        gross = data.get("gross_profit_cents")
+        if gross is not None:
+            try:
+                gross = int(gross)
+            except (TypeError, ValueError):
+                gross = None
+        reason = str(data.get("exit_reason") or "")
+        payload = data.get("event_payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        _apply_auto_sell_outcome_and_event(
+            gross_profit_cents=gross,
+            exit_reason=reason,
+            event_payload=payload,
+        )
+        return jsonify({"ok": True})
 
     @app.get("/api/events")
     def api_events() -> Any:

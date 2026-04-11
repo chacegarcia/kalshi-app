@@ -74,11 +74,12 @@ class Settings(BaseSettings):
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_MAX_CONTRACTS_PER_MARKET",
+            "TRADE_MAX_SHARES_PER_MARKET",
             "MAX_CONTRACTS_PER_MARKET",
             "MAX_POSITION_CONTRACTS",
             "max_contracts_per_market",
         ),
-        description="Max contracts per market when TRADE_BALANCE_SIZING_ENABLED=false or balance is unknown. With balance sizing + balance, per-order cap is from balance×TRADE_RISK_PCT_OF_BALANCE_PER_TRADE÷price instead.",
+        description="Max YES shares (Kalshi contracts) per market when TRADE_BALANCE_SIZING_ENABLED=false or balance unknown. With balance sizing + balance, per-order cap is balance×TRADE_RISK_PCT_OF_BALANCE_PER_TRADE÷share_price.",
     )
     max_daily_drawdown_usd: float = Field(
         default=25.0,
@@ -134,7 +135,7 @@ class Settings(BaseSettings):
         description="Require at least this YES bid–ask width (0–1 on $1). 0 = do not block on spread tightness.",
     )
     strategy_probability_gap: float = Field(
-        default=0.0,
+        default=0.02,
         ge=0,
         le=0.5,
         validation_alias=AliasChoices(
@@ -142,6 +143,7 @@ class Settings(BaseSettings):
             "STRATEGY_PROBABILITY_GAP",
             "strategy_probability_gap",
         ),
+        description="Require |mid−50%| ≥ this (0–1 scale). 0.02 ≈ skip mids in 48–52¢ coin-flip band. 0 = off.",
     )
     trade_entry_min_yes_ask_cents: int = Field(
         default=0,
@@ -154,23 +156,25 @@ class Settings(BaseSettings):
         description="Extra floor: do not buy YES below this many cents (0 = off). Stricter of this and TRADE_ENTRY_MAX_AMERICAN_ODDS_YES is used.",
     )
     trade_entry_max_american_odds_yes: float = Field(
-        default=200.0,
+        default=150.0,
         ge=0.0,
         le=100_000.0,
         validation_alias=AliasChoices(
             "TRADE_ENTRY_MAX_AMERICAN_ODDS_YES",
             "trade_entry_max_american_odds_yes",
         ),
-        description="Skip buy YES when implied American long odds exceed this (+200 ≈ min ~34¢; +400≈20¢, +600≈14¢). 0 = disable this cap.",
+        description="Skip buy YES when implied American long odds exceed this (+150 ≈ min ~40¢; +200≈34¢; +400≈20¢). 0 = disable this cap.",
     )
     strategy_order_count: int = Field(
         default=1,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_BUY_CONTRACTS_PER_ORDER",
+            "TRADE_BUY_SHARES_PER_ORDER",
             "STRATEGY_ORDER_COUNT",
             "strategy_order_count",
         ),
+        description="Shares (YES contracts) per buy signal for the sample WebSocket strategy.",
     )
     trade_min_order_notional_usd: float | None = Field(
         default=0.0,
@@ -179,7 +183,7 @@ class Settings(BaseSettings):
             "TRADE_MIN_ORDER_NOTIONAL_USD",
             "trade_min_order_notional_usd",
         ),
-        description="Buy YES: bump contracts to at least this $ at limit (0 = no floor). Requires TRADE_MAX_ORDER_NOTIONAL_USD ≥ this when both positive.",
+        description="Buy YES: bump share count to at least this $ notional at limit (0 = no floor). Requires TRADE_MAX_ORDER_NOTIONAL_USD ≥ this when both positive.",
     )
     trade_max_order_notional_usd: float | None = Field(
         default=10.0,
@@ -240,18 +244,18 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TRADE_USE_EDGE_STRATEGY", "trade_use_edge_strategy"),
     )
     trade_min_net_edge_after_fees: float = Field(
-        default=0.0,
+        default=0.005,
         ge=0.0,
         le=0.5,
         validation_alias=AliasChoices("TRADE_MIN_NET_EDGE_AFTER_FEES", "trade_min_net_edge_after_fees"),
-        description="Min (fair_yes − YES_ask − taker fee), 0–1 on $1 face. 0 = no minimum edge gate (still subject to fees in math). Raise (e.g. 0.005) to require edge.",
+        description="Min (fair_yes − YES_ask − taker fee), 0–1 on $1 face. Used when TRADE_USE_EDGE_STRATEGY + fair value; also LLM base unless TRADE_LLM_MIN_NET_EDGE_AFTER_FEES set. 0.005 ≈ 0.5¢/contract after fees.",
     )
     trade_edge_middle_extra_edge: float = Field(
-        default=0.0,
+        default=0.01,
         ge=0.0,
         le=0.2,
         validation_alias=AliasChoices("TRADE_EDGE_MIDDLE_EXTRA_EDGE", "trade_edge_middle_extra_edge"),
-        description="Extra edge required near 50¢ mid. 0 = no extra mid-price hurdle.",
+        description="Extra edge required near 50¢ mid. 0.01 adds ~1¢ hurdle at mid (with default mid kernel). 0 = off.",
     )
     trade_llm_min_net_edge_after_fees: float | None = Field(
         default=None,
@@ -396,23 +400,23 @@ class Settings(BaseSettings):
         description="If set, skip when (YES_ask − YES_bid) exceeds this. None = no maximum spread filter (only min_spread if >0).",
     )
     trade_llm_relaxed_approval: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices(
             "TRADE_LLM_RELAXED_APPROVAL",
             "trade_llm_relaxed_approval",
         ),
-        description="If true, more permissive LLM prompt (prefer approve on fair value / small edge). If false, still accumulation-biased but slightly stricter wording.",
+        description="If true, more permissive LLM prompt (prefer approve on fair value / small edge). If false, stricter wording—approve only when fair supports the buy.",
     )
     trade_llm_accept_when_fair_covers_ask: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices(
             "TRADE_LLM_ACCEPT_WHEN_FAIR_COVERS_ASK",
             "trade_llm_accept_when_fair_covers_ask",
         ),
-        description="If LLM sets approve/buy_yes false but fair_yes is within slippage of the implied YES ask, still proceed (bot checks book limits).",
+        description="If true, when LLM declines but fair_yes is within slippage of ask, still run deterministic edge checks. false = respect LLM decline (stricter).",
     )
     trade_llm_fair_ask_slippage: float = Field(
-        default=0.04,
+        default=0.02,
         ge=0.0,
         le=0.5,
         validation_alias=AliasChoices(
@@ -682,23 +686,24 @@ class Settings(BaseSettings):
 
     # Exit quality: implied-% floor, optional profit-margin vs entry, IOC-style sells (Kalshi API TIF)
     trade_exit_take_profit_min_yes_bid_pct: float = Field(
-        default=72.0,
+        default=78.0,
         ge=1.0,
         le=99.0,
         validation_alias=AliasChoices(
             "TRADE_EXIT_TAKE_PROFIT_MIN_YES_BID_PCT",
             "trade_exit_take_profit_min_yes_bid_pct",
         ),
+        description="When implied-% exits are on (TRADE_EXIT_ONLY_PROFIT_MARGIN=false): min best YES bid (1–99) to count as take-profit.",
     )
     trade_exit_min_profit_cents_per_contract: float | None = Field(
-        default=None,
+        default=4.0,
         ge=0.0,
         validation_alias=AliasChoices(
             "TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT",
             "TRADE_EXIT_MIN_PROFIT_CENTS",
             "trade_exit_min_profit_cents_per_contract",
         ),
-        description="Min profit vs entry (¢/contract). If unset but TRADE_EXIT_ONLY_PROFIT_MARGIN=true, code uses 1¢ (see trade_exit_effective_min_profit_cents_per_contract).",
+        description="Min profit vs entry (¢ per share). Default 4¢; set lower (e.g. 1) for ‘any green’ exits when using profit-margin mode.",
     )
     trade_exit_entry_reference_yes_cents: int | None = Field(
         default=None,
@@ -717,12 +722,12 @@ class Settings(BaseSettings):
         ),
     )
     trade_exit_only_profit_margin: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices(
             "TRADE_EXIT_ONLY_PROFIT_MARGIN",
             "trade_exit_only_profit_margin",
         ),
-        description="If true, skip implied-% TP; exit when bid ≥ entry + min profit (default 1¢/contract if min profit unset).",
+        description="If true, skip implied-% TP; exit when bid ≥ entry + TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT (default 4¢).",
     )
     trade_exit_stop_loss_enabled: bool = Field(
         default=True,
@@ -794,6 +799,15 @@ class Settings(BaseSettings):
         validation_alias=_env("DASHBOARD_PORTFOLIO_POLL_SECONDS", "dashboard_portfolio_poll_seconds"),
         description="While llm-trade / tape-trade / discover-trade / bitcoin-trade run with the dashboard: poll balance & exposure this often (seconds). 0 = only record at start/end of each pipeline pass.",
     )
+    dashboard_ingest_auto_sell: bool = Field(
+        default=True,
+        validation_alias=_env("DASHBOARD_INGEST_AUTO_SELL", "dashboard_ingest_auto_sell"),
+        description=(
+            "If true, after an auto-sell/exit-scan sell, POST the outcome to the local dashboard (127.0.0.1) "
+            "so session W–L and the event table update when auto-sell runs in a separate terminal. Falls back to "
+            "in-process recording if nothing is listening."
+        ),
+    )
 
     log_level: str = Field(default="INFO", validation_alias=_env("LOG_LEVEL", "log_level"))
     structured_log_path: Path = Field(
@@ -862,6 +876,7 @@ class Settings(BaseSettings):
         "no_martingale",
         "dashboard_enabled",
         "dashboard_open_browser",
+        "dashboard_ingest_auto_sell",
         "trade_use_edge_strategy",
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
@@ -879,6 +894,8 @@ class Settings(BaseSettings):
         "trade_bitcoin_sidecar_enabled",
         "trade_balance_sizing_enabled",
         "trade_auto_sell_after_each_pass",
+        "trade_exit_only_profit_margin",
+        "trade_exit_estimate_entry_from_portfolio",
         "trade_exit_stop_loss_enabled",
         "trade_exit_stop_loss_skip_suspect_portfolio_estimate",
         "structured_log_clear_every_other_pass",
@@ -969,7 +986,7 @@ class Settings(BaseSettings):
 
     @property
     def trade_exit_effective_min_profit_cents_per_contract(self) -> float | None:
-        """Explicit min profit, or 1.0 when TRADE_EXIT_ONLY_PROFIT_MARGIN=true and unset (any green vs entry)."""
+        """Explicit min profit; if unset and profit-margin-only mode, fallback 1¢ ‘any green’ vs entry."""
         if self.trade_exit_min_profit_cents_per_contract is not None:
             return float(self.trade_exit_min_profit_cents_per_contract)
         if self.trade_exit_only_profit_margin:

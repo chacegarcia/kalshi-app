@@ -119,7 +119,7 @@ def print_portfolio_balance_line(client: KalshiSdkClient) -> None:
 def estimate_yes_entry_cents_from_position(p: object) -> int | None:
     """Rough average YES **price** implied by API fields (not guaranteed cost basis).
 
-    Uses ``per_contract_dollars = total_traded_dollars / abs(position_fp)`` then converts to cents.
+    Uses ``per_share_dollars = total_traded_dollars / abs(position_fp)`` (per YES share) then converts to cents.
     Kalshi’s ``total_traded_dollars`` is not always the same as economic average cost (e.g. netting,
     fees, or mixed YES/NO activity)—so values pinned to 1¢ or 99¢ should be treated as suspect for
     stop-loss / P/L estimates. Prefer ``TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS`` when you know your basis.
@@ -129,12 +129,12 @@ def estimate_yes_entry_cents_from_position(p: object) -> int | None:
     if fp is None or tt is None:
         return None
     try:
-        contracts = abs(float(str(fp)))
+        shares = abs(float(str(fp)))
         traded = float(str(tt))
     except ValueError:
         return None
-    if contracts < 1e-9:
+    if shares < 1e-9:
         return None
-    per_contract_dollars = traded / contracts
-    cents = int(round(per_contract_dollars * 100.0))
+    per_share_dollars = traded / shares
+    cents = int(round(per_share_dollars * 100.0))
     return max(1, min(99, cents))

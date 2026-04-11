@@ -20,9 +20,10 @@ from kalshi_bot.portfolio import (
     fetch_portfolio_snapshot,
     get_market_position_row,
 )
-from kalshi_bot.monitor import record_auto_sell_outcome, record_event
+from kalshi_bot.monitor import notify_auto_sell_outcome
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
+from kalshi_bot.trading_model import gross_pnl_cents_from_price_move
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,7 @@ class ExitScanRow:
     """One long-YES position and how it compares to auto-sell / take-profit rules (cashout check)."""
 
     ticker: str
-    long_yes_contracts: float
+    long_yes_shares: float
     best_yes_bid_cents: int | None
     entry_yes_cents: int | None
     effective_min_yes_bid_cents: int | None
@@ -73,7 +74,7 @@ def collect_exit_scan_rows(
             rows.append(
                 ExitScanRow(
                     ticker=ticker,
-                    long_yes_contracts=signed,
+                    long_yes_shares=signed,
                     best_yes_bid_cents=None,
                     entry_yes_cents=entry_ref.cents,
                     effective_min_yes_bid_cents=eff_floor,
@@ -94,7 +95,7 @@ def collect_exit_scan_rows(
         rows.append(
             ExitScanRow(
                 ticker=ticker,
-                long_yes_contracts=signed,
+                long_yes_shares=signed,
                 best_yes_bid_cents=best,
                 entry_yes_cents=entry_ref.cents,
                 effective_min_yes_bid_cents=eff_floor,
@@ -117,7 +118,7 @@ def format_exit_scan_summary(rows: list[ExitScanRow]) -> list[str]:
     lines = [
         "--- exit-scan (cashout check) ---",
         "  Rules: stop-loss vs entry, TRADE_EXIT_* / TRADE_TAKE_PROFIT_* / TRADE_EXIT_ONLY_PROFIT_MARGIN (same as auto-sell).",
-        f"  {'ticker':<28} {'qty':>6} {'bid¢':>5} {'entry¢':>7} {'floor¢':>6} {'profit≥¢':>8}  would_exit  detail",
+        f"  {'ticker':<28} {'shares':>6} {'bid¢':>5} {'entry¢':>7} {'floor¢':>6} {'profit≥¢':>8}  would_exit  detail",
     ]
     ready = 0
     for r in rows:
@@ -129,7 +130,7 @@ def format_exit_scan_summary(rows: list[ExitScanRow]) -> list[str]:
         p = "—" if r.min_bid_for_profit_rule_cents is None else str(r.min_bid_for_profit_rule_cents)
         w = "yes" if r.would_take_profit else "no"
         lines.append(
-            f"  {r.ticker:<28} {r.long_yes_contracts:>6.1f} {b:>5} {e:>7} {f:>6} {p:>8}  {w:<10}  {r.detail}"
+            f"  {r.ticker:<28} {r.long_yes_shares:>6.1f} {b:>5} {e:>7} {f:>6} {p:>8}  {w:<10}  {r.detail}"
         )
     lines.append("---")
     lines.append(f"  Positions: {len(rows)}  |  Would exit now (stop or TP): {ready}")
@@ -244,13 +245,15 @@ def _format_auto_sell_profit_line(
     elif exit_reason.startswith("take_profit"):
         kind = "take-profit "
     if entry_ref is not None:
-        gross_cents = (limit_cents - entry_ref) * count
+        gross_cents = gross_pnl_cents_from_price_move(
+            shares=count, exit_price_cents=limit_cents, entry_price_cents=entry_ref
+        )
         return (
             f"{ticker}: {kind}est. gross P/L ${gross_cents / 100.0:.2f} "
-            f"({count} × (sell {limit_cents}¢ − entry ~{entry_ref}¢); proceeds ~${proceeds_cents / 100.0:.2f}; before fees)"
+            f"({count} sh × (sell {limit_cents}¢ − entry ~{entry_ref}¢); proceeds ~${proceeds_cents / 100.0:.2f}; before fees)"
         )
     return (
-        f"{ticker}: sell {count} YES @ {limit_cents}¢ limit — proceeds ~${proceeds_cents / 100.0:.2f} "
+        f"{ticker}: sell {count} sh YES @ {limit_cents}¢ limit — proceeds ~${proceeds_cents / 100.0:.2f} "
         "(P/L unknown: set TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS or TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO=true)"
     )
 
@@ -349,27 +352,35 @@ def try_auto_sell_exit_for_ticker(
     proceeds_cents = limit_cents * count
     gross_cents: int | None = None
     if entry_ref.cents is not None:
-        gross_cents = (limit_cents - entry_ref.cents) * count
+        gross_cents = gross_pnl_cents_from_price_move(
+            shares=count, exit_price_cents=limit_cents, entry_price_cents=entry_ref.cents
+        )
     log.info(
         "auto_sell_profit_estimate",
         ticker=ticker,
         count=count,
+        shares=count,
         limit_yes_price_cents=limit_cents,
         entry_yes_cents=entry_ref.cents,
         proceeds_cents=proceeds_cents,
         estimated_gross_profit_cents=gross_cents,
         note="vs portfolio entry estimate; excludes fees; IOC may partially fill",
     )
-    record_event(
-        "auto_sell_profit_estimate",
-        ticker=ticker,
-        count=count,
-        limit_yes_price_cents=limit_cents,
-        entry_yes_cents=entry_ref.cents,
-        proceeds_cents=proceeds_cents,
-        estimated_gross_profit_cents=gross_cents,
+    notify_auto_sell_outcome(
+        settings,
+        gross_profit_cents=gross_cents,
+        exit_reason=reason,
+        event_payload={
+            "ticker": ticker,
+            "count": count,
+            "shares": count,
+            "limit_yes_price_cents": limit_cents,
+            "entry_yes_cents": entry_ref.cents,
+            "proceeds_cents": proceeds_cents,
+            "estimated_gross_profit_cents": gross_cents,
+            "note": "vs portfolio entry estimate; excludes fees; IOC may partially fill",
+        },
     )
-    record_auto_sell_outcome(gross_profit_cents=gross_cents, exit_reason=reason)
     summary = _format_auto_sell_profit_line(
         ticker=ticker,
         count=count,
