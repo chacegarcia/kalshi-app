@@ -16,6 +16,7 @@ from kalshi_bot.monitor import record_event
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import (
+    adjust_buy_yes_count_for_notional_floor,
     cap_buy_yes_count_for_notional,
     effective_max_contracts,
     effective_max_exposure_cents,
@@ -156,6 +157,28 @@ def execute_intent(
     max_exp = effective_max_exposure_cents(settings, snap.balance_cents)
     if intent.count > max_c:
         intent = replace(intent, count=max_c)
+
+    if intent.side == "yes" and intent.action == "buy":
+        floored = adjust_buy_yes_count_for_notional_floor(
+            intent.count,
+            yes_price_cents=intent.yes_price_cents,
+            min_notional_usd=settings.trade_min_order_notional_usd,
+            max_notional_usd=settings.trade_max_order_notional_usd,
+            max_contracts=max_c,
+        )
+        if floored < 1:
+            log.info(
+                "order_blocked",
+                reason="min_order_notional_unreachable",
+                ticker=intent.ticker,
+                min_usd=settings.trade_min_order_notional_usd,
+                max_usd=settings.trade_max_order_notional_usd,
+            )
+            record_event("blocked", reason="min_order_notional_unreachable", intent=intent)
+            return
+        if floored != intent.count:
+            intent = replace(intent, count=floored)
+
     if intent.count < 1:
         log.info("order_blocked", reason="zero_contracts_after_balance_sizing", ticker=intent.ticker)
         record_event("blocked", reason="zero_contracts_after_balance_sizing", intent=intent)

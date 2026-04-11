@@ -21,6 +21,52 @@ class MarketSummary:
 
 
 @with_rest_retry
+def fetch_public_trades(
+    client: KalshiSdkClient,
+    *,
+    max_trades: int,
+    page_limit: int = 1000,
+) -> list[Any]:
+    """Recent public trades (all markets). No per-user identity — Kalshi does not expose counterparties.
+
+    Used to rank **tickers** by flow; not copy-trading of specific accounts.
+    """
+    out: list[Any] = []
+    cursor: str | None = None
+    page_limit = max(1, min(1000, page_limit))
+    while len(out) < max_trades:
+        take = min(page_limit, max_trades - len(out))
+        resp = client.markets.get_trades(limit=take, cursor=cursor)
+        batch = list(getattr(resp, "trades", []) or [])
+        out.extend(batch)
+        cursor = getattr(resp, "cursor", None)
+        if not batch or not cursor:
+            break
+    return out[:max_trades]
+
+
+def rank_tickers_by_public_flow(trades: list[Any]) -> list[tuple[str, float, int]]:
+    """Return ``(ticker, approx_usd_flow, trade_count)`` sorted by flow descending."""
+    from collections import defaultdict
+
+    agg: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
+    for t in trades:
+        ticker = getattr(t, "ticker", None)
+        if not ticker:
+            continue
+        try:
+            cnt = float(str(getattr(t, "count_fp", "0")))
+            yp = float(str(getattr(t, "yes_price_dollars", "0")))
+        except (TypeError, ValueError):
+            continue
+        row = agg[ticker]
+        row[0] = float(row[0]) + cnt * yp
+        row[1] = int(row[1]) + 1
+    ranked = sorted(agg.items(), key=lambda x: float(x[1][0]), reverse=True)
+    return [(tk, float(v[0]), int(v[1])) for tk, v in ranked]
+
+
+@with_rest_retry
 def list_open_markets(
     client: KalshiSdkClient,
     *,

@@ -79,6 +79,7 @@ kalshi-bot list-markets
 kalshi-bot scan [--limit N] [--llm]
 kalshi-bot llm-trade [--execute]
 kalshi-bot discover-trade [--execute]
+kalshi-bot tape-trade [--execute]
 kalshi-bot watch-market TICKER
 kalshi-bot place-test-order [--ticker T]
 kalshi-bot cancel-all

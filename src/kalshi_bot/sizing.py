@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from kalshi_bot.config import Settings
 
 
@@ -40,6 +42,31 @@ def cap_buy_yes_count_for_notional(
     p = max(1, min(99, yes_price_cents)) / 100.0
     max_n = int(max_notional_usd / p)
     return max(0, min(count, max_n))
+
+
+def adjust_buy_yes_count_for_notional_floor(
+    count: int,
+    *,
+    yes_price_cents: int,
+    min_notional_usd: float | None,
+    max_notional_usd: float | None,
+    max_contracts: int,
+) -> int:
+    """Raise buy-YES count to meet minimum $ at limit without exceeding max $ and max_contracts.
+
+    Returns 0 if the minimum notional cannot be reached (e.g. cap too tight vs min).
+    """
+    if min_notional_usd is None or min_notional_usd <= 0:
+        return max(0, count)
+    p = max(1, min(99, yes_price_cents)) / 100.0
+    max_n = max(0, max_contracts)
+    if max_notional_usd is not None and max_notional_usd > 0:
+        max_n = min(max_n, int(max_notional_usd / p))
+    count = min(max(0, count), max_n)
+    need = int(math.ceil(min_notional_usd / p))
+    if need > max_n:
+        return 0
+    return max(count, need)
 
 
 def effective_max_exposure_cents(settings: Settings, balance_cents: int | None) -> float:

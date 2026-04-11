@@ -26,6 +26,7 @@ class LLMTradeRunStats:
     llm_no_verdict: int = 0
     llm_declined: int = 0
     bot_math_rejected: int = 0
+    skip_low_volume: int = 0
     skipped_cli_no_execute: int = 0
     blocked_trade_llm_auto_execute_false: int = 0
     submitted: int = 0
@@ -39,6 +40,7 @@ class LLMTradeRunStats:
             f"  LLM no JSON / API fail:       {self.llm_no_verdict}",
             f"  LLM declined (approve/buy):   {self.llm_declined}  <-- usually #1 when this is high",
             f"  blocked by bot math (edge):   {self.bot_math_rejected}",
+            f"  skip (volume below min):      {self.skip_low_volume}",
             f"  skipped (--execute false):    {self.skipped_cli_no_execute}",
             f"  TRADE_LLM_AUTO_EXECUTE false: {self.blocked_trade_llm_auto_execute_false}",
             f"  reached trade_execute:        {self.submitted}",
@@ -69,6 +71,8 @@ def _passes_bot_edge(
         return False
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
     if spread < settings.strategy_min_spread_dollars:
+        return False
+    if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
         return False
     return True
 
@@ -111,6 +115,12 @@ def run_llm_opportunity_pipeline(
         s = summarize_market_row(m)
         ticker = s.ticker
         print(f"llm-trade: {ticker} …", flush=True)
+        if settings.trade_min_market_volume is not None:
+            vol = s.volume
+            if vol is None or vol < settings.trade_min_market_volume:
+                stats.skip_low_volume += 1
+                log.info("llm_trade_skip_low_volume", ticker=ticker, volume=vol)
+                continue
         try:
             ob = get_orderbook(client, ticker)
         except Exception as exc:  # noqa: BLE001

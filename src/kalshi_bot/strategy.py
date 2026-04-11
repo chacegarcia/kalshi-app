@@ -72,6 +72,7 @@ def signal_from_bar(
     probability_gap: float,
     order_count: int,
     limit_price_cents: int,
+    max_spread_dollars: float | None = None,
 ) -> TradeIntent | None:
     """Shared rule logic for both WebSocket tickers and backtest `PriceRecord` rows.
 
@@ -79,6 +80,8 @@ def signal_from_bar(
     """
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
     if spread < min_spread_dollars:
+        return None
+    if max_spread_dollars is not None and spread > max_spread_dollars:
         return None
 
     mid = (yes_bid_dollars + yes_ask_dollars) / 2.0
@@ -107,6 +110,8 @@ def signal_edge_buy_yes_from_ticker(
     """Buy YES only if ``fair_yes − ask − taker fee`` clears a mid-aware minimum edge (fee-aware ideology)."""
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
     if spread < settings.strategy_min_spread_dollars:
+        return None
+    if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
         return None
 
     fair = settings.trade_fair_yes_prob
@@ -173,6 +178,7 @@ class SampleSpreadGapStrategy:
             probability_gap=self.settings.strategy_probability_gap,
             order_count=self.settings.strategy_order_count,
             limit_price_cents=self.settings.strategy_limit_price_cents,
+            max_spread_dollars=self.settings.trade_max_entry_spread_dollars,
         )
 
 
@@ -193,6 +199,7 @@ def make_bar_strategy_fn(params: dict[str, Any]):
             probability_gap=float(params.get("probability_gap", 0)),
             order_count=int(params.get("order_count", 1)),
             limit_price_cents=int(params["limit_price_cents"]),
+            max_spread_dollars=params.get("max_spread_dollars"),
         )
 
     return _fn

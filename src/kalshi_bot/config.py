@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -147,14 +147,23 @@ class Settings(BaseSettings):
             "strategy_order_count",
         ),
     )
+    trade_min_order_notional_usd: float | None = Field(
+        default=3.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "TRADE_MIN_ORDER_NOTIONAL_USD",
+            "trade_min_order_notional_usd",
+        ),
+        description="Buy YES: bump contracts to at least this $ at limit (0 = no floor). Requires TRADE_MAX_ORDER_NOTIONAL_USD ≥ this.",
+    )
     trade_max_order_notional_usd: float | None = Field(
-        default=None,
+        default=5.0,
         ge=0.0,
         validation_alias=AliasChoices(
             "TRADE_MAX_ORDER_NOTIONAL_USD",
             "trade_max_order_notional_usd",
         ),
-        description="Cap buy-YES size: count ≤ floor(USD / limit_price_dollars). Omit or 0 to disable.",
+        description="Cap buy-YES $ at limit price. Default 5; set 0 to disable cap only.",
     )
     strategy_limit_price_cents: int = Field(
         default=50,
@@ -188,13 +197,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TRADE_USE_EDGE_STRATEGY", "trade_use_edge_strategy"),
     )
     trade_min_net_edge_after_fees: float = Field(
-        default=0.025,
+        default=0.005,
         ge=0.0,
         le=0.5,
         validation_alias=AliasChoices("TRADE_MIN_NET_EDGE_AFTER_FEES", "trade_min_net_edge_after_fees"),
+        description="Min (fair_yes − YES_ask − taker fee), 0–1 scale on $1 face. 0.005≈0.5¢ edge; 0.05≈5¢ — looser = more signals.",
     )
     trade_edge_middle_extra_edge: float = Field(
-        default=0.01,
+        default=0.002,
         ge=0.0,
         le=0.2,
         validation_alias=AliasChoices("TRADE_EDGE_MIDDLE_EXTRA_EDGE", "trade_edge_middle_extra_edge"),
@@ -219,13 +229,32 @@ class Settings(BaseSettings):
         ),
     )
     trade_llm_max_markets_per_run: int = Field(
-        default=20,
+        default=500,
         ge=1,
-        le=200,
+        le=500,
         validation_alias=AliasChoices(
             "TRADE_LLM_MAX_MARKETS_PER_RUN",
             "trade_llm_max_markets_per_run",
         ),
+    )
+    trade_min_market_volume: int | None = Field(
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices(
+            "TRADE_MIN_MARKET_VOLUME",
+            "trade_min_market_volume",
+        ),
+        description="If set, skip markets with lower REST `volume` (None/unknown skips when min is set).",
+    )
+    trade_max_entry_spread_dollars: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_MAX_ENTRY_SPREAD_DOLLARS",
+            "trade_max_entry_spread_dollars",
+        ),
+        description="If set, skip when (YES_ask − YES_bid) exceeds this — keeps tighter, more liquid books.",
     )
     trade_llm_relaxed_approval: bool = Field(
         default=False,
@@ -250,6 +279,43 @@ class Settings(BaseSettings):
             "trade_discover_auto_execute",
         ),
         description="If true, discover-trade may submit orders when --execute (still needs LIVE_TRADING and not DRY_RUN).",
+    )
+    trade_tape_max_trades_fetch: int = Field(
+        default=3000,
+        ge=50,
+        le=50_000,
+        validation_alias=AliasChoices(
+            "TRADE_TAPE_MAX_TRADES_FETCH",
+            "trade_tape_max_trades_fetch",
+        ),
+        description="How many recent public trades to pull for tape-trade ranking (paginated).",
+    )
+    trade_tape_top_markets: int = Field(
+        default=100,
+        ge=1,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_TAPE_TOP_MARKETS",
+            "trade_tape_top_markets",
+        ),
+        description="After ranking by flow, evaluate at most this many tickers per run.",
+    )
+    trade_tape_min_flow_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "TRADE_TAPE_MIN_FLOW_USD",
+            "trade_tape_min_flow_usd",
+        ),
+        description="Skip tickers with aggregate tape notional below this (0 = off).",
+    )
+    trade_tape_auto_execute: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_TAPE_AUTO_EXECUTE",
+            "trade_tape_auto_execute",
+        ),
+        description="If true, tape-trade may submit when --execute (still needs LIVE_TRADING and not DRY_RUN).",
     )
 
     # Balance-scaled limits (bigger account → larger caps within fixed % of balance)
@@ -425,6 +491,7 @@ class Settings(BaseSettings):
         "trade_llm_auto_execute",
         "trade_llm_relaxed_approval",
         "trade_discover_auto_execute",
+        "trade_tape_auto_execute",
         "trade_balance_sizing_enabled",
         mode="before",
     )
@@ -436,6 +503,16 @@ class Settings(BaseSettings):
             return False
         s = str(v).strip().lower()
         return s in ("1", "true", "yes", "on")
+
+    @model_validator(mode="after")
+    def _order_notional_min_max(self) -> "Settings":
+        mn = self.trade_min_order_notional_usd
+        mx = self.trade_max_order_notional_usd
+        if mn is not None and mx is not None and mn > 0 and mx > 0 and mn > mx:
+            raise ValueError(
+                "TRADE_MIN_ORDER_NOTIONAL_USD must be <= TRADE_MAX_ORDER_NOTIONAL_USD when both are positive"
+            )
+        return self
 
     @property
     def rest_base_url(self) -> str:
