@@ -29,6 +29,7 @@ from kalshi_bot.paper_engine import PaperFillConfig
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import SampleSpreadGapStrategy, TradeIntent, make_bar_strategy_fn
+from kalshi_bot.monitor import heartbeat, start_dashboard
 from kalshi_bot.ws import KalshiWS
 
 
@@ -97,6 +98,8 @@ def cmd_run_bot(settings: Settings) -> None:
         print("STRATEGY_MARKET_TICKER is required for run", file=sys.stderr)
         sys.exit(2)
 
+    start_dashboard(settings)
+
     auth = build_kalshi_auth(
         settings.kalshi_api_key_id,
         key_path=settings.kalshi_private_key_path,
@@ -116,6 +119,10 @@ def cmd_run_bot(settings: Settings) -> None:
                 snap = fetch_portfolio_snapshot(client, ticker=settings.strategy_market_ticker)
                 risk.record_balance_sample(snap.balance_cents)
                 cancel_stale_orders(client, settings, log)
+                if settings.dashboard_enabled:
+                    heartbeat(
+                        f"balance_cents={snap.balance_cents} exposure_cents={snap.total_exposure_cents:.0f}"
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.error("maintenance_loop_error", error=str(exc))
 
@@ -152,6 +159,8 @@ def cmd_run_bot(settings: Settings) -> None:
         env=settings.kalshi_env,
         market=settings.strategy_market_ticker,
     )
+    if settings.dashboard_enabled:
+        heartbeat("bot started")
     asyncio.run(_run())
 
 
@@ -246,7 +255,6 @@ def cmd_sensitivity(settings: Settings, path: Path) -> None:
         "limit_price_cents": settings.strategy_limit_price_cents,
     }
     tr, eq, _ = run_rule_backtest(records, strategy_signal_fn=make_bar_strategy_fn(params), paper_cfg=cfg)
-    from kalshi_bot.metrics import TradeOutcome
 
     sens = fee_slippage_sensitivity(
         base_trades=tr,
@@ -273,9 +281,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("cancel-all", help="Cancel all resting orders")
 
-    run = sub.add_parser("run", help="Run strategy loop (default command)")
+    run = sub.add_parser("run", help="Run strategy loop (default command); opens local monitor in browser")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--live", action="store_true")
+    run.add_argument("--no-web", action="store_true", help="Disable Flask dashboard and browser open")
 
     bt = sub.add_parser("backtest", help="Run rule backtest on JSONL price records")
     bt.add_argument("data", type=Path, help="Path to JSONL (ts, ticker, yes_bid_dollars, yes_ask_dollars)")
@@ -306,6 +315,8 @@ def main(argv: list[str] | None = None) -> None:
         if getattr(args, "live", False):
             os.environ["LIVE_TRADING"] = "true"
             os.environ["DRY_RUN"] = "false"
+        if getattr(args, "no_web", False):
+            os.environ["DASHBOARD_ENABLED"] = "false"
 
     get_settings.cache_clear()
     settings = get_settings()

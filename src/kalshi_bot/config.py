@@ -98,12 +98,20 @@ class Settings(BaseSettings):
     paper_slippage_cents_per_contract: float = Field(default=0.0, validation_alias=_env("PAPER_SLIPPAGE_CENTS_PER_CONTRACT", "paper_slippage_cents_per_contract"))
     paper_fill_probability: float = Field(default=0.85, ge=0, le=1, validation_alias=_env("PAPER_FILL_PROBABILITY", "paper_fill_probability"))
 
+    # Local monitor (Flask) while `run` is active
+    dashboard_enabled: bool = Field(default=True, validation_alias=_env("DASHBOARD_ENABLED", "dashboard_enabled"))
+    dashboard_host: str = Field(default="127.0.0.1", validation_alias=_env("DASHBOARD_HOST", "dashboard_host"))
+    dashboard_port: int = Field(default=5050, ge=1, le=65535, validation_alias=_env("DASHBOARD_PORT", "dashboard_port"))
+    dashboard_open_browser: bool = Field(
+        default=True, validation_alias=_env("DASHBOARD_OPEN_BROWSER", "dashboard_open_browser")
+    )
+
     log_level: str = Field(default="INFO", validation_alias=_env("LOG_LEVEL", "log_level"))
     structured_log_path: Path = Field(
         default_factory=_default_log_path, validation_alias=_env("STRUCTURED_LOG_PATH", "structured_log_path")
     )
 
-    @field_validator("live_trading", "dry_run", "kill_switch", "no_martingale", mode="before")
+    @field_validator("live_trading", "dry_run", "kill_switch", "no_martingale", "dashboard_enabled", "dashboard_open_browser", mode="before")
     @classmethod
     def _parse_bool(cls, v: object) -> bool:
         if isinstance(v, bool):

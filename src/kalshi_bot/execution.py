@@ -12,6 +12,7 @@ from kalshi_python_sync.models.order import Order
 from kalshi_bot.client import KalshiSdkClient, with_rest_retry
 from kalshi_bot.config import Settings
 from kalshi_bot.logger import StructuredLogger
+from kalshi_bot.monitor import record_event
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import TradeIntent
@@ -148,6 +149,7 @@ def execute_intent(
     )
     if not decision.allowed:
         log.info("order_blocked", reason=decision.reason, intent=intent)
+        record_event("blocked", reason=decision.reason, intent=intent)
         return
 
     if settings.dry_run:
@@ -155,16 +157,28 @@ def execute_intent(
         sim = ldg.record_intent(intent)
         risk.record_order_submitted(intent.count)
         log.info("dry_run_order", simulated_client_order_id=sim.client_order_id, intent=intent)
+        record_event(
+            "dry_run",
+            simulated_client_order_id=sim.client_order_id,
+            ticker=intent.ticker,
+            count=intent.count,
+            yes_price_cents=intent.yes_price_cents,
+        )
         return
 
     if not settings.can_send_real_orders:
         log.warning("order_refused", reason="LIVE_TRADING_false_or_misconfigured", intent=intent)
+        record_event("refused", reason="LIVE_TRADING_false_or_misconfigured", intent=intent)
         return
 
     if settings.kalshi_env == "prod":
         _warn_live_banner(settings)
 
     log.info("live_order_submit", intent=intent, env=settings.kalshi_env)
+    record_event("live_submit", env=settings.kalshi_env, intent=intent)
     resp = place_limit_order_live(client, intent)
     risk.record_order_submitted(intent.count)
+    oid = getattr(resp, "order", None)
+    order_id = getattr(oid, "order_id", None) if oid is not None else getattr(resp, "order_id", None)
     log.info("live_order_ack", response_type=type(resp).__name__)
+    record_event("live_ack", response_type=type(resp).__name__, order_id=order_id)
