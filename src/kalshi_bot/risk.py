@@ -88,10 +88,13 @@ class RiskManager:
         *,
         market_ticker: str,
         order_contracts: int,
-        position_contracts_for_market: float,
+        projected_abs_position: float,
         resting_orders_on_market: int,
         current_total_exposure_cents: float = 0.0,
         additional_order_exposure_cents: float = 0.0,
+        order_increases_exposure: bool = True,
+        max_contracts_override: int | None = None,
+        max_exposure_cents_override: float | None = None,
     ) -> RiskDecision:
         if self.kill_switch_active():
             return RiskDecision(False, "kill_switch_enabled")
@@ -102,21 +105,27 @@ class RiskManager:
         if self.daily_loss_usd() >= self._s.max_daily_drawdown_usd:
             return RiskDecision(False, "max_daily_drawdown_exceeded")
 
-        projected = position_contracts_for_market + order_contracts
-        if projected > self._s.max_contracts_per_market:
+        max_c = max_contracts_override if max_contracts_override is not None else self._s.max_contracts_per_market
+        if projected_abs_position > max_c:
             return RiskDecision(False, "max_contracts_per_market_exceeded")
 
         if resting_orders_on_market >= self._s.max_open_orders_per_market:
             return RiskDecision(False, "max_open_orders_per_market")
 
+        max_exp = max_exposure_cents_override if max_exposure_cents_override is not None else float(self._s.max_exposure_cents)
         if (
             current_total_exposure_cents + additional_order_exposure_cents
-            > self._s.max_exposure_cents
+            > max_exp
         ):
             return RiskDecision(False, "max_exposure_exceeded")
 
-        # Anti-martingale: do not increase size after a loss while in loss state
-        if self._s.no_martingale and self.state.last_realized_loss and self.state.last_order_contracts is not None:
+        # Anti-martingale: do not increase *buy* size after a loss (sells / closes exempt)
+        if (
+            self._s.no_martingale
+            and order_increases_exposure
+            and self.state.last_realized_loss
+            and self.state.last_order_contracts is not None
+        ):
             if order_contracts > self.state.last_order_contracts:
                 return RiskDecision(False, "no_martingale_increase_after_loss")
 

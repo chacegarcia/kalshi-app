@@ -12,10 +12,11 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from kalshi_bot.ssl_bundle import apply_certifi_ca_bundle
 from kalshi_bot.auth import AuthError, build_kalshi_auth
+from kalshi_bot.auto_sell import run_auto_sell_loop
 from kalshi_bot.backtest import load_price_records_jsonl, parameter_sweep, run_rule_backtest, walk_forward_eval
-from kalshi_bot.client import KalshiSdkClient
-from kalshi_bot.config import Settings, get_settings
+from kalshi_bot.config import Settings, get_settings, project_root
 from kalshi_bot.execution import (
     DryRunLedger,
     cancel_all_resting_orders,
@@ -25,25 +26,45 @@ from kalshi_bot.execution import (
 from kalshi_bot.logger import get_logger
 from kalshi_bot.market_data import list_open_markets, summarize_market_row
 from kalshi_bot.metrics import NO_GUARANTEE_DISCLAIMER, fee_slippage_sensitivity
+from kalshi_bot.scanner import format_scan_report, scan_kalshi_opportunities
 from kalshi_bot.paper_engine import PaperFillConfig
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.strategy import SampleSpreadGapStrategy, TradeIntent, make_bar_strategy_fn
+from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
 from kalshi_bot.monitor import heartbeat, start_dashboard
+from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.ws import KalshiWS
 
 
-def _sdk_client(settings: Settings) -> KalshiSdkClient:
-    auth = build_kalshi_auth(
-        settings.kalshi_api_key_id,
-        key_path=settings.kalshi_private_key_path,
-        key_pem=settings.kalshi_private_key_pem,
+def cmd_llm_trade(settings: Settings, *, execute: bool) -> None:
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    from kalshi_bot.llm_runner import run_llm_opportunity_pipeline
+
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    try:
+        n = run_llm_opportunity_pipeline(settings, execute=execute, log=log)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    print(f"Orders submitted this run (0 = none or scan-only): {n}")
+
+
+def cmd_scan(settings: Settings, *, limit: int, use_llm: bool) -> None:
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    client = build_sdk_client(settings)
+    rows = scan_kalshi_opportunities(client, settings, limit=limit, use_llm_fair=use_llm)
+    print(format_scan_report(rows))
+    print()
+    print(
+        "boxed$_after_fees: 1.0 − YES_ask − NO_ask − taker fees (Kalshi formula). "
+        "edge_vs_fair: TRADE_FAIR_YES_PROB − YES_ask − fee (needs TRADE_FAIR_YES_PROB or --llm)."
     )
-    return KalshiSdkClient(rest_base_url=settings.rest_base_url, auth=auth)
 
 
 def cmd_list_markets(settings: Settings) -> None:
-    client = _sdk_client(settings)
+    client = build_sdk_client(settings)
     resp = list_open_markets(client, limit=30)
     markets = getattr(resp, "markets", []) or []
     for m in markets:
@@ -70,24 +91,91 @@ def cmd_watch_market(settings: Settings, ticker: str) -> None:
 def cmd_place_test_order(settings: Settings, ticker: str | None) -> None:
     t = ticker or settings.strategy_market_ticker
     if not t:
-        print("Set STRATEGY_MARKET_TICKER or pass --ticker", file=sys.stderr)
+        print("Set TRADE_MARKET_TICKER (or STRATEGY_MARKET_TICKER) or pass --ticker", file=sys.stderr)
         sys.exit(2)
-    client = _sdk_client(settings)
+    client = build_sdk_client(settings)
     log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
     risk = RiskManager(settings)
     ledger = DryRunLedger()
-    intent = TradeIntent(
+    intent = make_limit_intent(
         ticker=t,
         side="yes",
         action="buy",
         count=1,
         yes_price_cents=settings.strategy_limit_price_cents,
     )
-    execute_intent(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+    trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+
+
+def cmd_trade(
+    settings: Settings,
+    *,
+    ticker: str,
+    side: str,
+    action: str,
+    count: int,
+    yes_price_cents: int | None,
+) -> None:
+    client = build_sdk_client(settings)
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    risk = RiskManager(settings)
+    ledger = DryRunLedger()
+    price = yes_price_cents if yes_price_cents is not None else settings.strategy_limit_price_cents
+    intent = make_limit_intent(
+        ticker=ticker,
+        side=side,  # type: ignore[arg-type]
+        action=action,  # type: ignore[arg-type]
+        count=count,
+        yes_price_cents=price,
+    )
+    trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+
+
+def cmd_auto_sell(
+    settings: Settings,
+    *,
+    ticker: str | None,
+    min_yes_bid_cents: int | None,
+    poll_seconds: float | None,
+    max_cycles: int,
+    once: bool,
+) -> None:
+    t = ticker or settings.strategy_market_ticker
+    if not t:
+        print("Pass a ticker argument or set TRADE_MARKET_TICKER in .env", file=sys.stderr)
+        sys.exit(2)
+    poll = poll_seconds if poll_seconds is not None else settings.auto_sell_poll_seconds
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    eff = settings.auto_sell_effective_min_yes_bid_cents(min_yes_bid_cents)
+    log.warning(
+        "auto_sell_start",
+        ticker=t,
+        cli_min_yes_bid_cents=min_yes_bid_cents,
+        effective_min_yes_bid_cents=eff,
+        take_profit_min_yes_bid_pct=settings.trade_exit_take_profit_min_yes_bid_pct,
+        min_profit_cents=settings.trade_exit_min_profit_cents_per_contract,
+        sell_time_in_force=settings.trade_exit_sell_time_in_force,
+        poll_seconds=poll,
+        max_cycles=max_cycles,
+        once=once,
+    )
+    try:
+        run_auto_sell_loop(
+            settings,
+            ticker=t,
+            cli_min_yes_bid_cents=min_yes_bid_cents,
+            poll_seconds=poll,
+            max_cycles=max_cycles,
+            stop_after_one_sell=once,
+            log=log,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 
 
 def cmd_cancel_all(settings: Settings) -> None:
-    client = _sdk_client(settings)
+    client = build_sdk_client(settings)
     log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
     n = cancel_all_resting_orders(client, log)
     print(f"Requested cancel for {n} orders.")
@@ -95,7 +183,7 @@ def cmd_cancel_all(settings: Settings) -> None:
 
 def cmd_run_bot(settings: Settings) -> None:
     if not settings.strategy_market_ticker:
-        print("STRATEGY_MARKET_TICKER is required for run", file=sys.stderr)
+        print("TRADE_MARKET_TICKER is required for run", file=sys.stderr)
         sys.exit(2)
 
     start_dashboard(settings)
@@ -105,7 +193,7 @@ def cmd_run_bot(settings: Settings) -> None:
         key_path=settings.kalshi_private_key_path,
         key_pem=settings.kalshi_private_key_pem,
     )
-    client = _sdk_client(settings)
+    client = build_sdk_client(settings)
     log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
     risk = RiskManager(settings)
     ledger = DryRunLedger()
@@ -273,13 +361,64 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list-markets", help="List open markets")
 
+    sc = sub.add_parser(
+        "scan",
+        help="Kalshi-only: boxed YES+NO surplus after fees + edge vs TRADE_FAIR_YES_PROB (optional LLM)",
+    )
+    sc.add_argument("--limit", type=int, default=30, help="Max open markets to pull orderbooks for")
+    sc.add_argument(
+        "--llm",
+        action="store_true",
+        help="If TRADE_LLM_SCREEN_ENABLED and OPENAI_API_KEY, ask model for fair_yes per title",
+    )
+
+    lt = sub.add_parser(
+        "llm-trade",
+        help="LLM reasons over open markets; bot re-checks edge/fees; optional execute (OPENAI_API_KEY)",
+    )
+    lt.add_argument(
+        "--execute",
+        action="store_true",
+        help="Submit orders when LLM+math pass (still needs TRADE_LLM_AUTO_EXECUTE=true; DRY_RUN respected)",
+    )
+
     w = sub.add_parser("watch-market", help="WebSocket ticker + orderbook stream")
     w.add_argument("ticker")
 
-    po = sub.add_parser("place-test-order", help="One shot through risk + execution")
+    po = sub.add_parser("place-test-order", help="One shot: buy 1 YES at STRATEGY_LIMIT_PRICE_CENTS")
     po.add_argument("--ticker", default=None)
 
+    tr = sub.add_parser(
+        "trade",
+        help="Place one limit order (side/action/count/price) via same risk + execution as run",
+    )
+    tr.add_argument("ticker", help="Market ticker")
+    tr.add_argument("--side", choices=["yes", "no"], default="yes")
+    tr.add_argument("--action", choices=["buy", "sell"], default="buy")
+    tr.add_argument("--count", type=int, default=1)
+    tr.add_argument(
+        "--yes-price-cents",
+        type=int,
+        default=None,
+        help="Limit price in cents (default: STRATEGY_LIMIT_PRICE_CENTS)",
+    )
+
     sub.add_parser("cancel-all", help="Cancel all resting orders")
+
+    ase = sub.add_parser(
+        "auto-sell",
+        help="Poll best YES bid; when bid >= floor, limit-sell long YES at that bid (set min in CLI or .env)",
+    )
+    ase.add_argument("ticker", nargs="?", default=None, help="Market (default: TRADE_MARKET_TICKER)")
+    ase.add_argument(
+        "--min-yes-bid-cents",
+        type=int,
+        default=None,
+        help="Override min best YES bid (cents); else TRADE_TAKE_PROFIT_* / TRADE_EXIT_TAKE_PROFIT_MIN_YES_BID_PCT",
+    )
+    ase.add_argument("--poll", type=float, default=None, help="Seconds between checks (default: TRADE_TAKE_PROFIT_POLL_SECONDS or 2)")
+    ase.add_argument("--max-cycles", type=int, default=0, help="Stop after N polls (0 = unlimited)")
+    ase.add_argument("--once", action="store_true", help="Exit after one sell attempt (may still dry-run)")
 
     run = sub.add_parser("run", help="Run strategy loop (default command); opens local monitor in browser")
     run.add_argument("--dry-run", action="store_true")
@@ -302,7 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    load_dotenv()
+    apply_certifi_ca_bundle()
+    load_dotenv(project_root() / ".env")
     argv = argv if argv is not None else sys.argv[1:]
     p = build_parser()
     args = p.parse_args(argv)
@@ -324,10 +464,32 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if cmd == "list-markets":
             cmd_list_markets(settings)
+        elif cmd == "scan":
+            cmd_scan(settings, limit=args.limit, use_llm=args.llm)
+        elif cmd == "llm-trade":
+            cmd_llm_trade(settings, execute=args.execute)
         elif cmd == "watch-market":
             cmd_watch_market(settings, args.ticker)
         elif cmd == "place-test-order":
             cmd_place_test_order(settings, args.ticker)
+        elif cmd == "trade":
+            cmd_trade(
+                settings,
+                ticker=args.ticker,
+                side=args.side,
+                action=args.action,
+                count=args.count,
+                yes_price_cents=args.yes_price_cents,
+            )
+        elif cmd == "auto-sell":
+            cmd_auto_sell(
+                settings,
+                ticker=args.ticker,
+                min_yes_bid_cents=args.min_yes_bid_cents,
+                poll_seconds=args.poll,
+                max_cycles=args.max_cycles,
+                once=args.once,
+            )
         elif cmd == "cancel-all":
             cmd_cancel_all(settings)
         elif cmd == "run":

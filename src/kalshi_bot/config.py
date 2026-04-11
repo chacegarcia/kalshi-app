@@ -19,11 +19,20 @@ def _default_log_path() -> Path:
     return Path("logs/kalshi_bot.jsonl")
 
 
+# Repo root = directory containing pyproject.toml (parent of src/)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def project_root() -> Path:
+    """Project root (``pyproject.toml``). Runtime config: ``.env``; variable list: ``.env.example``."""
+    return _PROJECT_ROOT
+
+
 class Settings(BaseSettings):
-    """All configuration is environment-driven; defaults favor demo + dry-run safety."""
+    """Environment-driven settings (loaded from ``.env``). See ``.env.example`` for every key."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -38,24 +47,45 @@ class Settings(BaseSettings):
 
     kalshi_env: Literal["demo", "prod"] = Field(default="demo", validation_alias=_env("KALSHI_ENV", "kalshi_env"))
 
+    # Optional: pin REST/WebSocket hosts (defaults follow KALSHI_ENV). Prod default is Kalshi's unified API
+    # (api.elections.kalshi.com — all markets, not only elections).
+    kalshi_rest_base_url: str | None = Field(
+        default=None, validation_alias=_env("KALSHI_REST_BASE_URL", "kalshi_rest_base_url")
+    )
+    kalshi_ws_url: str | None = Field(default=None, validation_alias=_env("KALSHI_WS_URL", "kalshi_ws_url"))
+
     live_trading: bool = Field(default=False, validation_alias=_env("LIVE_TRADING", "live_trading"))
     dry_run: bool = Field(default=True, validation_alias=_env("DRY_RUN", "dry_run"))
 
-    # Risk: exposure & drawdown (amounts in USD where noted; cents for exposure cap)
+    # --- Risk & bankroll (session limits, exposure caps) ---
     max_exposure_cents: float = Field(
         default=50_000.0,
         ge=0,
-        validation_alias=_env("MAX_EXPOSURE_CENTS", "max_exposure_cents"),
+        validation_alias=AliasChoices(
+            "TRADE_MAX_TOTAL_EXPOSURE_CENTS",
+            "MAX_EXPOSURE_CENTS",
+            "max_exposure_cents",
+        ),
     )
     max_contracts_per_market: int = Field(
         default=10,
         ge=1,
-        validation_alias=AliasChoices("MAX_CONTRACTS_PER_MARKET", "MAX_POSITION_CONTRACTS", "max_contracts_per_market"),
+        validation_alias=AliasChoices(
+            "TRADE_MAX_CONTRACTS_PER_MARKET",
+            "MAX_CONTRACTS_PER_MARKET",
+            "MAX_POSITION_CONTRACTS",
+            "max_contracts_per_market",
+        ),
     )
     max_daily_drawdown_usd: float = Field(
         default=25.0,
         ge=0,
-        validation_alias=AliasChoices("MAX_DAILY_DRAWDOWN_USD", "MAX_DAILY_LOSS_USD", "max_daily_drawdown_usd"),
+        validation_alias=AliasChoices(
+            "TRADE_STOP_MAX_SESSION_LOSS_USD",
+            "MAX_DAILY_DRAWDOWN_USD",
+            "MAX_DAILY_LOSS_USD",
+            "max_daily_drawdown_usd",
+        ),
     )
     max_open_orders_per_market: int = Field(
         default=3, ge=1, validation_alias=_env("MAX_OPEN_ORDERS_PER_MARKET", "max_open_orders_per_market")
@@ -71,26 +101,227 @@ class Settings(BaseSettings):
     stale_order_seconds: int = Field(default=3600, ge=1, validation_alias=_env("STALE_ORDER_SECONDS", "stale_order_seconds"))
     kill_switch: bool = Field(default=False, validation_alias=_env("KILL_SWITCH", "kill_switch"))
 
-    # Strategy (research sample — plug in your own in strategy.py)
-    strategy_market_ticker: str = Field(default="", validation_alias=_env("STRATEGY_MARKET_TICKER", "strategy_market_ticker"))
+    # --- Trading — market (which contract the sample strategy / auto-sell target) ---
+    strategy_market_ticker: str = Field(
+        default="",
+        validation_alias=AliasChoices("TRADE_MARKET_TICKER", "STRATEGY_MARKET_TICKER", "strategy_market_ticker"),
+    )
+
+    # --- Trading — entry (buy YES): price filters & size ---
     strategy_max_yes_ask_dollars: float = Field(
-        default=0.55, ge=0, validation_alias=_env("STRATEGY_MAX_YES_ASK_DOLLARS", "strategy_max_yes_ask_dollars")
+        default=0.55,
+        ge=0,
+        validation_alias=AliasChoices(
+            "TRADE_BUY_MAX_YES_ASK_DOLLARS",
+            "STRATEGY_MAX_YES_ASK_DOLLARS",
+            "strategy_max_yes_ask_dollars",
+        ),
     )
     strategy_min_spread_dollars: float = Field(
-        default=0.0, ge=0, validation_alias=_env("STRATEGY_MIN_SPREAD_DOLLARS", "strategy_min_spread_dollars")
+        default=0.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MIN_SPREAD_DOLLARS",
+            "STRATEGY_MIN_SPREAD_DOLLARS",
+            "strategy_min_spread_dollars",
+        ),
     )
     strategy_probability_gap: float = Field(
         default=0.0,
         ge=0,
         le=0.5,
-        validation_alias=_env("STRATEGY_PROBABILITY_GAP", "strategy_probability_gap"),
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MIN_EDGE_FROM_50",
+            "STRATEGY_PROBABILITY_GAP",
+            "strategy_probability_gap",
+        ),
     )
-    strategy_order_count: int = Field(default=1, ge=1, validation_alias=_env("STRATEGY_ORDER_COUNT", "strategy_order_count"))
+    strategy_order_count: int = Field(
+        default=1,
+        ge=1,
+        validation_alias=AliasChoices(
+            "TRADE_BUY_CONTRACTS_PER_ORDER",
+            "STRATEGY_ORDER_COUNT",
+            "strategy_order_count",
+        ),
+    )
     strategy_limit_price_cents: int = Field(
-        default=50, ge=1, le=99, validation_alias=_env("STRATEGY_LIMIT_PRICE_CENTS", "strategy_limit_price_cents")
+        default=50,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_BUY_LIMIT_YES_PRICE_CENTS",
+            "STRATEGY_LIMIT_PRICE_CENTS",
+            "strategy_limit_price_cents",
+        ),
     )
     strategy_min_seconds_between_signals: int = Field(
-        default=45, ge=0, validation_alias=_env("STRATEGY_MIN_SECONDS_BETWEEN_SIGNALS", "strategy_min_seconds_between_signals")
+        default=45,
+        ge=0,
+        validation_alias=AliasChoices(
+            "TRADE_MIN_SECONDS_BETWEEN_ORDERS",
+            "STRATEGY_MIN_SECONDS_BETWEEN_SIGNALS",
+            "strategy_min_seconds_between_signals",
+        ),
+    )
+
+    # --- Edge-aware entry (fair value vs market + Kalshi taker fee curve) ---
+    trade_fair_yes_prob: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("TRADE_FAIR_YES_PROB", "trade_fair_yes_prob"),
+    )
+    trade_use_edge_strategy: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_USE_EDGE_STRATEGY", "trade_use_edge_strategy"),
+    )
+    trade_min_net_edge_after_fees: float = Field(
+        default=0.025,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices("TRADE_MIN_NET_EDGE_AFTER_FEES", "trade_min_net_edge_after_fees"),
+    )
+    trade_edge_middle_extra_edge: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=0.2,
+        validation_alias=AliasChoices("TRADE_EDGE_MIDDLE_EXTRA_EDGE", "trade_edge_middle_extra_edge"),
+    )
+    trade_llm_screen_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_LLM_SCREEN_ENABLED", "trade_llm_screen_enabled"),
+    )
+    trade_llm_model: str = Field(
+        default="gpt-4o-mini",
+        validation_alias=AliasChoices("TRADE_LLM_MODEL", "trade_llm_model"),
+    )
+    openai_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"),
+    )
+    trade_llm_auto_execute: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_AUTO_EXECUTE",
+            "trade_llm_auto_execute",
+        ),
+    )
+    trade_llm_max_markets_per_run: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_MAX_MARKETS_PER_RUN",
+            "trade_llm_max_markets_per_run",
+        ),
+    )
+
+    # Balance-scaled limits (bigger account → larger caps within fixed % of balance)
+    trade_balance_sizing_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_BALANCE_SIZING_ENABLED",
+            "trade_balance_sizing_enabled",
+        ),
+    )
+    trade_risk_pct_of_balance_per_trade: float = Field(
+        default=0.02,
+        ge=0.0001,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_RISK_PCT_OF_BALANCE_PER_TRADE",
+            "trade_risk_pct_of_balance_per_trade",
+        ),
+    )
+    trade_total_risk_pct_of_balance: float = Field(
+        default=0.25,
+        ge=0.01,
+        le=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_TOTAL_RISK_PCT_OF_BALANCE",
+            "trade_total_risk_pct_of_balance",
+        ),
+    )
+
+    # --- Trading — exit: take-profit (auto-sell) & pacing ---
+    auto_sell_min_yes_bid_cents: int | None = Field(
+        default=None,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_TAKE_PROFIT_MIN_YES_BID_CENTS",
+            "AUTO_SELL_MIN_YES_BID_CENTS",
+            "auto_sell_min_yes_bid_cents",
+        ),
+    )
+    auto_sell_poll_seconds: float = Field(
+        default=2.0,
+        ge=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_TAKE_PROFIT_POLL_SECONDS",
+            "AUTO_SELL_POLL_SECONDS",
+            "auto_sell_poll_seconds",
+        ),
+    )
+
+    # Exit quality: implied-% floor, optional profit-margin vs entry, IOC-style sells (Kalshi API TIF)
+    trade_exit_take_profit_min_yes_bid_pct: float = Field(
+        default=72.0,
+        ge=1.0,
+        le=99.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TAKE_PROFIT_MIN_YES_BID_PCT",
+            "trade_exit_take_profit_min_yes_bid_pct",
+        ),
+    )
+    trade_exit_min_profit_cents_per_contract: float | None = Field(
+        default=None,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT",
+            "TRADE_EXIT_MIN_PROFIT_CENTS",
+            "trade_exit_min_profit_cents_per_contract",
+        ),
+    )
+    trade_exit_entry_reference_yes_cents: int | None = Field(
+        default=None,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS",
+            "trade_exit_entry_reference_yes_cents",
+        ),
+    )
+    trade_exit_estimate_entry_from_portfolio: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO",
+            "trade_exit_estimate_entry_from_portfolio",
+        ),
+    )
+    trade_exit_only_profit_margin: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_ONLY_PROFIT_MARGIN",
+            "trade_exit_only_profit_margin",
+        ),
+    )
+    trade_exit_sell_time_in_force: Literal["immediate_or_cancel", "fill_or_kill", "good_till_canceled"] = Field(
+        default="immediate_or_cancel",
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_SELL_TIME_IN_FORCE",
+            "trade_exit_sell_time_in_force",
+        ),
+    )
+    trade_exit_sell_aggression_cents: int = Field(
+        default=0,
+        ge=0,
+        le=15,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_SELL_AGGRESSION_CENTS",
+            "trade_exit_sell_aggression_cents",
+        ),
     )
 
     # Paper / backtest defaults (override in CLI or code)
@@ -111,7 +342,55 @@ class Settings(BaseSettings):
         default_factory=_default_log_path, validation_alias=_env("STRUCTURED_LOG_PATH", "structured_log_path")
     )
 
-    @field_validator("live_trading", "dry_run", "kill_switch", "no_martingale", "dashboard_enabled", "dashboard_open_browser", mode="before")
+    @field_validator("kalshi_rest_base_url", "kalshi_ws_url", mode="before")
+    @classmethod
+    def _blank_url_to_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    @field_validator("openai_api_key", mode="before")
+    @classmethod
+    def _blank_openai_to_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    @field_validator("trade_exit_sell_time_in_force", mode="before")
+    @classmethod
+    def _normalize_exit_time_in_force(cls, v: object) -> str:
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            return "immediate_or_cancel"
+        s = str(v).strip().lower().replace("-", "_")
+        aliases = {
+            "ioc": "immediate_or_cancel",
+            "fok": "fill_or_kill",
+            "gtc": "good_till_canceled",
+            "good_till_cancelled": "good_till_canceled",
+        }
+        s = aliases.get(s, s)
+        if s not in ("immediate_or_cancel", "fill_or_kill", "good_till_canceled"):
+            raise ValueError(
+                "trade_exit_sell_time_in_force must be immediate_or_cancel, fill_or_kill, or good_till_canceled "
+                f"(got {v!r})"
+            )
+        return s
+
+    @field_validator(
+        "live_trading",
+        "dry_run",
+        "kill_switch",
+        "no_martingale",
+        "dashboard_enabled",
+        "dashboard_open_browser",
+        "trade_use_edge_strategy",
+        "trade_llm_screen_enabled",
+        "trade_llm_auto_execute",
+        "trade_balance_sizing_enabled",
+        mode="before",
+    )
     @classmethod
     def _parse_bool(cls, v: object) -> bool:
         if isinstance(v, bool):
@@ -123,12 +402,16 @@ class Settings(BaseSettings):
 
     @property
     def rest_base_url(self) -> str:
+        if self.kalshi_rest_base_url:
+            return self.kalshi_rest_base_url.rstrip("/")
         if self.kalshi_env == "demo":
             return "https://demo-api.kalshi.co/trade-api/v2"
         return "https://api.elections.kalshi.com/trade-api/v2"
 
     @property
     def ws_url(self) -> str:
+        if self.kalshi_ws_url:
+            return self.kalshi_ws_url.rstrip("/")
         if self.kalshi_env == "demo":
             return "wss://demo-api.kalshi.co/trade-api/ws/v2"
         return "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -137,6 +420,26 @@ class Settings(BaseSettings):
     def can_send_real_orders(self) -> bool:
         """True only when live trading is explicitly enabled and dry-run is off."""
         return self.live_trading and not self.dry_run
+
+    @property
+    def trade_buy_max_yes_ask_implied_pct(self) -> float:
+        """Entry cap `TRADE_BUY_MAX_YES_ASK_DOLLARS` as implied YES probability in 0–100 (e.g. 0.55 → 55)."""
+        return self.strategy_max_yes_ask_dollars * 100.0
+
+    @property
+    def trade_entry_min_edge_from_50_pct_points(self) -> float:
+        """Minimum |mid−50%| in percentage points (`TRADE_ENTRY_MIN_EDGE_FROM_50` × 100)."""
+        return self.strategy_probability_gap * 100.0
+
+    def auto_sell_effective_min_yes_bid_cents(self, cli_override: int | None) -> int | None:
+        """Min best YES bid (cents) to treat as take-profit-by-implied-%, or None if only profit-margin mode."""
+        if self.trade_exit_only_profit_margin:
+            return None
+        if cli_override is not None:
+            return cli_override
+        if self.auto_sell_min_yes_bid_cents is not None:
+            return self.auto_sell_min_yes_bid_cents
+        return int(round(self.trade_exit_take_profit_min_yes_bid_pct))
 
 
 @lru_cache

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from kalshi_bot.config import Settings
+from kalshi_bot.edge_math import min_edge_threshold_for_mid, net_edge_buy_yes_long
 
 
 @dataclass
@@ -24,6 +25,25 @@ class TradeIntent:
     count: int
     yes_price_cents: int
     time_in_force: str = "good_till_canceled"
+
+
+def signed_position_delta(intent: TradeIntent) -> float:
+    """Net YES contracts added (Kalshi convention: long YES > 0, long NO < 0)."""
+    c = float(intent.count)
+    if intent.side == "yes" and intent.action == "buy":
+        return c
+    if intent.side == "yes" and intent.action == "sell":
+        return -c
+    if intent.side == "no" and intent.action == "buy":
+        return -c
+    if intent.side == "no" and intent.action == "sell":
+        return c
+    return 0.0
+
+
+def projected_abs_position_after(signed: float, intent: TradeIntent) -> float:
+    """Absolute net position after the order (for per-market contract cap)."""
+    return abs(signed + signed_position_delta(intent))
 
 
 class Strategy(Protocol):
@@ -77,6 +97,46 @@ def signal_from_bar(
     )
 
 
+def signal_edge_buy_yes_from_ticker(
+    *,
+    ticker: str,
+    yes_bid_dollars: float,
+    yes_ask_dollars: float,
+    settings: Settings,
+) -> TradeIntent | None:
+    """Buy YES only if ``fair_yes − ask − taker fee`` clears a mid-aware minimum edge (fee-aware ideology)."""
+    spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
+    if spread < settings.strategy_min_spread_dollars:
+        return None
+
+    fair = settings.trade_fair_yes_prob
+    if fair is None:
+        return None
+
+    mid = (yes_bid_dollars + yes_ask_dollars) / 2.0
+    c = settings.strategy_order_count
+    edge = net_edge_buy_yes_long(fair_yes=fair, yes_ask_dollars=yes_ask_dollars, contracts=c)
+    need = min_edge_threshold_for_mid(
+        mid,
+        base_min_edge=settings.trade_min_net_edge_after_fees,
+        middle_extra=settings.trade_edge_middle_extra_edge,
+    )
+    if edge < need:
+        return None
+
+    if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
+        return None
+
+    limit_cents = int(max(1, min(99, round(yes_ask_dollars * 100.0))))
+    return TradeIntent(
+        ticker=ticker,
+        side="yes",
+        action="buy",
+        count=c,
+        yes_price_cents=limit_cents,
+    )
+
+
 @dataclass
 class SampleSpreadGapStrategy:
     """Research sample: require min spread + probability gap away from 0.5, cap on YES ask."""
@@ -95,6 +155,14 @@ class SampleSpreadGapStrategy:
         ask = _parse_dollar_field(body.get("yes_ask_dollars"))
         if bid is None or ask is None:
             return None
+
+        if self.settings.trade_use_edge_strategy and self.settings.trade_fair_yes_prob is not None:
+            return signal_edge_buy_yes_from_ticker(
+                ticker=ticker,
+                yes_bid_dollars=bid,
+                yes_ask_dollars=ask,
+                settings=self.settings,
+            )
 
         return signal_from_bar(
             ticker=ticker,

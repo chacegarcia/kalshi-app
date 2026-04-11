@@ -35,6 +35,38 @@ def get_orderbook(client: KalshiSdkClient, ticker: str) -> GetMarketOrderbookRes
     return client.markets.get_market_orderbook(ticker=ticker, depth=10)
 
 
+def _best_bid_dollars(levels: list[list[str]] | None) -> float | None:
+    if not levels:
+        return None
+    best = 0.0
+    for row in levels:
+        if len(row) >= 1:
+            best = max(best, float(row[0]))
+    return best if best > 0 else None
+
+
+def best_yes_bid_cents(orderbook: GetMarketOrderbookResponse) -> int | None:
+    """Best bid to buy YES (highest price in dollars → cents). None if no YES bids."""
+    ob = orderbook.orderbook_fp
+    if ob is None:
+        return None
+    b = _best_bid_dollars(list(ob.yes_dollars or []))
+    if b is None or b <= 0:
+        return None
+    return int(round(b * 100))
+
+
+def best_no_bid_cents(orderbook: GetMarketOrderbookResponse) -> int | None:
+    """Best bid on the NO side (dollars → cents)."""
+    ob = orderbook.orderbook_fp
+    if ob is None:
+        return None
+    b = _best_bid_dollars(list(ob.no_dollars or []))
+    if b is None or b <= 0:
+        return None
+    return int(round(b * 100))
+
+
 def summarize_market_row(m: Any) -> MarketSummary:
     """Narrow SDK model to a stable dataclass for CLI/tests."""
     return MarketSummary(

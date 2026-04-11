@@ -24,17 +24,22 @@ kalshi-bot
 kalshi-bot run --dry-run
 ```
 
-## Setup
+## Setup (local only — no GitHub required)
+
+Use the project from **any folder on your computer** (copy, unzip, or clone — hosting is optional). Running the bot does **not** depend on GitHub, `git`, or a remote.
 
 ```bash
-cd kalshi-trading-bot
+cd path/to/kalshi-trading-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cp env.master.template .env
+cp .env.example .env
 ```
 
-**Configuration:** `env.master.template` is the single place for API keys, bet/position limits, drawdown caps, strategy knobs, and safety flags — copy it to `.env` and edit (`.env.example` mirrors the same keys in compact form). Demo keys: [demo.kalshi.co](https://demo.kalshi.co/).
+**Configuration:** **`.env.example`** lists every variable: **API**, **risk / session stop-loss** (`TRADE_STOP_MAX_SESSION_LOSS_USD` aliases `MAX_DAILY_DRAWDOWN_USD`), **trading** (`TRADE_MARKET_TICKER`, `TRADE_BUY_*` entry, `TRADE_TAKE_PROFIT_*` exit, pacing), **paper**, **dashboard**, **logging**. Copy to **`.env`** — the app reads **`.env`** only at runtime.
+
+- **Your real Kalshi account:** set `KALSHI_ENV=prod` and create API keys in **[kalshi.com](https://kalshi.com/)** account settings (not the demo site).
+- **Sandbox / demo only:** set `KALSHI_ENV=demo` and use keys from [demo.kalshi.co](https://demo.kalshi.co/).
 
 ### Run + monitor
 
@@ -49,6 +54,12 @@ cp env.master.template .env
 | `auth.py`         | RSA PEM loading + WebSocket signing headers.                                          |
 | `client.py`       | `ApiClient` + `MarketApi` / `OrdersApi` / `PortfolioApi`.                             |
 | `market_data.py`  | REST helpers for markets and order books.                                             |
+| `fees.py`         | Kalshi general taker/maker fee (P×(1−P) schedule).                                   |
+| `edge_math.py`    | Boxed YES+NO surplus, fee-adjusted directional edge vs fair value.                    |
+| `scanner.py`      | `kalshi-bot scan` — rank boxed arb + edge columns.                                    |
+| `llm_screen.py`   | OpenAI JSON verdicts (`fair_yes` / full opportunity).                                  |
+| `llm_runner.py`   | **`llm-trade`** — scan markets, LLM + deterministic edge gate, optional orders.       |
+| `sizing.py`       | Balance-scaled max contracts / exposure (`TRADE_RISK_PCT_OF_BALANCE_*`).              |
 | `ws.py`           | Async `KalshiWS` WebSocket client.                                                    |
 | `paper_engine.py` | **Fill simulation** — replace `match_limit_order` / `simulate_fill` with your model.  |
 | `backtest.py`     | **Backtest engine** — swap `strategy_signal_fn` or `strategy_factory` for your rules. |
@@ -65,6 +76,8 @@ cp env.master.template .env
 ```bash
 kalshi-bot                          # default: run strategy loop
 kalshi-bot list-markets
+kalshi-bot scan [--limit N] [--llm]
+kalshi-bot llm-trade [--execute]
 kalshi-bot watch-market TICKER
 kalshi-bot place-test-order [--ticker T]
 kalshi-bot cancel-all
@@ -94,6 +107,14 @@ Record your own streams from WebSocket or REST snapshots; this repo does not shi
 ## Paper engine assumptions
 
 `PaperFillConfig` controls fill probability, partial fills, fees, and slippage. Treat outputs as **stress tests**, not exchange truth.
+
+## Troubleshooting: `SSL: CERTIFICATE_VERIFY_FAILED` (macOS)
+
+If HTTPS to Kalshi fails with certificate verify errors, try:
+
+1. Reinstall deps so **`certifi`** is present — the CLI calls `apply_certifi_ca_bundle()` before any requests.
+2. If you use **python.org**’s macOS installer, run **`Install Certificates.command`** in `/Applications/Python 3.x/`.
+3. Corporate proxies / antivirus sometimes intercept TLS — you may need your IT root cert (not something we disable in code by default).
 
 ## References
 

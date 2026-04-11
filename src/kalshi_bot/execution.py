@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 from kalshi_python_sync.models.order import Order
@@ -15,7 +15,8 @@ from kalshi_bot.logger import StructuredLogger
 from kalshi_bot.monitor import record_event
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.strategy import TradeIntent
+from kalshi_bot.sizing import effective_max_contracts, effective_max_exposure_cents
+from kalshi_bot.strategy import TradeIntent, projected_abs_position_after
 
 
 @dataclass
@@ -135,17 +136,34 @@ def execute_intent(
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
 
-    pos = abs(snap.positions_by_ticker.get(intent.ticker, 0.0))
+    max_c = effective_max_contracts(
+        settings, balance_cents=snap.balance_cents, yes_price_cents=intent.yes_price_cents
+    )
+    max_exp = effective_max_exposure_cents(settings, snap.balance_cents)
+    if intent.count > max_c:
+        intent = replace(intent, count=max_c)
+    if intent.count < 1:
+        log.info("order_blocked", reason="zero_contracts_after_balance_sizing", ticker=intent.ticker)
+        record_event("blocked", reason="zero_contracts_after_balance_sizing", intent=intent)
+        return
+
+    signed = snap.positions_by_ticker.get(intent.ticker, 0.0)
+    projected_abs = projected_abs_position_after(signed, intent)
     resting = snap.resting_orders_by_ticker.get(intent.ticker, 0)
-    add_exp = float(intent.count * intent.yes_price_cents) if intent.side == "yes" else 0.0
+    add_exp = (
+        float(intent.count * intent.yes_price_cents) if (intent.side == "yes" and intent.action == "buy") else 0.0
+    )
 
     decision = risk.check_new_order(
         market_ticker=intent.ticker,
         order_contracts=intent.count,
-        position_contracts_for_market=pos,
+        projected_abs_position=projected_abs,
         resting_orders_on_market=resting,
         current_total_exposure_cents=snap.total_exposure_cents,
         additional_order_exposure_cents=add_exp,
+        order_increases_exposure=(intent.action == "buy"),
+        max_contracts_override=max_c,
+        max_exposure_cents_override=max_exp,
     )
     if not decision.allowed:
         log.info("order_blocked", reason=decision.reason, intent=intent)

@@ -45,6 +45,13 @@ def _total_exposure_cents(market_positions: list[object]) -> float:
 
 
 @with_rest_retry
+def get_balance_cents(client: KalshiSdkClient) -> int | None:
+    """Cash balance in cents (None if API omits it)."""
+    bal = client.portfolio.get_balance()
+    return getattr(bal, "balance", None)
+
+
+@with_rest_retry
 def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = None) -> PortfolioSnapshot:
     """Aggregate resting orders and positions. Exposure sums all markets (for risk cap)."""
     bal = client.portfolio.get_balance()
@@ -79,3 +86,35 @@ def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = No
         balance_cents=balance_cents,
         total_exposure_cents=exposure,
     )
+
+
+@with_rest_retry
+def get_market_position_row(client: KalshiSdkClient, ticker: str) -> object | None:
+    """Return the raw ``market_positions`` row for ``ticker``, or None."""
+    pos_resp = client.portfolio.get_positions(
+        ticker=ticker,
+        count_filter="position",
+        limit=50,
+    )
+    for p in getattr(pos_resp, "market_positions", []) or []:
+        if getattr(p, "ticker", None) == ticker:
+            return p
+    return None
+
+
+def estimate_yes_entry_cents_from_position(p: object) -> int | None:
+    """Rough average YES entry in cents from ``total_traded_dollars`` / ``position_fp`` (not always exact cost basis)."""
+    fp = getattr(p, "position_fp", None)
+    tt = getattr(p, "total_traded_dollars", None)
+    if fp is None or tt is None:
+        return None
+    try:
+        contracts = abs(float(str(fp)))
+        traded = float(str(tt))
+    except ValueError:
+        return None
+    if contracts < 1e-9:
+        return None
+    per_contract_dollars = traded / contracts
+    cents = int(round(per_contract_dollars * 100.0))
+    return max(1, min(99, cents))
