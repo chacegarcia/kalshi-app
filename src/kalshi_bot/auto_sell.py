@@ -7,6 +7,7 @@ orders unless you set ``good_till_canceled``. Educational wiring only.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 from kalshi_bot.client import KalshiSdkClient
 from kalshi_bot.config import Settings
@@ -18,8 +19,112 @@ from kalshi_bot.portfolio import (
     fetch_portfolio_snapshot,
     get_market_position_row,
 )
+from kalshi_bot.monitor import record_event
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
+
+
+@dataclass
+class ExitScanRow:
+    """One long-YES position and how it compares to auto-sell / take-profit rules (cashout check)."""
+
+    ticker: str
+    long_yes_contracts: float
+    best_yes_bid_cents: int | None
+    entry_yes_cents: int | None
+    effective_min_yes_bid_cents: int | None
+    min_bid_for_profit_rule_cents: int | None
+    would_take_profit: bool
+    detail: str
+
+
+def collect_exit_scan_rows(
+    client: KalshiSdkClient,
+    settings: Settings,
+    *,
+    cli_min_yes_bid_cents: int | None,
+    log: StructuredLogger,
+) -> list[ExitScanRow]:
+    """Read-only: for every long YES, compare book + entry to TRADE_EXIT_* / TRADE_TAKE_PROFIT_* (no orders)."""
+    snap = fetch_portfolio_snapshot(client, ticker=None)
+    tickers = sorted(t for t, s in snap.positions_by_ticker.items() if s > 0)
+    rows: list[ExitScanRow] = []
+    eff_floor = settings.auto_sell_effective_min_yes_bid_cents(cli_min_yes_bid_cents)
+    mpc = settings.trade_exit_effective_min_profit_cents_per_contract
+    for ticker in tickers:
+        signed = float(snap.positions_by_ticker.get(ticker, 0.0))
+        entry_ref = _resolve_entry_reference_yes_cents(settings, client, ticker, log)
+        min_profit_bid: int | None = None
+        if mpc is not None and entry_ref is not None:
+            min_profit_bid = int(entry_ref + mpc)
+
+        ob = get_orderbook(client, ticker)
+        best = best_yes_bid_cents(ob)
+        if best is None:
+            rows.append(
+                ExitScanRow(
+                    ticker=ticker,
+                    long_yes_contracts=signed,
+                    best_yes_bid_cents=None,
+                    entry_yes_cents=entry_ref,
+                    effective_min_yes_bid_cents=eff_floor,
+                    min_bid_for_profit_rule_cents=min_profit_bid,
+                    would_take_profit=False,
+                    detail="no_yes_bids",
+                )
+            )
+            continue
+
+        fire, reason = _should_fire_exit(
+            best_bid_cents=best,
+            settings=settings,
+            cli_min_yes_bid_cents=cli_min_yes_bid_cents,
+            entry_ref_cents=entry_ref,
+        )
+        rows.append(
+            ExitScanRow(
+                ticker=ticker,
+                long_yes_contracts=signed,
+                best_yes_bid_cents=best,
+                entry_yes_cents=entry_ref,
+                effective_min_yes_bid_cents=eff_floor,
+                min_bid_for_profit_rule_cents=min_profit_bid,
+                would_take_profit=fire,
+                detail=reason,
+            )
+        )
+    return rows
+
+
+def format_exit_scan_summary(rows: list[ExitScanRow]) -> list[str]:
+    """Human-readable lines for the terminal (table + totals)."""
+    if not rows:
+        return [
+            "--- exit-scan (cashout check) ---",
+            "  No long YES positions in portfolio.",
+            "---",
+        ]
+    lines = [
+        "--- exit-scan (cashout check) ---",
+        "  Rules: TRADE_EXIT_* / TRADE_TAKE_PROFIT_* / TRADE_EXIT_ONLY_PROFIT_MARGIN (same as auto-sell).",
+        f"  {'ticker':<28} {'qty':>6} {'bid¢':>5} {'entry¢':>7} {'floor¢':>6} {'profit≥¢':>8}  would_exit  detail",
+    ]
+    ready = 0
+    for r in rows:
+        if r.would_take_profit:
+            ready += 1
+        b = "—" if r.best_yes_bid_cents is None else str(r.best_yes_bid_cents)
+        e = "—" if r.entry_yes_cents is None else str(r.entry_yes_cents)
+        f = "—" if r.effective_min_yes_bid_cents is None else str(r.effective_min_yes_bid_cents)
+        p = "—" if r.min_bid_for_profit_rule_cents is None else str(r.min_bid_for_profit_rule_cents)
+        w = "yes" if r.would_take_profit else "no"
+        lines.append(
+            f"  {r.ticker:<28} {r.long_yes_contracts:>6.1f} {b:>5} {e:>7} {f:>6} {p:>8}  {w:<10}  {r.detail}"
+        )
+    lines.append("---")
+    lines.append(f"  Positions: {len(rows)}  |  Would take-profit now: {ready}")
+    lines.append("---")
+    return lines
 
 
 def _resolve_entry_reference_yes_cents(
@@ -69,6 +174,27 @@ def _should_fire_exit(
     return False, "wait"
 
 
+def _format_auto_sell_profit_line(
+    *,
+    ticker: str,
+    count: int,
+    limit_cents: int,
+    entry_ref: int | None,
+) -> str:
+    """One-line summary for stdout / exit-scan (gross vs estimated entry; not exchange fill or fees)."""
+    proceeds_cents = limit_cents * count
+    if entry_ref is not None:
+        gross_cents = (limit_cents - entry_ref) * count
+        return (
+            f"{ticker}: est. gross P/L ${gross_cents / 100.0:.2f} "
+            f"({count} × (sell {limit_cents}¢ − entry ~{entry_ref}¢); proceeds ~${proceeds_cents / 100.0:.2f}; before fees)"
+        )
+    return (
+        f"{ticker}: sell {count} YES @ {limit_cents}¢ limit — proceeds ~${proceeds_cents / 100.0:.2f} "
+        "(P/L unknown: set TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS or TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO=true)"
+    )
+
+
 def try_auto_sell_exit_for_ticker(
     client: KalshiSdkClient,
     settings: Settings,
@@ -79,14 +205,17 @@ def try_auto_sell_exit_for_ticker(
     cli_min_yes_bid_cents: int | None,
     log: StructuredLogger,
     log_waits: bool = False,
-) -> str:
-    """One take-profit attempt for ``ticker``. Returns a short outcome tag (e.g. ``sold``, ``wait``, ``no_long_yes``)."""
+) -> tuple[str, str | None]:
+    """One take-profit attempt for ``ticker``.
+
+    Returns ``(tag, summary_line)``. ``summary_line`` is set when tag is ``sold`` (profit / proceeds text).
+    """
     snap = fetch_portfolio_snapshot(client, ticker=ticker)
     signed = snap.positions_by_ticker.get(ticker, 0.0)
     if signed <= 0:
         if log_waits:
             log.info("auto_sell_skip", reason="no_long_yes", ticker=ticker, signed=signed)
-        return "no_long_yes"
+        return "no_long_yes", None
 
     entry_ref = _resolve_entry_reference_yes_cents(settings, client, ticker, log)
     if settings.trade_exit_effective_min_profit_cents_per_contract is not None and entry_ref is None:
@@ -101,7 +230,7 @@ def try_auto_sell_exit_for_ticker(
     if best is None:
         if log_waits:
             log.info("auto_sell_skip", reason="no_yes_bids", ticker=ticker)
-        return "no_yes_bids"
+        return "no_yes_bids", None
 
     fire, reason = _should_fire_exit(
         best_bid_cents=best,
@@ -120,11 +249,11 @@ def try_auto_sell_exit_for_ticker(
                 entry_ref_yes_cents=entry_ref,
                 detail=reason,
             )
-        return "wait"
+        return "wait", None
 
     count = min(int(signed), settings.max_contracts_per_market)
     if count < 1:
-        return "zero_contracts"
+        return "zero_contracts", None
 
     limit_cents = max(1, best - settings.trade_exit_sell_aggression_cents)
     tif = settings.trade_exit_sell_time_in_force
@@ -148,7 +277,36 @@ def try_auto_sell_exit_for_ticker(
         aggression_cents=settings.trade_exit_sell_aggression_cents,
     )
     trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
-    return "sold"
+
+    proceeds_cents = limit_cents * count
+    gross_cents: int | None = None
+    if entry_ref is not None:
+        gross_cents = (limit_cents - entry_ref) * count
+    log.info(
+        "auto_sell_profit_estimate",
+        ticker=ticker,
+        count=count,
+        limit_yes_price_cents=limit_cents,
+        entry_yes_cents=entry_ref,
+        proceeds_cents=proceeds_cents,
+        estimated_gross_profit_cents=gross_cents,
+        note="vs portfolio entry estimate; excludes fees; IOC may partially fill",
+    )
+    record_event(
+        "auto_sell_profit_estimate",
+        ticker=ticker,
+        count=count,
+        limit_yes_price_cents=limit_cents,
+        entry_yes_cents=entry_ref,
+        proceeds_cents=proceeds_cents,
+        estimated_gross_profit_cents=gross_cents,
+    )
+    summary = _format_auto_sell_profit_line(
+        ticker=ticker, count=count, limit_cents=limit_cents, entry_ref=entry_ref
+    )
+    if log_waits:
+        print(f"auto-sell: {summary}", flush=True)
+    return "sold", summary
 
 
 def auto_sell_scan_all_long_yes(
@@ -169,7 +327,7 @@ def auto_sell_scan_all_long_yes(
     sold = 0
     lines: list[str] = []
     for ticker in tickers:
-        tag = try_auto_sell_exit_for_ticker(
+        tag, summary = try_auto_sell_exit_for_ticker(
             client,
             settings,
             risk,
@@ -181,7 +339,7 @@ def auto_sell_scan_all_long_yes(
         )
         if tag == "sold":
             sold += 1
-            lines.append(f"exit-scan: take-profit sell submitted for {ticker}")
+            lines.append(f"exit-scan: take-profit sell — {summary}")
     return sold, lines
 
 
@@ -203,7 +361,7 @@ def run_auto_sell_loop(
 
     while max_cycles == 0 or cycle < max_cycles:
         cycle += 1
-        tag = try_auto_sell_exit_for_ticker(
+        tag, _summary = try_auto_sell_exit_for_ticker(
             client,
             settings,
             risk,

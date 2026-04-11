@@ -175,11 +175,13 @@ def execute_intent(
     if capped != intent.count:
         intent = replace(intent, count=capped)
 
+    max_exp = effective_max_exposure_cents(settings, snap.balance_cents)
     max_c = effective_max_contracts(
         settings, balance_cents=snap.balance_cents, yes_price_cents=intent.yes_price_cents
     )
-    max_exp = effective_max_exposure_cents(settings, snap.balance_cents)
-    if intent.count > max_c:
+    # Balance-based contract cap is for *buys* only. Applying it to sells incorrectly
+    # shrinks exit size to a per-trade cash budget unrelated to contracts held.
+    if intent.action == "buy" and intent.count > max_c:
         intent = replace(intent, count=max_c)
 
     if intent.side == "yes" and intent.action == "buy":
@@ -223,7 +225,7 @@ def execute_intent(
         current_total_exposure_cents=snap.total_exposure_cents,
         additional_order_exposure_cents=add_exp,
         order_increases_exposure=(intent.action == "buy"),
-        max_contracts_override=max_c,
+        max_contracts_override=(max_c if intent.action == "buy" else None),
         max_exposure_cents_override=max_exp,
     )
     if not decision.allowed:

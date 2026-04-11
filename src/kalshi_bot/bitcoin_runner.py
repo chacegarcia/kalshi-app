@@ -24,7 +24,7 @@ from kalshi_bot.market_data import (
 )
 from kalshi_bot.momentum import momentum_buy_intent_if_hot
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.strategy import TradeIntent, signal_edge_buy_yes_from_ticker, signal_from_bar
+from kalshi_bot.strategy import TradeIntent, signal_edge_buy_yes_from_ticker, signal_from_bar, skip_buy_yes_longshot
 from kalshi_bot.trading import build_sdk_client, trade_execute
 
 
@@ -35,6 +35,7 @@ class BitcoinTradeRunStats:
     skip_low_volume: int = 0
     skip_orderbook: int = 0
     skip_no_bids: int = 0
+    skip_yes_ask_longshot: int = 0
     no_rule_signal: int = 0
     momentum_signal: int = 0
     momentum_candle_error: int = 0
@@ -50,6 +51,7 @@ class BitcoinTradeRunStats:
             f"  skip (volume below min):            {self.skip_low_volume}",
             f"  skip (orderbook error):             {self.skip_orderbook}",
             f"  skip (no YES/NO bids):              {self.skip_no_bids}",
+            f"  skip (YES ask < min / longshot):    {self.skip_yes_ask_longshot}",
             f"  momentum (chart YES) signals:       {self.momentum_signal}",
             f"  momentum candle fetch errors:       {self.momentum_candle_error}",
             f"  no signal from .env rules:          {self.no_rule_signal}",
@@ -210,6 +212,16 @@ def evaluate_bitcoin_ticker_pass(
 
     yes_bid_d = yb_c / 100.0
     yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
+    yes_ask_c = int(max(1, min(99, round(yes_ask_d * 100.0))))
+    if skip_buy_yes_longshot(settings, yes_ask_c):
+        stats.skip_yes_ask_longshot += 1
+        log.info(
+            "bitcoin_skip_longshot_yes",
+            ticker=ticker,
+            yes_ask_cents=yes_ask_c,
+            min_yes_ask_cents=settings.trade_entry_min_yes_ask_cents,
+        )
+        return 0, stats
 
     intent: TradeIntent | None = None
     if settings.trade_momentum_enabled:
@@ -254,6 +266,7 @@ def evaluate_bitcoin_ticker_pass(
             order_count=settings.strategy_order_count,
             limit_price_cents=settings.strategy_limit_price_cents,
             max_spread_dollars=settings.trade_max_entry_spread_dollars,
+            entry_min_yes_ask_cents=settings.trade_entry_min_yes_ask_cents,
         )
 
     if intent is None:

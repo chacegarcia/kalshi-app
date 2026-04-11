@@ -22,6 +22,7 @@ from kalshi_bot.momentum import momentum_buy_intent_if_hot
 from kalshi_bot.portfolio import get_balance_cents
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import effective_max_contracts
+from kalshi_bot.strategy import skip_buy_yes_longshot
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.llm_screen import LLMOpportunityVerdict, llm_evaluate_opportunity
 
@@ -44,6 +45,7 @@ class LLMTradeRunStats:
     skipped_cli_no_execute: int = 0
     blocked_zero_contracts_balance: int = 0
     skip_zero_contracts_after_verdict: int = 0
+    skip_yes_ask_longshot: int = 0
     blocked_trade_llm_auto_execute_false: int = 0
     submitted: int = 0
     # Filled each run so the summary explains why nothing submitted without reading logs
@@ -76,6 +78,7 @@ class LLMTradeRunStats:
                 f"  skip (volume below min):      {self.skip_low_volume}",
                 f"  skip (balance→0 contracts):   {self.blocked_zero_contracts_balance}",
                 f"  skip (verdict size 0):        {self.skip_zero_contracts_after_verdict}",
+                f"  skip (YES ask < min longshot): {self.skip_yes_ask_longshot}",
                 f"  momentum bypass (chart YES):  {self.momentum_llm_bypass}",
                 f"  momentum candle fetch errors: {self.momentum_candle_error}",
                 f"  skipped (--execute false):    {self.skipped_cli_no_execute}",
@@ -303,6 +306,16 @@ def run_llm_opportunity_pipeline(
             yes_bid_d = yb_c / 100.0
             yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
             yes_ask_c = int(max(1, min(99, round(yes_ask_d * 100.0))))
+
+            if skip_buy_yes_longshot(settings, yes_ask_c):
+                stats.skip_yes_ask_longshot += 1
+                log.info(
+                    "llm_trade_skip_longshot_yes",
+                    ticker=ticker,
+                    yes_ask_cents=yes_ask_c,
+                    min_yes_ask_cents=settings.trade_entry_min_yes_ask_cents,
+                )
+                continue
 
             max_allowed = effective_max_contracts(
                 settings, balance_cents=bal, yes_price_cents=yes_ask_c

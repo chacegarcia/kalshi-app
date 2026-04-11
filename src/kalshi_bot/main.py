@@ -17,7 +17,12 @@ from kalshi_bot.client import KalshiSdkClient
 
 from kalshi_bot.ssl_bundle import apply_certifi_ca_bundle
 from kalshi_bot.auth import AuthError, build_kalshi_auth
-from kalshi_bot.auto_sell import auto_sell_scan_all_long_yes, run_auto_sell_loop
+from kalshi_bot.auto_sell import (
+    auto_sell_scan_all_long_yes,
+    collect_exit_scan_rows,
+    format_exit_scan_summary,
+    run_auto_sell_loop,
+)
 from kalshi_bot.backtest import load_price_records_jsonl, parameter_sweep, run_rule_backtest, walk_forward_eval
 from kalshi_bot.config import Settings, get_settings, project_root
 from kalshi_bot.execution import (
@@ -37,7 +42,12 @@ from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
 from kalshi_bot.discover_runner import run_discover_rule_pipeline
 from kalshi_bot.tape_runner import run_tape_rule_pipeline
 from kalshi_bot.bitcoin_runner import run_bitcoin_trade_pass
-from kalshi_bot.monitor import heartbeat, record_portfolio_series_point, start_dashboard
+from kalshi_bot.monitor import (
+    heartbeat,
+    record_portfolio_series_point,
+    start_dashboard,
+    start_portfolio_series_poller,
+)
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.ws import KalshiWS
 
@@ -86,6 +96,7 @@ def cmd_llm_trade(
     if settings.dashboard_enabled:
         start_dashboard(settings)
         dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
             record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
@@ -157,6 +168,7 @@ def cmd_discover_trade(
     if settings.dashboard_enabled:
         start_dashboard(settings)
         dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
             record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
@@ -221,6 +233,7 @@ def cmd_tape_trade(
     if settings.dashboard_enabled:
         start_dashboard(settings)
         dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
             record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
@@ -286,6 +299,7 @@ def cmd_bitcoin_trade(
     if settings.dashboard_enabled:
         start_dashboard(settings)
         dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
             record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
@@ -408,6 +422,60 @@ def cmd_trade(
         yes_price_cents=price,
     )
     trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+
+
+def cmd_exit_scan(
+    settings: Settings,
+    *,
+    min_yes_bid_cents: int | None,
+    execute: bool,
+    loop: bool = False,
+    interval_seconds: float = 30.0,
+) -> None:
+    """Print a read-only cashout / take-profit report for all long YES; optional --execute to run batch auto-sell."""
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            if loop:
+                print(f"--- exit-scan iteration {iteration} ---", flush=True)
+            client = build_sdk_client(settings)
+            rows = collect_exit_scan_rows(client, settings, cli_min_yes_bid_cents=min_yes_bid_cents, log=log)
+            for line in format_exit_scan_summary(rows):
+                print(line, flush=True)
+            if not execute:
+                if not loop:
+                    print(
+                        "  Run with --execute to submit take-profit sells where rules pass (same as post-pass exit scan).",
+                        flush=True,
+                    )
+                elif iteration == 1:
+                    print(
+                        "  Loop: add --execute to submit take-profit sells after each summary when rules pass.",
+                        flush=True,
+                    )
+            else:
+                n, sell_lines = auto_sell_scan_all_long_yes(
+                    client, settings, cli_min_yes_bid_cents=min_yes_bid_cents, log=log
+                )
+                print("--- exit-scan --execute ---", flush=True)
+                if n == 0:
+                    print(
+                        "  No take-profit orders submitted (conditions not met, dry-run, or risk blocked).",
+                        flush=True,
+                    )
+                else:
+                    for sl in sell_lines:
+                        print(f"  {sl}", flush=True)
+                print(f"  Submitted sells: {n}", flush=True)
+
+            if not loop:
+                break
+            print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("\nexit-scan loop stopped.", file=sys.stderr)
 
 
 def cmd_auto_sell(
@@ -789,6 +857,33 @@ def build_parser() -> argparse.ArgumentParser:
     ase.add_argument("--max-cycles", type=int, default=0, help="Stop after N polls (0 = unlimited)")
     ase.add_argument("--once", action="store_true", help="Exit after one sell attempt (may still dry-run)")
 
+    exs = sub.add_parser(
+        "exit-scan",
+        help="Cashout check: summarize all long YES vs take-profit rules (TRADE_EXIT_*); --loop to repeat; optional --execute to sell",
+    )
+    exs.add_argument(
+        "--min-yes-bid-cents",
+        type=int,
+        default=None,
+        help="Override min best YES bid (cents); else TRADE_TAKE_PROFIT_* / TRADE_EXIT_TAKE_PROFIT_MIN_YES_BID_PCT",
+    )
+    exs.add_argument(
+        "--execute",
+        action="store_true",
+        help="After printing the summary, submit take-profit sells where rules pass (batch auto-sell)",
+    )
+    exs.add_argument(
+        "--loop",
+        action="store_true",
+        help="Repeat the scan every --interval seconds until Ctrl+C",
+    )
+    exs.add_argument(
+        "--interval",
+        type=float,
+        default=30.0,
+        help="Seconds between scans when --loop (default: 30; min 5)",
+    )
+
     run = sub.add_parser("run", help="Run strategy loop (default command); opens local monitor in browser")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--live", action="store_true")
@@ -849,7 +944,7 @@ def main(argv: list[str] | None = None) -> None:
                 execute=bool(args.execute or settings.trade_llm_cli_execute),
                 loop=args.loop,
                 interval_seconds=max(5.0, float(args.interval)),
-                use_tape=getattr(args, "tape", False),
+                use_tape=bool(getattr(args, "tape", False) or settings.trade_llm_use_tape_universe),
             )
         elif cmd == "discover-trade":
             cmd_discover_trade(
@@ -884,6 +979,14 @@ def main(argv: list[str] | None = None) -> None:
                 action=args.action,
                 count=args.count,
                 yes_price_cents=args.yes_price_cents,
+            )
+        elif cmd == "exit-scan":
+            cmd_exit_scan(
+                settings,
+                min_yes_bid_cents=getattr(args, "min_yes_bid_cents", None),
+                execute=bool(getattr(args, "execute", False)),
+                loop=bool(getattr(args, "loop", False)),
+                interval_seconds=max(5.0, float(getattr(args, "interval", 30.0))),
             )
         elif cmd == "auto-sell":
             cmd_auto_sell(

@@ -15,6 +15,17 @@ from kalshi_bot.config import Settings
 from kalshi_bot.edge_math import min_edge_threshold_for_mid, net_edge_buy_yes_long
 
 
+def skip_buy_yes_longshot(settings: Settings, yes_ask_cents: int) -> bool:
+    """Return True to skip a buy-YES entry: implied YES ask is below ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` (moonshot filter).
+
+    When the floor is 0, the check is disabled.
+    """
+    m = settings.trade_entry_min_yes_ask_cents
+    if m <= 0:
+        return False
+    return yes_ask_cents < m
+
+
 @dataclass
 class TradeIntent:
     """Desired order (execution layer decides dry-run vs live after risk checks)."""
@@ -73,6 +84,7 @@ def signal_from_bar(
     order_count: int,
     limit_price_cents: int,
     max_spread_dollars: float | None = None,
+    entry_min_yes_ask_cents: int = 0,
 ) -> TradeIntent | None:
     """Shared rule logic for both WebSocket tickers and backtest `PriceRecord` rows.
 
@@ -82,6 +94,10 @@ def signal_from_bar(
     if spread < min_spread_dollars:
         return None
     if max_spread_dollars is not None and spread > max_spread_dollars:
+        return None
+
+    yes_ask_c = int(max(1, min(99, round(yes_ask_dollars * 100.0))))
+    if entry_min_yes_ask_cents > 0 and yes_ask_c < entry_min_yes_ask_cents:
         return None
 
     mid = (yes_bid_dollars + yes_ask_dollars) / 2.0
@@ -112,6 +128,10 @@ def signal_edge_buy_yes_from_ticker(
     if spread < settings.strategy_min_spread_dollars:
         return None
     if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
+        return None
+
+    yes_ask_c = int(max(1, min(99, round(yes_ask_dollars * 100.0))))
+    if skip_buy_yes_longshot(settings, yes_ask_c):
         return None
 
     fair = settings.trade_fair_yes_prob
@@ -179,6 +199,7 @@ class SampleSpreadGapStrategy:
             order_count=self.settings.strategy_order_count,
             limit_price_cents=self.settings.strategy_limit_price_cents,
             max_spread_dollars=self.settings.trade_max_entry_spread_dollars,
+            entry_min_yes_ask_cents=self.settings.trade_entry_min_yes_ask_cents,
         )
 
 
@@ -200,6 +221,7 @@ def make_bar_strategy_fn(params: dict[str, Any]):
             order_count=int(params.get("order_count", 1)),
             limit_price_cents=int(params["limit_price_cents"]),
             max_spread_dollars=params.get("max_spread_dollars"),
+            entry_min_yes_ask_cents=int(params.get("trade_entry_min_yes_ask_cents", 0)),
         )
 
     return _fn

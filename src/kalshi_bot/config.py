@@ -142,6 +142,16 @@ class Settings(BaseSettings):
             "strategy_probability_gap",
         ),
     )
+    trade_entry_min_yes_ask_cents: int = Field(
+        default=8,
+        ge=0,
+        le=98,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MIN_YES_ASK_CENTS",
+            "trade_entry_min_yes_ask_cents",
+        ),
+        description="Do not buy YES when implied YES ask (from the book) is below this many cents — filters extreme longshots. 0 = off. Example: 8 means roughly ≥8% implied before sizing other gates.",
+    )
     strategy_order_count: int = Field(
         default=1,
         ge=1,
@@ -282,6 +292,14 @@ class Settings(BaseSettings):
             "trade_llm_cli_execute",
         ),
         description="If true, llm-trade runs with execute=True without passing --execute (still needs TRADE_LLM_AUTO_EXECUTE; DRY_RUN respected).",
+    )
+    trade_llm_use_tape_universe: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_USE_TAPE_UNIVERSE",
+            "trade_llm_use_tape_universe",
+        ),
+        description="If true, llm-trade ranks markets by recent public trade $ flow (same as --tape). Use with KALSHI_ENV=prod and TRADE_TAPE_* for active/live-style liquidity.",
     )
     trade_llm_max_markets_per_run: int = Field(
         default=900,
@@ -593,6 +611,15 @@ class Settings(BaseSettings):
             "TRADE_TOTAL_RISK_PCT_OF_BALANCE",
             "trade_total_risk_pct_of_balance",
         ),
+        description="With balance sizing: max total exposure ≈ balance×this (ignored when TRADE_NO_MAX_EXPOSURE_CAP=true).",
+    )
+    trade_no_max_exposure_cap: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_NO_MAX_EXPOSURE_CAP",
+            "trade_no_max_exposure_cap",
+        ),
+        description="If true, do not cap total portfolio exposure by balance×TRADE_TOTAL_RISK_PCT (uses unlimited cap while balance>0). New orders still blocked when API reports balance≤0. Per-order sizing still uses TRADE_RISK_PCT_OF_BALANCE_PER_TRADE. If balance is unknown, falls back to MAX_EXPOSURE_CENTS.",
     )
 
     # --- Trading — exit: take-profit (auto-sell) & pacing ---
@@ -697,6 +724,13 @@ class Settings(BaseSettings):
     dashboard_open_browser: bool = Field(
         default=True, validation_alias=_env("DASHBOARD_OPEN_BROWSER", "dashboard_open_browser")
     )
+    dashboard_portfolio_poll_seconds: float = Field(
+        default=20.0,
+        ge=0.0,
+        le=3600.0,
+        validation_alias=_env("DASHBOARD_PORTFOLIO_POLL_SECONDS", "dashboard_portfolio_poll_seconds"),
+        description="While llm-trade / tape-trade / discover-trade / bitcoin-trade run with the dashboard: poll balance & exposure this often (seconds). 0 = only record at start/end of each pipeline pass.",
+    )
 
     log_level: str = Field(default="INFO", validation_alias=_env("LOG_LEVEL", "log_level"))
     structured_log_path: Path = Field(
@@ -764,10 +798,12 @@ class Settings(BaseSettings):
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
         "trade_llm_cli_execute",
+        "trade_llm_use_tape_universe",
         "trade_llm_relaxed_approval",
         "trade_llm_accept_when_fair_covers_ask",
         "trade_llm_shuffle_open_markets",
         "trade_llm_bitcoin_priority_enabled",
+        "trade_no_max_exposure_cap",
         "trade_discover_auto_execute",
         "trade_tape_auto_execute",
         "trade_bitcoin_auto_execute",
@@ -836,6 +872,7 @@ class Settings(BaseSettings):
             return self.auto_sell_min_yes_bid_cents
         return int(round(self.trade_exit_take_profit_min_yes_bid_pct))
 
+    @property
     def trade_exit_effective_min_profit_cents_per_contract(self) -> float | None:
         """Explicit min profit, or 1.0 when TRADE_EXIT_ONLY_PROFIT_MARGIN=true and unset (any green vs entry)."""
         if self.trade_exit_min_profit_cents_per_contract is not None:

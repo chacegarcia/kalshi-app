@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 
+from kalshi_bot.client import KalshiSdkClient
 from kalshi_bot.config import Settings
+from kalshi_bot.portfolio import fetch_portfolio_snapshot
 
 _LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
@@ -92,7 +94,7 @@ _HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Kalshi bot — order monitor</h1>
-  <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Chart updates every 2s from portfolio snapshots.</p>
+  <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Chart polls every 2s; new points are added when the bot records snapshots (including periodic balance/exposure during long runs).</p>
   <div class="status" id="status">Loading…</div>
   <div class="balance-banner" id="balanceBanner" style="display:none;">
     <span><strong>Cash</strong> <span id="balCash">—</span></span>
@@ -149,7 +151,7 @@ _HTML = """<!DOCTYPE html>
     }
     async function poll() {
       try {
-        const r = await fetch('/api/events');
+        const r = await fetch('/api/events', { cache: 'no-store' });
         const data = await r.json();
         document.getElementById('status').textContent = data.length + ' event(s) — last update ' + new Date().toISOString();
         const tb = document.getElementById('rows');
@@ -166,7 +168,11 @@ _HTML = """<!DOCTYPE html>
           detail.appendChild(pre);
           tb.appendChild(tr);
         }
-        const sr = await fetch('/api/series');
+      } catch (e) {
+        document.getElementById('status').textContent = 'Fetch error (events) — is the bot running?';
+      }
+      try {
+        const sr = await fetch('/api/series', { cache: 'no-store' });
         const pts = await sr.json();
         if (pts.length > 0) {
           buildOrUpdateChart(pts);
@@ -188,7 +194,10 @@ _HTML = """<!DOCTYPE html>
           banner.style.display = 'flex';
         }
       } catch (e) {
-        document.getElementById('status').textContent = 'Fetch error (is the bot running?)';
+        const st = document.getElementById('status');
+        if (!st.textContent.includes('Fetch error')) {
+          st.textContent = 'Series fetch error — chart may be stale';
+        }
       }
     }
     poll();
@@ -241,6 +250,26 @@ def start_dashboard(settings: Settings) -> threading.Thread | None:
         webbrowser.open(url)
     print(f"Monitor dashboard: {url}", flush=True)
     return th
+
+
+def start_portfolio_series_poller(settings: Settings, client: KalshiSdkClient) -> threading.Thread | None:
+    """Background balance/exposure snapshots so the chart updates during long LLM or tape passes (not only between iterations)."""
+    interval = float(settings.dashboard_portfolio_poll_seconds)
+    if interval <= 0 or not settings.dashboard_enabled:
+        return None
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                snap = fetch_portfolio_snapshot(client, ticker=None)
+                record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+            except Exception:
+                pass
+
+    poller = threading.Thread(target=_loop, name="kalshi-series-poller", daemon=True)
+    poller.start()
+    return poller
 
 
 def heartbeat(note: str = "") -> None:

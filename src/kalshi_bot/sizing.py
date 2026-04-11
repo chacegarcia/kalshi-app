@@ -142,11 +142,18 @@ def adjust_buy_yes_count_for_notional_floor(
 def effective_max_exposure_cents(settings: Settings, balance_cents: int | None) -> float:
     """Cap total portfolio exposure (cents).
 
-    With balance sizing and a positive balance: ``balance × TRADE_TOTAL_RISK_PCT_OF_BALANCE``.
+    With ``TRADE_NO_MAX_EXPOSURE_CAP`` and a positive known balance: effectively no cap (infinity); the exchange
+    and per-order notional/contract limits still apply. Risk still blocks when balance≤0.
+
+    With balance sizing and a positive balance (otherwise): ``balance × TRADE_TOTAL_RISK_PCT_OF_BALANCE``.
 
     Otherwise: ``MAX_EXPOSURE_CENTS`` (static fallback when balance is unknown or sizing is off).
     """
     static = float(settings.max_exposure_cents)
+    if settings.trade_no_max_exposure_cap:
+        if balance_cents is not None and balance_cents > 0:
+            return float("inf")
+        return static
     if not settings.trade_balance_sizing_enabled or balance_cents is None or balance_cents <= 0:
         return static
     return float(balance_cents) * settings.trade_total_risk_pct_of_balance

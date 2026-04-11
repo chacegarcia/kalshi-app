@@ -29,12 +29,14 @@ kalshi-bot run --dry-run
 Use the project from **any folder on your computer** (copy, unzip, or clone — hosting is optional). Running the bot does **not** depend on GitHub, `git`, or a remote.
 
 ```bash
-cd path/to/kalshi-trading-bot
+cd /Users/chacegarcia/Projects/kalshi-trading-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 cp .env.example .env
 ```
+
+If the project lives somewhere else, change the `cd` line (or use `cd ~/Projects/kalshi-trading-bot` when that matches your machine).
 
 **Configuration:** **`.env.example`** lists every variable: **API**, **risk / session stop-loss** (`TRADE_STOP_MAX_SESSION_LOSS_USD` aliases `MAX_DAILY_DRAWDOWN_USD`), **trading** (`TRADE_MARKET_TICKER`, `TRADE_BUY_*` entry, `TRADE_TAKE_PROFIT_*` exit, pacing), **paper**, **dashboard**, **logging**. Copy to **`.env`** — the app reads **`.env`** only at runtime.
 
