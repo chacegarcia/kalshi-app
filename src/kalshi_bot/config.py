@@ -147,6 +147,15 @@ class Settings(BaseSettings):
             "strategy_order_count",
         ),
     )
+    trade_max_order_notional_usd: float | None = Field(
+        default=None,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "TRADE_MAX_ORDER_NOTIONAL_USD",
+            "trade_max_order_notional_usd",
+        ),
+        description="Cap buy-YES size: count ≤ floor(USD / limit_price_dollars). Omit or 0 to disable.",
+    )
     strategy_limit_price_cents: int = Field(
         default=50,
         ge=1,

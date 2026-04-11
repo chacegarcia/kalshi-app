@@ -15,7 +15,11 @@ from kalshi_bot.logger import StructuredLogger
 from kalshi_bot.monitor import record_event
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.sizing import effective_max_contracts, effective_max_exposure_cents
+from kalshi_bot.sizing import (
+    cap_buy_yes_count_for_notional,
+    effective_max_contracts,
+    effective_max_exposure_cents,
+)
 from kalshi_bot.strategy import TradeIntent, projected_abs_position_after
 
 
@@ -135,6 +139,16 @@ def execute_intent(
     """Risk-check then either simulate or place a real order."""
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
+
+    capped = cap_buy_yes_count_for_notional(
+        intent.count,
+        yes_price_cents=intent.yes_price_cents,
+        max_notional_usd=settings.trade_max_order_notional_usd,
+        side=intent.side,
+        action=intent.action,
+    )
+    if capped != intent.count:
+        intent = replace(intent, count=capped)
 
     max_c = effective_max_contracts(
         settings, balance_cents=snap.balance_cents, yes_price_cents=intent.yes_price_cents
