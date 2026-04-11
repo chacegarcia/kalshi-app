@@ -111,11 +111,13 @@ class Settings(BaseSettings):
     strategy_max_yes_ask_dollars: float = Field(
         default=0.55,
         ge=0,
+        le=1.0,
         validation_alias=AliasChoices(
             "TRADE_BUY_MAX_YES_ASK_DOLLARS",
             "STRATEGY_MAX_YES_ASK_DOLLARS",
             "strategy_max_yes_ask_dollars",
         ),
+        description="Max implied YES ask as a fraction of $1 (0–1). Example: 0.55 = 55¢, 0.98 = 98¢. Not a dollar amount like 5.00.",
     )
     strategy_min_spread_dollars: float = Field(
         default=0.0,
@@ -215,6 +217,14 @@ class Settings(BaseSettings):
             "TRADE_LLM_MAX_MARKETS_PER_RUN",
             "trade_llm_max_markets_per_run",
         ),
+    )
+    trade_llm_relaxed_approval: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_RELAXED_APPROVAL",
+            "trade_llm_relaxed_approval",
+        ),
+        description="If true, LLM may approve when fair_yes clears edge vs ask; default prompt requires a 'clear mispricing'.",
     )
 
     # Balance-scaled limits (bigger account → larger caps within fixed % of balance)
@@ -388,6 +398,7 @@ class Settings(BaseSettings):
         "trade_use_edge_strategy",
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
+        "trade_llm_relaxed_approval",
         "trade_balance_sizing_enabled",
         mode="before",
     )

@@ -15,6 +15,24 @@ from kalshi_bot.config import Settings
 
 _LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
+# Time series for dashboard line chart (balance + exposure in cents)
+_SERIES: deque[dict[str, Any]] = deque(maxlen=2000)
+
+
+def record_portfolio_series_point(balance_cents: int | float | None, exposure_cents: float) -> None:
+    """Append one point for the live line chart (thread-safe)."""
+    try:
+        bal = int(balance_cents) if balance_cents is not None else 0
+    except (TypeError, ValueError):
+        bal = 0
+    row = {
+        "unix": time.time(),
+        "ts_iso": datetime.now(timezone.utc).isoformat(),
+        "balance_cents": bal,
+        "exposure_cents": float(exposure_cents),
+    }
+    with _LOCK:
+        _SERIES.append(row)
 
 
 def _json_safe(obj: Any) -> Any:
@@ -62,17 +80,64 @@ _HTML = """<!DOCTYPE html>
     .kind-heartbeat { color: var(--muted); }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.75rem; color: #c5d0dc; }
     .status { display: inline-block; padding: 0.15rem 0.45rem; border-radius: 4px; background: var(--card); font-size: 0.75rem; color: var(--muted); margin-bottom: 0.75rem; }
+    .chart-wrap { background: var(--card); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.25rem; max-width: 100%; }
+    .chart-wrap h2 { font-size: 0.9375rem; font-weight: 600; margin: 0 0 0.5rem; color: var(--muted); }
+    .chart-wrap canvas { max-height: 220px; }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <h1>Kalshi bot — order monitor</h1>
-  <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Refreshes every 2s.</p>
+  <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Chart updates every 2s from portfolio snapshots.</p>
   <div class="status" id="status">Loading…</div>
+  <div class="chart-wrap">
+    <h2>Balance &amp; exposure (USD)</h2>
+    <canvas id="seriesChart" width="800" height="220"></canvas>
+  </div>
   <table>
     <thead><tr><th>Time (UTC)</th><th>Kind</th><th>Detail</th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
   <script>
+    let seriesChart = null;
+    function dollarsFromCents(c) { return (Number(c) || 0) / 100; }
+    function buildOrUpdateChart(points) {
+      const labels = points.map(p => {
+        const t = new Date((p.unix || 0) * 1000);
+        return t.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      });
+      const bal = points.map(p => dollarsFromCents(p.balance_cents));
+      const exp = points.map(p => dollarsFromCents(p.exposure_cents));
+      const ctx = document.getElementById('seriesChart');
+      if (!seriesChart) {
+        seriesChart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [
+              { label: 'Balance', data: bal, borderColor: '#3ecf8e', backgroundColor: 'rgba(62,207,142,0.08)', tension: 0.2, fill: false, pointRadius: 0 },
+              { label: 'Exposure', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0 }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            animation: false,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+              x: { ticks: { maxTicksLimit: 8, color: '#8b9aab' }, grid: { color: '#2a3544' } },
+              y: { ticks: { color: '#8b9aab' }, grid: { color: '#2a3544' } }
+            },
+            plugins: { legend: { labels: { color: '#e7ecf3' } } }
+          }
+        });
+      } else {
+        seriesChart.data.labels = labels;
+        seriesChart.data.datasets[0].data = bal;
+        seriesChart.data.datasets[1].data = exp;
+        seriesChart.update('none');
+      }
+    }
     async function poll() {
       try {
         const r = await fetch('/api/events');
@@ -92,6 +157,9 @@ _HTML = """<!DOCTYPE html>
           detail.appendChild(pre);
           tb.appendChild(tr);
         }
+        const sr = await fetch('/api/series');
+        const pts = await sr.json();
+        if (pts.length > 0) buildOrUpdateChart(pts);
       } catch (e) {
         document.getElementById('status').textContent = 'Fetch error (is the bot running?)';
       }
@@ -116,6 +184,11 @@ def _create_app() -> Any:
     def api_events() -> Any:
         with _LOCK:
             return jsonify(list(_EVENTS))
+
+    @app.get("/api/series")
+    def api_series() -> Any:
+        with _LOCK:
+            return jsonify(list(_SERIES))
 
     return app
 

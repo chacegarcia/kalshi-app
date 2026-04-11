@@ -12,6 +12,19 @@ from typing import Any
 from kalshi_bot.config import Settings
 
 
+def _llm_approval_tail(settings: Settings) -> str:
+    """Last lines of the user prompt: strict (default) vs relaxed (more approvals, still re-checked in code)."""
+    if settings.trade_llm_relaxed_approval:
+        return (
+            "Set approve=true and buy_yes=true when fair_yes exceeds the implied YES ask by at least the min net edge "
+            "(directional) in the parameters above (after fees), or when the ask is clearly too cheap for the outcome; "
+            "otherwise approve=false. Never invent facts not in the title."
+        )
+    return (
+        "Set approve=false unless you see a clear mispricing vs the book; never invent facts not in the title."
+    )
+
+
 @dataclass
 class LLMOpportunityVerdict:
     approve: bool
@@ -65,7 +78,7 @@ Order book (YES): bid={yes_bid_cents}¢ implied ask≈{yes_ask_cents}¢ ({yes_as
 
 Decide if a long YES is justified. Output ONLY valid JSON:
 {{"approve": true/false, "fair_yes": 0.0-1.0, "buy_yes": true/false, "limit_yes_price_cents": 1-99, "contracts": 1-{max_contracts_allowed}, "reason": "short text"}}
-Set approve=false unless you see a clear mispricing vs the book; never invent facts not in the title."""
+{_llm_approval_tail(settings)}"""
 
     raw = _openai_chat_json(key, settings.trade_llm_model, user)
     if raw is None:

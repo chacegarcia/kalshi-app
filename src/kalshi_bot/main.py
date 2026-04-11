@@ -31,23 +31,58 @@ from kalshi_bot.paper_engine import PaperFillConfig
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
-from kalshi_bot.monitor import heartbeat, start_dashboard
+from kalshi_bot.monitor import heartbeat, record_portfolio_series_point, start_dashboard
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.ws import KalshiWS
 
 
-def cmd_llm_trade(settings: Settings, *, execute: bool) -> None:
+def cmd_llm_trade(
+    settings: Settings,
+    *,
+    execute: bool,
+    loop: bool = False,
+    interval_seconds: float = 120.0,
+) -> None:
     print(NO_GUARANTEE_DISCLAIMER)
     print()
     from kalshi_bot.llm_runner import run_llm_opportunity_pipeline
 
     log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+
+    dash_client = None
+    if settings.dashboard_enabled:
+        start_dashboard(settings)
+        dash_client = build_sdk_client(settings)
+        try:
+            snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
+            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+        except Exception:
+            pass
+
+    iteration = 0
     try:
-        n = run_llm_opportunity_pipeline(settings, execute=execute, log=log)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(2)
-    print(f"Orders submitted this run (0 = none or scan-only): {n}")
+        while True:
+            iteration += 1
+            if loop:
+                print(f"--- llm-trade iteration {iteration} ---", flush=True)
+            try:
+                n = run_llm_opportunity_pipeline(settings, execute=execute, log=log)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(2)
+            print(f"Orders submitted this run (0 = none or scan-only): {n}")
+            if dash_client is not None:
+                try:
+                    snap = fetch_portfolio_snapshot(dash_client, ticker=None)
+                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                except Exception:
+                    pass
+            if not loop:
+                break
+            print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("\nllm-trade loop stopped.", file=sys.stderr)
 
 
 def cmd_scan(settings: Settings, *, limit: int, use_llm: bool) -> None:
@@ -200,6 +235,13 @@ def cmd_run_bot(settings: Settings) -> None:
     strategy = SampleSpreadGapStrategy(settings)
     last_signal = 0.0
 
+    if settings.dashboard_enabled:
+        try:
+            snap0 = fetch_portfolio_snapshot(client, ticker=settings.strategy_market_ticker)
+            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+        except Exception:
+            pass
+
     async def maintenance_loop() -> None:
         while True:
             await asyncio.sleep(30)
@@ -208,6 +250,7 @@ def cmd_run_bot(settings: Settings) -> None:
                 risk.record_balance_sample(snap.balance_cents)
                 cancel_stale_orders(client, settings, log)
                 if settings.dashboard_enabled:
+                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
                     heartbeat(
                         f"balance_cents={snap.balance_cents} exposure_cents={snap.total_exposure_cents:.0f}"
                     )
@@ -381,6 +424,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Submit orders when LLM+math pass (still needs TRADE_LLM_AUTO_EXECUTE=true; DRY_RUN respected)",
     )
+    lt.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run scan+evaluate repeatedly until Ctrl+C (sleep --interval seconds between passes)",
+    )
+    lt.add_argument(
+        "--interval",
+        type=float,
+        default=120.0,
+        metavar="SEC",
+        help="Seconds between iterations when --loop (default: 120)",
+    )
+    lt.add_argument(
+        "--web",
+        action="store_true",
+        help="Start local dashboard with live balance/exposure line chart (sets DASHBOARD_ENABLED)",
+    )
 
     w = sub.add_parser("watch-market", help="WebSocket ticker + orderbook stream")
     w.add_argument("ticker")
@@ -457,6 +517,8 @@ def main(argv: list[str] | None = None) -> None:
             os.environ["DRY_RUN"] = "false"
         if getattr(args, "no_web", False):
             os.environ["DASHBOARD_ENABLED"] = "false"
+    if cmd == "llm-trade" and getattr(args, "web", False):
+        os.environ["DASHBOARD_ENABLED"] = "true"
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -467,7 +529,12 @@ def main(argv: list[str] | None = None) -> None:
         elif cmd == "scan":
             cmd_scan(settings, limit=args.limit, use_llm=args.llm)
         elif cmd == "llm-trade":
-            cmd_llm_trade(settings, execute=args.execute)
+            cmd_llm_trade(
+                settings,
+                execute=args.execute,
+                loop=args.loop,
+                interval_seconds=max(5.0, float(args.interval)),
+            )
         elif cmd == "watch-market":
             cmd_watch_market(settings, args.ticker)
         elif cmd == "place-test-order":
