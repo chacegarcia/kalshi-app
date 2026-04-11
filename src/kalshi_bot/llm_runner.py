@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from kalshi_bot.config import Settings
 from kalshi_bot.edge_math import implied_yes_ask_dollars, min_edge_threshold_for_mid, net_edge_buy_yes_long
 from kalshi_bot.execution import DryRunLedger
@@ -12,6 +14,37 @@ from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import effective_max_contracts
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.llm_screen import LLMOpportunityVerdict, llm_evaluate_opportunity
+
+
+@dataclass
+class LLMTradeRunStats:
+    """Counts why markets did not become orders (see end-of-run summary)."""
+
+    markets: int = 0
+    skip_orderbook: int = 0
+    skip_no_bids: int = 0
+    llm_no_verdict: int = 0
+    llm_declined: int = 0
+    bot_math_rejected: int = 0
+    skipped_cli_no_execute: int = 0
+    blocked_trade_llm_auto_execute_false: int = 0
+    submitted: int = 0
+
+    def lines(self) -> list[str]:
+        return [
+            "--- llm-trade summary (why no orders?) ---",
+            f"  markets scanned:              {self.markets}",
+            f"  skip (orderbook error):       {self.skip_orderbook}",
+            f"  skip (no YES/NO bids):        {self.skip_no_bids}",
+            f"  LLM no JSON / API fail:       {self.llm_no_verdict}",
+            f"  LLM declined (approve/buy):   {self.llm_declined}  <-- usually #1 when this is high",
+            f"  blocked by bot math (edge):   {self.bot_math_rejected}",
+            f"  skipped (--execute false):    {self.skipped_cli_no_execute}",
+            f"  TRADE_LLM_AUTO_EXECUTE false: {self.blocked_trade_llm_auto_execute_false}",
+            f"  reached trade_execute:        {self.submitted}",
+            "  (If this > 0 but you see no live orders: check logs for order_blocked / refused / dry_run.)",
+            "---",
+        ]
 
 
 def _passes_bot_edge(
@@ -45,12 +78,13 @@ def run_llm_opportunity_pipeline(
     *,
     execute: bool,
     log: StructuredLogger | None = None,
-) -> int:
+) -> tuple[int, LLMTradeRunStats]:
     """Scan open markets, LLM verdict + bot math; optionally ``trade_execute`` when ``execute`` and allowed.
 
-    Returns number of orders submitted (dry-run or live).
+    Returns (submitted_count, stats). ``submitted`` counts calls to ``trade_execute`` (risk may still block inside).
     """
     log = log or get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    stats = LLMTradeRunStats()
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is required for llm-trade")
 
@@ -58,10 +92,10 @@ def run_llm_opportunity_pipeline(
     bal = get_balance_cents(client)
     risk = RiskManager(settings)
     ledger = DryRunLedger()
-    submitted = 0
 
     resp = list_open_markets(client, limit=settings.trade_llm_max_markets_per_run)
     markets = list(getattr(resp, "markets", []) or [])
+    stats.markets = len(markets)
     log.info(
         "llm_trade_scan_start",
         market_count=len(markets),
@@ -79,12 +113,14 @@ def run_llm_opportunity_pipeline(
         try:
             ob = get_orderbook(client, ticker)
         except Exception as exc:  # noqa: BLE001
+            stats.skip_orderbook += 1
             log.warning("llm_trade_skip_orderbook", ticker=ticker, error=str(exc))
             continue
 
         yb_c = best_yes_bid_cents(ob)
         nb_c = best_no_bid_cents(ob)
         if yb_c is None or nb_c is None:
+            stats.skip_no_bids += 1
             log.info(
                 "llm_trade_skip_no_bids",
                 ticker=ticker,
@@ -113,6 +149,7 @@ def run_llm_opportunity_pipeline(
             max_contracts_allowed=max_allowed,
         )
         if verdict is None:
+            stats.llm_no_verdict += 1
             log.warning(
                 "llm_trade_no_verdict",
                 ticker=ticker,
@@ -130,6 +167,7 @@ def run_llm_opportunity_pipeline(
         )
 
         if not verdict.approve or not verdict.buy_yes:
+            stats.llm_declined += 1
             log.info(
                 "llm_trade_skip_llm_declined",
                 ticker=ticker,
@@ -148,6 +186,7 @@ def run_llm_opportunity_pipeline(
             yes_ask_dollars=yes_ask_d,
             contracts=count,
         ):
+            stats.bot_math_rejected += 1
             log.info("llm_trade_rejected_by_bot_math", ticker=ticker, fair_yes=verdict.fair_yes)
             continue
 
@@ -160,6 +199,7 @@ def run_llm_opportunity_pipeline(
         )
 
         if not execute:
+            stats.skipped_cli_no_execute += 1
             log.warning(
                 "llm_trade_candidate",
                 ticker=ticker,
@@ -170,6 +210,7 @@ def run_llm_opportunity_pipeline(
             continue
 
         if not settings.trade_llm_auto_execute:
+            stats.blocked_trade_llm_auto_execute_false += 1
             log.warning(
                 "llm_trade_blocked",
                 ticker=ticker,
@@ -178,6 +219,6 @@ def run_llm_opportunity_pipeline(
             continue
 
         trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
-        submitted += 1
+        stats.submitted += 1
 
-    return submitted
+    return stats.submitted, stats

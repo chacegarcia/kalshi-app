@@ -66,11 +66,13 @@ def cmd_llm_trade(
             if loop:
                 print(f"--- llm-trade iteration {iteration} ---", flush=True)
             try:
-                n = run_llm_opportunity_pipeline(settings, execute=execute, log=log)
+                n, run_stats = run_llm_opportunity_pipeline(settings, execute=execute, log=log)
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             print(f"Orders submitted this run (0 = none or scan-only): {n}")
+            for line in run_stats.lines():
+                print(line, flush=True)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
