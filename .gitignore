@@ -9,6 +9,8 @@ __pycache__/
 llm-run.log
 # Private keys — never commit (use KALSHI_PRIVATE_KEY_PATH to a local file)
 *.pem
+# Local GitHub SSH keys in repo root (never commit)
+ghkey-*
 logs/
 *.egg-info/
 dist/
