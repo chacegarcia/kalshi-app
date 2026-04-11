@@ -31,6 +31,7 @@ from kalshi_bot.paper_engine import PaperFillConfig
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
+from kalshi_bot.discover_runner import run_discover_rule_pipeline
 from kalshi_bot.monitor import heartbeat, record_portfolio_series_point, start_dashboard
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.ws import KalshiWS
@@ -85,6 +86,55 @@ def cmd_llm_trade(
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         print("\nllm-trade loop stopped.", file=sys.stderr)
+
+
+def cmd_discover_trade(
+    settings: Settings,
+    *,
+    execute: bool,
+    loop: bool = False,
+    interval_seconds: float = 120.0,
+) -> None:
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+
+    dash_client = None
+    if settings.dashboard_enabled:
+        start_dashboard(settings)
+        dash_client = build_sdk_client(settings)
+        try:
+            snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
+            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+        except Exception:
+            pass
+
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            if loop:
+                print(f"--- discover-trade iteration {iteration} ---", flush=True)
+            try:
+                n, run_stats = run_discover_rule_pipeline(settings, execute=execute, log=log)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(2)
+            print(f"Orders submitted this run (0 = none): {n}")
+            for line in run_stats.lines():
+                print(line, flush=True)
+            if dash_client is not None:
+                try:
+                    snap = fetch_portfolio_snapshot(dash_client, ticker=None)
+                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                except Exception:
+                    pass
+            if not loop:
+                break
+            print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("\ndiscover-trade loop stopped.", file=sys.stderr)
 
 
 def cmd_scan(settings: Settings, *, limit: int, use_llm: bool) -> None:
@@ -444,6 +494,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start local dashboard with live balance/exposure line chart (sets DASHBOARD_ENABLED)",
     )
 
+    dt = sub.add_parser(
+        "discover-trade",
+        help="LLM filters market titles only; buy/sell from .env rules (TRADE_BUY_* / edge). Multi-ticker.",
+    )
+    dt.add_argument(
+        "--execute",
+        action="store_true",
+        help="Submit when LLM includes ticker and rules fire (needs TRADE_DISCOVER_AUTO_EXECUTE=true)",
+    )
+    dt.add_argument("--loop", action="store_true", help="Repeat until Ctrl+C")
+    dt.add_argument(
+        "--interval",
+        type=float,
+        default=120.0,
+        metavar="SEC",
+        help="Seconds between iterations when --loop (default: 120)",
+    )
+    dt.add_argument("--web", action="store_true", help="Local dashboard (sets DASHBOARD_ENABLED)")
+
     w = sub.add_parser("watch-market", help="WebSocket ticker + orderbook stream")
     w.add_argument("ticker")
 
@@ -521,6 +590,8 @@ def main(argv: list[str] | None = None) -> None:
             os.environ["DASHBOARD_ENABLED"] = "false"
     if cmd == "llm-trade" and getattr(args, "web", False):
         os.environ["DASHBOARD_ENABLED"] = "true"
+    if cmd == "discover-trade" and getattr(args, "web", False):
+        os.environ["DASHBOARD_ENABLED"] = "true"
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -532,6 +603,13 @@ def main(argv: list[str] | None = None) -> None:
             cmd_scan(settings, limit=args.limit, use_llm=args.llm)
         elif cmd == "llm-trade":
             cmd_llm_trade(
+                settings,
+                execute=args.execute,
+                loop=args.loop,
+                interval_seconds=max(5.0, float(args.interval)),
+            )
+        elif cmd == "discover-trade":
+            cmd_discover_trade(
                 settings,
                 execute=args.execute,
                 loop=args.loop,

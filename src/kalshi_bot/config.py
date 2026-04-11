@@ -235,6 +235,22 @@ class Settings(BaseSettings):
         ),
         description="If true, LLM may approve when fair_yes clears edge vs ask; default prompt requires a 'clear mispricing'.",
     )
+    trade_llm_discovery_query: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_DISCOVERY_QUERY",
+            "trade_llm_discovery_query",
+        ),
+        description="Optional theme for discover-trade: LLM filters titles; empty = allow normal markets.",
+    )
+    trade_discover_auto_execute: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_DISCOVER_AUTO_EXECUTE",
+            "trade_discover_auto_execute",
+        ),
+        description="If true, discover-trade may submit orders when --execute (still needs LIVE_TRADING and not DRY_RUN).",
+    )
 
     # Balance-scaled limits (bigger account → larger caps within fixed % of balance)
     trade_balance_sizing_enabled: bool = Field(
@@ -408,6 +424,7 @@ class Settings(BaseSettings):
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
         "trade_llm_relaxed_approval",
+        "trade_discover_auto_execute",
         "trade_balance_sizing_enabled",
         mode="before",
     )

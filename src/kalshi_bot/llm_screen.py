@@ -35,6 +35,14 @@ class LLMOpportunityVerdict:
     reason: str
 
 
+@dataclass
+class LLMDiscoveryVerdict:
+    """LLM only filters which tickers enter the rule-based pipeline (no buy/sell decision)."""
+
+    watch: bool
+    reason: str
+
+
 def optional_llm_fair_yes(title: str, *, ticker: str, settings: Settings) -> float | None:
     """Return model-estimated fair P(YES) in [0,1] or None if disabled / failure."""
     key = settings.openai_api_key
@@ -105,20 +113,53 @@ Decide if a long YES is justified. Output ONLY valid JSON:
         return None
 
 
-def _openai_chat_json(api_key: str, model: str, user_content: str) -> dict[str, Any] | None:
+def llm_discover_watchlist(settings: Settings, *, ticker: str, title: str) -> LLMDiscoveryVerdict | None:
+    """True/false: should this market be passed to deterministic rules? Does not evaluate trades."""
+    key = settings.openai_api_key
+    if not key:
+        return None
+    q = (settings.trade_llm_discovery_query or "").strip()
+    filter_block = (
+        f"The user only wants markets that match this interest (be strict):\n{q}\n"
+        if q
+        else (
+            "No specific theme: set watch=true for normal Kalshi prediction market titles; "
+            "watch=false only for obvious junk, empty, or non-market text."
+        )
+    )
+    user = f"""Market ticker: {ticker}
+Title: {title}
+
+{filter_block}
+
+You do NOT decide whether to buy or sell. A separate program applies fixed math from the user's settings.
+Output ONLY valid JSON: {{"watch": true/false, "reason": "short text"}}"""
+
+    system = (
+        "You filter Kalshi binary prediction markets for downstream rule-based software. "
+        "You never give trading instructions. Output strict JSON only."
+    )
+    raw = _openai_chat_json_with_system(key, settings.trade_llm_model, system=system, user=user)
+    if raw is None:
+        return None
+    try:
+        watch = bool(raw.get("watch", False))
+        reason = str(raw.get("reason", ""))[:2000]
+        return LLMDiscoveryVerdict(watch=watch, reason=reason)
+    except (TypeError, ValueError):
+        return None
+
+
+def _openai_chat_json_with_system(
+    api_key: str, model: str, *, system: str, user: str
+) -> dict[str, Any] | None:
     url = "https://api.openai.com/v1/chat/completions"
     body: dict[str, Any] = {
         "model": model,
         "temperature": 0.15,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You evaluate Kalshi binary prediction markets. You only see the title and rough prices. "
-                    "Be conservative; output strict JSON only."
-                ),
-            },
-            {"role": "user", "content": user_content},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
     }
     data = json.dumps(body).encode("utf-8")
@@ -145,6 +186,18 @@ def _openai_chat_json(api_key: str, model: str, user_content: str) -> dict[str, 
         return json.loads(text)
     except (urllib.error.URLError, json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
         return None
+
+
+def _openai_chat_json(api_key: str, model: str, user_content: str) -> dict[str, Any] | None:
+    return _openai_chat_json_with_system(
+        api_key,
+        model,
+        system=(
+            "You evaluate Kalshi binary prediction markets. You only see the title and rough prices. "
+            "Be conservative; output strict JSON only."
+        ),
+        user=user_content,
+    )
 
 
 def _openai_json_fair_only(api_key: str, model: str, title: str, ticker: str) -> float | None:
