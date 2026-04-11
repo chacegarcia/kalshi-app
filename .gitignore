@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .env
+.env.txt
+llm-run.log
 # Private keys — never commit (use KALSHI_PRIVATE_KEY_PATH to a local file)
 *.pem
 logs/

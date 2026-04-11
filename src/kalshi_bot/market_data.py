@@ -21,8 +21,23 @@ class MarketSummary:
 
 
 @with_rest_retry
-def list_open_markets(client: KalshiSdkClient, *, limit: int = 50) -> GetMarketsResponse:
-    return client.markets.get_markets(status="open", limit=limit)
+def list_open_markets(
+    client: KalshiSdkClient,
+    *,
+    limit: int = 50,
+    mve_filter: str | None = "exclude",
+) -> GetMarketsResponse:
+    """List open markets.
+
+    ``mve_filter='exclude'`` (default) drops multivariate / combo legs so the first page
+    is usually normal binary markets with resting liquidity. MVE tickers often return
+    empty YES/NO books via REST even when ``status=open``.
+    Pass ``mve_filter=None`` to use the API default (includes MVE).
+    """
+    kwargs: dict[str, object] = {"status": "open", "limit": limit}
+    if mve_filter is not None:
+        kwargs["mve_filter"] = mve_filter
+    return client.markets.get_markets(**kwargs)
 
 
 @with_rest_retry

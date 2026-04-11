@@ -62,6 +62,16 @@ def run_llm_opportunity_pipeline(
 
     resp = list_open_markets(client, limit=settings.trade_llm_max_markets_per_run)
     markets = list(getattr(resp, "markets", []) or [])
+    log.info(
+        "llm_trade_scan_start",
+        market_count=len(markets),
+        execute=execute,
+        trade_llm_auto_execute=settings.trade_llm_auto_execute,
+        dry_run=settings.dry_run,
+        live_trading=settings.live_trading,
+    )
+    if not markets:
+        log.warning("llm_trade_no_open_markets", note="API returned zero open markets for this limit")
 
     for m in markets:
         s = summarize_market_row(m)
@@ -75,6 +85,12 @@ def run_llm_opportunity_pipeline(
         yb_c = best_yes_bid_cents(ob)
         nb_c = best_no_bid_cents(ob)
         if yb_c is None or nb_c is None:
+            log.info(
+                "llm_trade_skip_no_bids",
+                ticker=ticker,
+                yes_bid_cents=yb_c,
+                no_bid_cents=nb_c,
+            )
             continue
 
         yes_bid_d = yb_c / 100.0
@@ -97,6 +113,11 @@ def run_llm_opportunity_pipeline(
             max_contracts_allowed=max_allowed,
         )
         if verdict is None:
+            log.warning(
+                "llm_trade_no_verdict",
+                ticker=ticker,
+                note="OpenAI returned no usable JSON (check OPENAI_API_KEY, model, network, SSL)",
+            )
             continue
 
         log.info(
@@ -109,6 +130,12 @@ def run_llm_opportunity_pipeline(
         )
 
         if not verdict.approve or not verdict.buy_yes:
+            log.info(
+                "llm_trade_skip_llm_declined",
+                ticker=ticker,
+                approve=verdict.approve,
+                buy_yes=verdict.buy_yes,
+            )
             continue
 
         count = max(1, min(verdict.contracts, max_allowed, settings.max_contracts_per_market))
