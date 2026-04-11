@@ -31,7 +31,7 @@ from kalshi_bot.execution import (
     cancel_stale_orders,
     execute_intent,
 )
-from kalshi_bot.logger import StructuredLogger, get_logger
+from kalshi_bot.logger import StructuredLogger, get_logger, maybe_clear_structured_log_every_other_pass
 from kalshi_bot.market_data import list_open_markets, summarize_market_row
 from kalshi_bot.metrics import NO_GUARANTEE_DISCLAIMER, fee_slippage_sensitivity
 from kalshi_bot.scanner import format_scan_report, scan_kalshi_opportunities
@@ -145,6 +145,12 @@ def cmd_llm_trade(
                     record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
                 except Exception:
                     pass
+            maybe_clear_structured_log_every_other_pass(
+                log_path=settings.structured_log_path,
+                pass_number=iteration,
+                enabled=settings.structured_log_clear_every_other_pass,
+                log=log,
+            )
             if not loop:
                 break
             print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
@@ -206,6 +212,12 @@ def cmd_discover_trade(
                     record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
                 except Exception:
                     pass
+            maybe_clear_structured_log_every_other_pass(
+                log_path=settings.structured_log_path,
+                pass_number=iteration,
+                enabled=settings.structured_log_clear_every_other_pass,
+                log=log,
+            )
             if not loop:
                 break
             print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
@@ -271,6 +283,12 @@ def cmd_tape_trade(
                     record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
                 except Exception:
                     pass
+            maybe_clear_structured_log_every_other_pass(
+                log_path=settings.structured_log_path,
+                pass_number=iteration,
+                enabled=settings.structured_log_clear_every_other_pass,
+                log=log,
+            )
             if not loop:
                 break
             print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
@@ -335,6 +353,12 @@ def cmd_bitcoin_trade(
                     record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
                 except Exception:
                     pass
+            maybe_clear_structured_log_every_other_pass(
+                log_path=settings.structured_log_path,
+                pass_number=iteration,
+                enabled=settings.structured_log_clear_every_other_pass,
+                log=log,
+            )
             if not loop:
                 break
             print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)

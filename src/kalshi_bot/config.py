@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -112,7 +113,7 @@ class Settings(BaseSettings):
 
     # --- Trading — entry (buy YES): price filters & size ---
     strategy_max_yes_ask_dollars: float = Field(
-        default=0.55,
+        default=0.85,
         ge=0,
         le=1.0,
         validation_alias=AliasChoices(
@@ -143,14 +144,24 @@ class Settings(BaseSettings):
         ),
     )
     trade_entry_min_yes_ask_cents: int = Field(
-        default=8,
+        default=0,
         ge=0,
         le=98,
         validation_alias=AliasChoices(
             "TRADE_ENTRY_MIN_YES_ASK_CENTS",
             "trade_entry_min_yes_ask_cents",
         ),
-        description="Do not buy YES when implied YES ask (from the book) is below this many cents — filters extreme longshots. 0 = off. Example: 8 means roughly ≥8% implied before sizing other gates.",
+        description="Extra floor: do not buy YES below this many cents (0 = off). Stricter of this and TRADE_ENTRY_MAX_AMERICAN_ODDS_YES is used.",
+    )
+    trade_entry_max_american_odds_yes: float = Field(
+        default=200.0,
+        ge=0.0,
+        le=100_000.0,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MAX_AMERICAN_ODDS_YES",
+            "trade_entry_max_american_odds_yes",
+        ),
+        description="Skip buy YES when implied American long odds exceed this (+200 ≈ min ~34¢; +400≈20¢, +600≈14¢). 0 = disable this cap.",
     )
     strategy_order_count: int = Field(
         default=1,
@@ -188,7 +199,7 @@ class Settings(BaseSettings):
         description="Comma-separated USD caps per order (round-robin); min floor is only TRADE_MIN_ORDER_NOTIONAL_USD. Empty = use TRADE_MIN/MAX_ORDER_NOTIONAL_USD only.",
     )
     strategy_limit_price_cents: int = Field(
-        default=50,
+        default=78,
         ge=1,
         le=99,
         validation_alias=AliasChoices(
@@ -409,6 +420,24 @@ class Settings(BaseSettings):
             "trade_llm_fair_ask_slippage",
         ),
         description="Override LLM decline when fair_yes >= implied_YES_ask − this (e.g. 0.04 = 4¢).",
+    )
+    trade_llm_adapt_to_session_wl: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_ADAPT_TO_SESSION_WL",
+            "trade_llm_adapt_to_session_wl",
+        ),
+        description="When session W–L (in-memory dashboard tally) skews negative, tighten fee-edge math and LLM prompt.",
+    )
+    trade_llm_adapt_min_closed_trades: int = Field(
+        default=5,
+        ge=1,
+        le=10_000,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_ADAPT_MIN_CLOSED_TRADES",
+            "trade_llm_adapt_min_closed_trades",
+        ),
+        description="Minimum wins+losses before W–L adaptation activates.",
     )
     trade_llm_discovery_query: str | None = Field(
         default=None,
@@ -695,6 +724,40 @@ class Settings(BaseSettings):
         ),
         description="If true, skip implied-% TP; exit when bid ≥ entry + min profit (default 1¢/contract if min profit unset).",
     )
+    trade_exit_stop_loss_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_STOP_LOSS_ENABLED",
+            "trade_exit_stop_loss_enabled",
+        ),
+        description="If true, sell long YES when best bid ≤ entry × TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION (requires entry reference).",
+    )
+    trade_exit_stop_loss_entry_fraction: float = Field(
+        default=0.5,
+        gt=0.0,
+        lt=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION",
+            "trade_exit_stop_loss_entry_fraction",
+        ),
+        description=(
+            "Long YES stop: fire when best YES bid ≤ round(entry_cents × this). "
+            "0.5 = exit if bid is at or below half of estimated entry (e.g. 60¢ entry → floor 30¢). "
+            "Not ‘lose 50% of dollars’—it compares bid level to entry level in cents."
+        ),
+    )
+    trade_exit_stop_loss_skip_suspect_portfolio_estimate: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_STOP_LOSS_SKIP_SUSPECT_PORTFOLIO_ESTIMATE",
+            "trade_exit_stop_loss_skip_suspect_portfolio_estimate",
+        ),
+        description=(
+            "If true, do not apply stop-loss when entry comes only from portfolio (total_traded/position) "
+            "and rounds to ≤5¢ or ≥95¢—often API noise. Manual TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS is always used for stops. "
+            "Take-profit rules still use the portfolio estimate."
+        ),
+    )
     trade_exit_sell_time_in_force: Literal["immediate_or_cancel", "fill_or_kill", "good_till_canceled"] = Field(
         default="immediate_or_cancel",
         validation_alias=AliasChoices(
@@ -737,10 +800,15 @@ class Settings(BaseSettings):
         default_factory=_default_log_path, validation_alias=_env("STRUCTURED_LOG_PATH", "structured_log_path")
     )
     structured_log_clear_every_n_tickers: int = Field(
-        default=1000,
+        default=0,
         ge=0,
         validation_alias=_env("STRUCTURED_LOG_CLEAR_EVERY_N_TICKERS", "structured_log_clear_every_n_tickers"),
-        description="llm-trade / tape-trade / discover-trade: truncate STRUCTURED_LOG_PATH after every N ticker iterations (0 = never).",
+        description="Per-ticker: truncate STRUCTURED_LOG_PATH after every N ticker iterations inside one pass (0 = never). Prefer STRUCTURED_LOG_CLEAR_EVERY_OTHER_PASS when using --loop.",
+    )
+    structured_log_clear_every_other_pass: bool = Field(
+        default=True,
+        validation_alias=_env("STRUCTURED_LOG_CLEAR_EVERY_OTHER_PASS", "structured_log_clear_every_other_pass"),
+        description="llm/discover/tape/bitcoin-trade with --loop: truncate JSONL after every 2nd completed pass (2, 4, 6…).",
     )
 
     @field_validator("kalshi_rest_base_url", "kalshi_ws_url", mode="before")
@@ -801,6 +869,7 @@ class Settings(BaseSettings):
         "trade_llm_use_tape_universe",
         "trade_llm_relaxed_approval",
         "trade_llm_accept_when_fair_covers_ask",
+        "trade_llm_adapt_to_session_wl",
         "trade_llm_shuffle_open_markets",
         "trade_llm_bitcoin_priority_enabled",
         "trade_no_max_exposure_cap",
@@ -810,6 +879,9 @@ class Settings(BaseSettings):
         "trade_bitcoin_sidecar_enabled",
         "trade_balance_sizing_enabled",
         "trade_auto_sell_after_each_pass",
+        "trade_exit_stop_loss_enabled",
+        "trade_exit_stop_loss_skip_suspect_portfolio_estimate",
+        "structured_log_clear_every_other_pass",
         mode="before",
     )
     @classmethod
@@ -861,6 +933,29 @@ class Settings(BaseSettings):
     def trade_entry_min_edge_from_50_pct_points(self) -> float:
         """Minimum |mid−50%| in percentage points (`TRADE_ENTRY_MIN_EDGE_FROM_50` × 100)."""
         return self.strategy_probability_gap * 100.0
+
+    @property
+    def trade_entry_min_yes_ask_cents_from_max_american_odds(self) -> int | None:
+        """Minimum YES ask (¢) from positive American odds cap (+200 → ~34¢ implied). ``None`` if disabled.
+
+        Maps +X to implied probability ``p = 100/(X+100)`` on a $1 contract, then minimum ask in cents is
+        ``ceil(100*p)`` (same as ``ceil(10000/(X+100))``). This only gates **buys**; unrelated to stop-loss %.
+        """
+        a = float(self.trade_entry_max_american_odds_yes)
+        if a <= 0:
+            return None
+        return max(1, min(98, int(math.ceil(100.0 * 100.0 / (a + 100.0) - 1e-12))))
+
+    @property
+    def trade_entry_effective_min_yes_ask_cents(self) -> int:
+        """Strictest of ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` and American-odds cap (0 = no floor)."""
+        floors: list[int] = []
+        if self.trade_entry_min_yes_ask_cents > 0:
+            floors.append(self.trade_entry_min_yes_ask_cents)
+        am = self.trade_entry_min_yes_ask_cents_from_max_american_odds
+        if am is not None:
+            floors.append(am)
+        return max(floors) if floors else 0
 
     def auto_sell_effective_min_yes_bid_cents(self, cli_override: int | None) -> int | None:
         """Min best YES bid (cents) to treat as take-profit-by-implied-%, or None if only profit-margin mode."""

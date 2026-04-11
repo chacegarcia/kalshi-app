@@ -219,7 +219,7 @@ def evaluate_bitcoin_ticker_pass(
             "bitcoin_skip_longshot_yes",
             ticker=ticker,
             yes_ask_cents=yes_ask_c,
-            min_yes_ask_cents=settings.trade_entry_min_yes_ask_cents,
+            min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
         )
         return 0, stats
 
@@ -266,7 +266,7 @@ def evaluate_bitcoin_ticker_pass(
             order_count=settings.strategy_order_count,
             limit_price_cents=settings.strategy_limit_price_cents,
             max_spread_dollars=settings.trade_max_entry_spread_dollars,
-            entry_min_yes_ask_cents=settings.trade_entry_min_yes_ask_cents,
+            entry_min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
         )
 
     if intent is None:

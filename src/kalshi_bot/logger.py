@@ -108,3 +108,26 @@ def maybe_clear_structured_log_after_tickers(
             every_n_tickers=every_n,
             processed_tickers=processed_count,
         )
+
+
+def maybe_clear_structured_log_every_other_pass(
+    *,
+    log_path: Path,
+    pass_number: int,
+    enabled: bool,
+    log: StructuredLogger | None = None,
+) -> None:
+    """Truncate JSONL after every **other** completed pipeline pass (passes 2, 4, 6…).
+
+    ``pass_number`` is 1-based (first run = 1). When disabled or pass is odd, no-op.
+    """
+    if not enabled or pass_number < 2 or pass_number % 2 != 0:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    if log is not None:
+        log.info(
+            "structured_log_cleared",
+            reason="every_other_pass",
+            pass_number=pass_number,
+        )

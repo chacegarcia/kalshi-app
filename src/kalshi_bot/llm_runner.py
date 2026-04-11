@@ -24,7 +24,9 @@ from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import effective_max_contracts
 from kalshi_bot.strategy import skip_buy_yes_longshot
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
+from kalshi_bot.log_insights import adaptive_edge_deltas_from_wl, aggregate_structured_log_tail
 from kalshi_bot.llm_screen import LLMOpportunityVerdict, llm_evaluate_opportunity
+from kalshi_bot.monitor import win_loss_snapshot
 
 
 @dataclass
@@ -91,14 +93,18 @@ class LLMTradeRunStats:
         return out
 
 
-def _llm_effective_edge_thresholds(settings: Settings) -> tuple[float, float]:
+def _llm_effective_edge_thresholds(
+    settings: Settings,
+    *,
+    adaptive_min_add: float = 0.0,
+    adaptive_mid_add: float = 0.0,
+) -> tuple[float, float]:
     """LLM-specific overrides so llm-trade can be looser than tape/discover without changing global TRADE_*."""
     mn = settings.trade_llm_min_net_edge_after_fees
     me = settings.trade_llm_edge_middle_extra_edge
-    return (
-        settings.trade_min_net_edge_after_fees if mn is None else mn,
-        settings.trade_edge_middle_extra_edge if me is None else me,
-    )
+    base_mn = settings.trade_min_net_edge_after_fees if mn is None else mn
+    base_me = settings.trade_edge_middle_extra_edge if me is None else me
+    return (base_mn + adaptive_min_add, base_me + adaptive_mid_add)
 
 
 def _passes_bot_edge(
@@ -141,6 +147,8 @@ def _passes_bot_math_for_llm(
     yes_ask_dollars: float,
     contracts: int,
     llm_decline_overridden: bool,
+    adaptive_min_add: float = 0.0,
+    adaptive_mid_add: float = 0.0,
 ) -> bool:
     """Strict fee-edge check, or when LLM declined but fair is near ask, only book-quality checks."""
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
@@ -158,7 +166,9 @@ def _passes_bot_math_for_llm(
     ):
         return True
 
-    mn, me = _llm_effective_edge_thresholds(settings)
+    mn, me = _llm_effective_edge_thresholds(
+        settings, adaptive_min_add=adaptive_min_add, adaptive_mid_add=adaptive_mid_add
+    )
     return _passes_bot_edge(
         settings,
         fair_yes=fair_yes,
@@ -275,6 +285,34 @@ def run_llm_opportunity_pipeline(
         if not rows:
             log.warning("llm_trade_no_open_markets", note="API returned zero open markets after pagination")
 
+    wl_snap = win_loss_snapshot()
+    ad_min, ad_mid, wl_stress, wl_note = adaptive_edge_deltas_from_wl(
+        wl_snap,
+        enabled=settings.trade_llm_adapt_to_session_wl,
+        min_closed=settings.trade_llm_adapt_min_closed_trades,
+    )
+    log.info(
+        "llm_trade_session_adaptive",
+        wins=wl_snap.get("wins", 0),
+        losses=wl_snap.get("losses", 0),
+        ties=wl_snap.get("ties", 0),
+        extra_min_net_edge=ad_min,
+        extra_mid_edge=ad_mid,
+        stress=wl_stress,
+    )
+    if ad_min > 0 or ad_mid > 0 or wl_note:
+        print(
+            f"llm-trade: session W–L {wl_snap.get('wins', 0)}-{wl_snap.get('losses', 0)} "
+            f"→ adaptive edge bump min={ad_min:.4f} mid={ad_mid:.4f} stress={wl_stress}",
+            flush=True,
+        )
+    else:
+        print(
+            f"llm-trade: session W–L {wl_snap.get('wins', 0)}-{wl_snap.get('losses', 0)} "
+            "(no adaptation yet or disabled)",
+            flush=True,
+        )
+
     for i, (ticker, title) in enumerate(rows):
         try:
             print(f"llm-trade: {ticker} …", flush=True)
@@ -313,7 +351,7 @@ def run_llm_opportunity_pipeline(
                     "llm_trade_skip_longshot_yes",
                     ticker=ticker,
                     yes_ask_cents=yes_ask_c,
-                    min_yes_ask_cents=settings.trade_entry_min_yes_ask_cents,
+                    min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
                 )
                 continue
 
@@ -352,6 +390,8 @@ def run_llm_opportunity_pipeline(
                     )
                     if mintent is not None:
                         cnt = min(mintent.count, max_allowed)
+                        if wl_stress:
+                            cnt = min(cnt, 1)
                         if cnt < 1:
                             continue
                         mintent = make_limit_intent(
@@ -397,6 +437,9 @@ def run_llm_opportunity_pipeline(
                 yes_ask_dollars=yes_ask_d,
                 balance_cents=bal,
                 max_contracts_allowed=max_allowed,
+                adaptive_extra_min_net_edge=ad_min,
+                adaptive_extra_mid_edge=ad_mid,
+                session_performance_note=wl_note,
             )
             if verdict is None:
                 stats.llm_no_verdict += 1
@@ -447,6 +490,8 @@ def run_llm_opportunity_pipeline(
                 stats.skip_zero_contracts_after_verdict += 1
                 log.info("llm_trade_skip_zero_contracts_after_cap", ticker=ticker, verdict_contracts=verdict.contracts)
                 continue
+            if wl_stress:
+                count = min(count, 1)
             limit_c = max(1, min(99, min(verdict.limit_yes_price_cents, yes_ask_c)))
 
             if not _passes_bot_math_for_llm(
@@ -456,6 +501,8 @@ def run_llm_opportunity_pipeline(
                 yes_ask_dollars=yes_ask_d,
                 contracts=count,
                 llm_decline_overridden=llm_decline_overridden,
+                adaptive_min_add=ad_min,
+                adaptive_mid_add=ad_mid,
             ):
                 stats.bot_math_rejected += 1
                 log.info("llm_trade_rejected_by_bot_math", ticker=ticker, fair_yes=verdict.fair_yes)
@@ -498,5 +545,16 @@ def run_llm_opportunity_pipeline(
                 processed_count=i + 1,
                 log=log,
             )
+
+    tail = aggregate_structured_log_tail(settings.structured_log_path)
+    log.info(
+        "llm_trade_log_tail_summary",
+        lines_parsed=tail.get("lines_parsed"),
+        top_events=tail.get("top_events"),
+        order_blocked_reasons=tail.get("order_blocked_reasons"),
+    )
+    print("--- structured log tail (event counts) ---", flush=True)
+    for line in tail.get("top_events", [])[:12]:
+        print(f"  {line}", flush=True)
 
     return stats.submitted, stats

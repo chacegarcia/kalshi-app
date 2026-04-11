@@ -16,14 +16,15 @@ from kalshi_bot.edge_math import min_edge_threshold_for_mid, net_edge_buy_yes_lo
 
 
 def skip_buy_yes_longshot(settings: Settings, yes_ask_cents: int) -> bool:
-    """Return True to skip a buy-YES entry: implied YES ask is below ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` (moonshot filter).
+    """Return True to skip buy-YES when implied YES ask is below the effective floor.
 
-    When the floor is 0, the check is disabled.
+    Uses the stricter of ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` and the minimum implied by
+    ``TRADE_ENTRY_MAX_AMERICAN_ODDS_YES`` (+200 → ~34¢; blocks +400/+600-style longshots).
     """
-    m = settings.trade_entry_min_yes_ask_cents
-    if m <= 0:
+    need = settings.trade_entry_effective_min_yes_ask_cents
+    if need <= 0:
         return False
-    return yes_ask_cents < m
+    return yes_ask_cents < need
 
 
 @dataclass
@@ -199,7 +200,7 @@ class SampleSpreadGapStrategy:
             order_count=self.settings.strategy_order_count,
             limit_price_cents=self.settings.strategy_limit_price_cents,
             max_spread_dollars=self.settings.trade_max_entry_spread_dollars,
-            entry_min_yes_ask_cents=self.settings.trade_entry_min_yes_ask_cents,
+            entry_min_yes_ask_cents=self.settings.trade_entry_effective_min_yes_ask_cents,
         )
 
 

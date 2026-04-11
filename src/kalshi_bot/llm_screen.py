@@ -115,12 +115,24 @@ def _bitcoin_market_context(ticker: str, title: str) -> bool:
 
 
 def _llm_prompt_edge_settings(settings: Settings) -> tuple[float, float]:
+    return _llm_prompt_edge_settings_with_adaptive(
+        settings,
+        adaptive_extra_min_net_edge=0.0,
+        adaptive_extra_mid_edge=0.0,
+    )
+
+
+def _llm_prompt_edge_settings_with_adaptive(
+    settings: Settings,
+    *,
+    adaptive_extra_min_net_edge: float = 0.0,
+    adaptive_extra_mid_edge: float = 0.0,
+) -> tuple[float, float]:
     mn = settings.trade_llm_min_net_edge_after_fees
     me = settings.trade_llm_edge_middle_extra_edge
-    return (
-        settings.trade_min_net_edge_after_fees if mn is None else mn,
-        settings.trade_edge_middle_extra_edge if me is None else me,
-    )
+    base_mn = settings.trade_min_net_edge_after_fees if mn is None else mn
+    base_me = settings.trade_edge_middle_extra_edge if me is None else me
+    return (base_mn + adaptive_extra_min_net_edge, base_me + adaptive_extra_mid_edge)
 
 
 def optional_llm_fair_yes(title: str, *, ticker: str, settings: Settings) -> float | None:
@@ -142,6 +154,9 @@ def llm_evaluate_opportunity(
     yes_ask_dollars: float,
     balance_cents: int | None,
     max_contracts_allowed: int,
+    adaptive_extra_min_net_edge: float = 0.0,
+    adaptive_extra_mid_edge: float = 0.0,
+    session_performance_note: str = "",
 ) -> LLMOpportunityVerdict | None:
     """Ask the model to reason about a market; output must be JSON matching ``LLMOpportunityVerdict`` shape."""
     key = settings.openai_api_key
@@ -149,12 +164,19 @@ def llm_evaluate_opportunity(
         return None
 
     bal_s = str(balance_cents) if balance_cents is not None else "?"
-    min_e, mid_x = _llm_prompt_edge_settings(settings)
+    min_e, mid_x = _llm_prompt_edge_settings_with_adaptive(
+        settings,
+        adaptive_extra_min_net_edge=adaptive_extra_min_net_edge,
+        adaptive_extra_mid_edge=adaptive_extra_mid_edge,
+    )
     params = (
         f"Enforced in code: min_net_edge_after_fees={min_e}, mid_price_extra_edge={mid_x}, "
         f"max_yes_ask={settings.strategy_max_yes_ask_dollars}, min_spread={settings.strategy_min_spread_dollars}, "
         f"max_contracts={max_contracts_allowed}, bal_cents={bal_s}"
     )
+    perf_block = ""
+    if session_performance_note.strip():
+        perf_block = f"Performance / risk note (session):\n{session_performance_note.strip()}\n\n"
     btc = _bitcoin_market_context(ticker, title)
     odds_block = (
         "This is a Bitcoin-tilted or BTC-series market: weigh spot/volatility and headline risk; you may size slightly "
@@ -170,7 +192,7 @@ def llm_evaluate_opportunity(
 
     user = f"""{ticker} | {title}
 YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
-{params}
+{perf_block}{params}
 {style_block}{odds_block}JSON only:
 {{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"contracts":1-{max_contracts_allowed},"reason":"brief"}}
 {_llm_approval_tail(settings)}"""

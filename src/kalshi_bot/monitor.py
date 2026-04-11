@@ -6,6 +6,7 @@ import threading
 import time
 import webbrowser
 from collections import deque
+from pathlib import Path
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from threading import Lock
@@ -17,8 +18,61 @@ from kalshi_bot.portfolio import fetch_portfolio_snapshot
 
 _LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
+# Set when dashboard starts so /api/log_summary can locate JSONL without Settings in Flask context
+_STRUCTURED_LOG_PATH_FOR_STATS: Path | None = None
 # Time series for dashboard line chart (balance + exposure in cents)
 _SERIES: deque[dict[str, Any]] = deque(maxlen=2000)
+# Closed-trade tally (auto-sell: estimated gross vs entry, or take-profit without basis)
+_WINS = 0
+_LOSSES = 0
+_TIES = 0  # breakeven (estimated gross == 0)
+
+
+def record_trade_outcome(pnl_cents: float | None) -> None:
+    """Increment dashboard W–L from signed estimated PnL (cents) on a close.
+
+    Positive → win, negative → loss, zero → tie (breakeven). ``None`` → no-op (use
+    ``record_auto_sell_outcome`` when entry was unknown).
+    """
+    global _WINS, _LOSSES, _TIES
+    if pnl_cents is None:
+        return
+    try:
+        p = float(pnl_cents)
+    except (TypeError, ValueError):
+        return
+    with _LOCK:
+        if p > 0:
+            _WINS += 1
+        elif p < 0:
+            _LOSSES += 1
+        else:
+            _TIES += 1
+
+
+def record_auto_sell_outcome(*, gross_profit_cents: int | None, exit_reason: str) -> None:
+    """Update W–L after auto-sell submitted an exit (take-profit or stop-loss).
+
+    When ``gross_profit_cents`` is set, sign decides W/L/BE. When ``None``, ``take_profit_*``
+    counts as a win (basis unknown); ``stop_loss_*`` counts as a loss.
+    """
+    global _WINS, _LOSSES
+    if gross_profit_cents is not None:
+        record_trade_outcome(float(gross_profit_cents))
+        return
+    if exit_reason.startswith("take_profit"):
+        with _LOCK:
+            _WINS += 1
+        return
+    if exit_reason.startswith("stop_loss"):
+        with _LOCK:
+            _LOSSES += 1
+
+
+def win_loss_snapshot() -> dict[str, int]:
+    """Return current win/loss/tie counts (thread-safe copy)."""
+    with _LOCK:
+        return {"wins": _WINS, "losses": _LOSSES, "ties": _TIES}
 
 
 def record_portfolio_series_point(balance_cents: int | float | None, exposure_cents: float) -> None:
@@ -96,6 +150,7 @@ _HTML = """<!DOCTYPE html>
   <h1>Kalshi bot — order monitor</h1>
   <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Chart polls every 2s; new points are added when the bot records snapshots (including periodic balance/exposure during long runs).</p>
   <div class="status" id="status">Loading…</div>
+  <div class="status" id="wlBanner">W–L <strong id="wlStat">0–0</strong> <span class="muted" id="wlTies"></span> <span class="muted">(auto-sell take-profit; P/L from entry estimate when available)</span></div>
   <div class="balance-banner" id="balanceBanner" style="display:none;">
     <span><strong>Cash</strong> <span id="balCash">—</span></span>
     <span><strong>Exposure</strong> <span id="balExp">—</span></span>
@@ -104,6 +159,11 @@ _HTML = """<!DOCTYPE html>
   <div class="chart-wrap">
     <h2>Balance &amp; exposure (USD)</h2>
     <canvas id="seriesChart" width="800" height="220"></canvas>
+  </div>
+  <div class="chart-wrap">
+    <h2>Structured log tail (event counts)</h2>
+    <p class="sub" style="margin:0 0 0.5rem;">Recent lines of <code>STRUCTURED_LOG_PATH</code> — which events fired most often.</p>
+    <pre id="logSummaryPre" style="font-size:0.75rem;max-height:160px;overflow:auto;color:#c5d0dc;">—</pre>
   </div>
   <table>
     <thead><tr><th>Time (UTC)</th><th>Kind</th><th>Detail</th></tr></thead>
@@ -150,6 +210,17 @@ _HTML = """<!DOCTYPE html>
       }
     }
     async function poll() {
+      try {
+        const rs = await fetch('/api/stats', { cache: 'no-store' });
+        const st = await rs.json();
+        const w = Number(st.wins) || 0;
+        const l = Number(st.losses) || 0;
+        const t = Number(st.ties) || 0;
+        const wlEl = document.getElementById('wlStat');
+        const tiesEl = document.getElementById('wlTies');
+        if (wlEl) wlEl.textContent = w + '–' + l;
+        if (tiesEl) tiesEl.textContent = t > 0 ? '· BE ' + t : '';
+      } catch (e) { /* ignore */ }
       try {
         const r = await fetch('/api/events', { cache: 'no-store' });
         const data = await r.json();
@@ -200,8 +271,20 @@ _HTML = """<!DOCTYPE html>
         }
       }
     }
+    async function pollLogSummary() {
+      try {
+        const r = await fetch('/api/log_summary', { cache: 'no-store' });
+        const j = await r.json();
+        const el = document.getElementById('logSummaryPre');
+        if (!el) return;
+        const lines = j.top_events || [];
+        el.textContent = lines.length ? lines.join('\\n') : (j.error || 'no lines parsed');
+      } catch (e) { /* ignore */ }
+    }
     poll();
     setInterval(poll, 2000);
+    pollLogSummary();
+    setInterval(pollLogSummary, 5000);
   </script>
 </body>
 </html>"""
@@ -209,6 +292,8 @@ _HTML = """<!DOCTYPE html>
 
 def _create_app() -> Any:
     from flask import Flask, Response, jsonify
+
+    from kalshi_bot.log_insights import aggregate_structured_log_tail
 
     app = Flask(__name__)
 
@@ -226,13 +311,24 @@ def _create_app() -> Any:
         with _LOCK:
             return jsonify(list(_SERIES))
 
+    @app.get("/api/stats")
+    def api_stats() -> Any:
+        return jsonify(win_loss_snapshot())
+
+    @app.get("/api/log_summary")
+    def api_log_summary() -> Any:
+        p = _STRUCTURED_LOG_PATH_FOR_STATS or Path("logs/kalshi_bot.jsonl")
+        return jsonify(aggregate_structured_log_tail(p))
+
     return app
 
 
 def start_dashboard(settings: Settings) -> threading.Thread | None:
     """Start Flask in a daemon thread; optionally open the default browser."""
+    global _STRUCTURED_LOG_PATH_FOR_STATS
     if not settings.dashboard_enabled:
         return None
+    _STRUCTURED_LOG_PATH_FOR_STATS = settings.structured_log_path
 
     def _run() -> None:
         app.run(

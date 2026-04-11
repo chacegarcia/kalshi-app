@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from kalshi_bot.config import Settings
-from kalshi_bot.strategy import TradeIntent
+from kalshi_bot.strategy import TradeIntent, skip_buy_yes_longshot
 
 
 def yes_price_momentum_is_hot(closes: list[float], settings: Settings) -> tuple[bool, str]:
@@ -50,6 +50,11 @@ def momentum_buy_intent_if_hot(
     if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
         return None, "spread too wide"
     limit_cents = int(max(1, min(99, round(yes_ask_dollars * 100.0))))
+    if skip_buy_yes_longshot(settings, limit_cents):
+        return None, (
+            f"YES ask {limit_cents}¢ below effective min "
+            f"{settings.trade_entry_effective_min_yes_ask_cents}¢ (American/longshot gate)"
+        )
     return (
         TradeIntent(
             ticker=ticker,
