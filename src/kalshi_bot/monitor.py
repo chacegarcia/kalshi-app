@@ -29,6 +29,7 @@ def record_portfolio_series_point(balance_cents: int | float | None, exposure_ce
         "unix": time.time(),
         "ts_iso": datetime.now(timezone.utc).isoformat(),
         "balance_cents": bal,
+        "balance_known": balance_cents is not None,
         "exposure_cents": float(exposure_cents),
     }
     with _LOCK:
@@ -80,6 +81,9 @@ _HTML = """<!DOCTYPE html>
     .kind-heartbeat { color: var(--muted); }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.75rem; color: #c5d0dc; }
     .status { display: inline-block; padding: 0.15rem 0.45rem; border-radius: 4px; background: var(--card); font-size: 0.75rem; color: var(--muted); margin-bottom: 0.75rem; }
+    .balance-banner { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; align-items: baseline; background: var(--card); border-radius: 8px; padding: 0.65rem 1rem; margin-bottom: 0.75rem; font-size: 0.9375rem; }
+    .balance-banner strong { color: var(--text); font-weight: 600; }
+    .balance-banner span.muted { color: var(--muted); font-size: 0.8125rem; }
     .chart-wrap { background: var(--card); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.25rem; max-width: 100%; }
     .chart-wrap h2 { font-size: 0.9375rem; font-weight: 600; margin: 0 0 0.5rem; color: var(--muted); }
     .chart-wrap canvas { max-height: 220px; }
@@ -90,6 +94,11 @@ _HTML = """<!DOCTYPE html>
   <h1>Kalshi bot — order monitor</h1>
   <p class="sub">Live feed of intents, simulated orders, blocks, and live submits. Chart updates every 2s from portfolio snapshots.</p>
   <div class="status" id="status">Loading…</div>
+  <div class="balance-banner" id="balanceBanner" style="display:none;">
+    <span><strong>Cash</strong> <span id="balCash">—</span></span>
+    <span><strong>Exposure</strong> <span id="balExp">—</span></span>
+    <span class="muted" id="balTs"></span>
+  </div>
   <div class="chart-wrap">
     <h2>Balance &amp; exposure (USD)</h2>
     <canvas id="seriesChart" width="800" height="220"></canvas>
@@ -159,7 +168,25 @@ _HTML = """<!DOCTYPE html>
         }
         const sr = await fetch('/api/series');
         const pts = await sr.json();
-        if (pts.length > 0) buildOrUpdateChart(pts);
+        if (pts.length > 0) {
+          buildOrUpdateChart(pts);
+          const last = pts[pts.length - 1];
+          const cashEl = document.getElementById('balCash');
+          const expEl = document.getElementById('balExp');
+          const tsEl = document.getElementById('balTs');
+          const banner = document.getElementById('balanceBanner');
+          const exp = dollarsFromCents(last.exposure_cents);
+          expEl.textContent = '$' + exp.toFixed(2);
+          if (last.balance_known === false) {
+            cashEl.textContent = 'n/a';
+          } else {
+            const cash = dollarsFromCents(last.balance_cents);
+            cashEl.textContent = '$' + cash.toFixed(2);
+          }
+          if (last.ts_iso) tsEl.textContent = 'as of ' + last.ts_iso;
+          else tsEl.textContent = '';
+          banner.style.display = 'flex';
+        }
       } catch (e) {
         document.getElementById('status').textContent = 'Fetch error (is the bot running?)';
       }

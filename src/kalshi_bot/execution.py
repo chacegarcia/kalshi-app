@@ -20,6 +20,8 @@ from kalshi_bot.sizing import (
     cap_buy_yes_count_for_notional,
     effective_max_contracts,
     effective_max_exposure_cents,
+    next_buy_yes_notional_min_max,
+    parse_notional_sweep_usd,
 )
 from kalshi_bot.strategy import TradeIntent, projected_abs_position_after
 
@@ -141,10 +143,22 @@ def execute_intent(
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
 
+    min_n = settings.trade_min_order_notional_usd
+    max_n = settings.trade_max_order_notional_usd
+    if intent.side == "yes" and intent.action == "buy":
+        min_n, max_n = next_buy_yes_notional_min_max(settings)
+        if parse_notional_sweep_usd(settings.trade_notional_sweep_usd):
+            log.info(
+                "notional_sweep_step",
+                ticker=intent.ticker,
+                target_usd=min_n,
+                sweep=settings.trade_notional_sweep_usd,
+            )
+
     capped = cap_buy_yes_count_for_notional(
         intent.count,
         yes_price_cents=intent.yes_price_cents,
-        max_notional_usd=settings.trade_max_order_notional_usd,
+        max_notional_usd=max_n,
         side=intent.side,
         action=intent.action,
     )
@@ -162,8 +176,8 @@ def execute_intent(
         floored = adjust_buy_yes_count_for_notional_floor(
             intent.count,
             yes_price_cents=intent.yes_price_cents,
-            min_notional_usd=settings.trade_min_order_notional_usd,
-            max_notional_usd=settings.trade_max_order_notional_usd,
+            min_notional_usd=min_n,
+            max_notional_usd=max_n,
             max_contracts=max_c,
         )
         if floored < 1:
@@ -171,8 +185,8 @@ def execute_intent(
                 "order_blocked",
                 reason="min_order_notional_unreachable",
                 ticker=intent.ticker,
-                min_usd=settings.trade_min_order_notional_usd,
-                max_usd=settings.trade_max_order_notional_usd,
+                min_usd=min_n,
+                max_usd=max_n,
             )
             record_event("blocked", reason="min_order_notional_unreachable", intent=intent)
             return

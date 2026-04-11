@@ -12,6 +12,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from kalshi_bot.client import KalshiSdkClient
+
 from kalshi_bot.ssl_bundle import apply_certifi_ca_bundle
 from kalshi_bot.auth import AuthError, build_kalshi_auth
 from kalshi_bot.auto_sell import run_auto_sell_loop
@@ -28,7 +30,7 @@ from kalshi_bot.market_data import list_open_markets, summarize_market_row
 from kalshi_bot.metrics import NO_GUARANTEE_DISCLAIMER, fee_slippage_sensitivity
 from kalshi_bot.scanner import format_scan_report, scan_kalshi_opportunities
 from kalshi_bot.paper_engine import PaperFillConfig
-from kalshi_bot.portfolio import fetch_portfolio_snapshot
+from kalshi_bot.portfolio import fetch_portfolio_snapshot, print_portfolio_balance_line
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
 from kalshi_bot.discover_runner import run_discover_rule_pipeline
@@ -38,12 +40,18 @@ from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execut
 from kalshi_bot.ws import KalshiWS
 
 
+def _client_for_balance(settings: Settings, dash_client: KalshiSdkClient | None) -> KalshiSdkClient:
+    """Reuse dashboard client or build one so balance prints even without --web."""
+    return dash_client if dash_client is not None else build_sdk_client(settings)
+
+
 def cmd_llm_trade(
     settings: Settings,
     *,
     execute: bool,
     loop: bool = False,
     interval_seconds: float = 120.0,
+    use_tape: bool = False,
 ) -> None:
     print(NO_GUARANTEE_DISCLAIMER)
     print()
@@ -68,13 +76,19 @@ def cmd_llm_trade(
             if loop:
                 print(f"--- llm-trade iteration {iteration} ---", flush=True)
             try:
-                n, run_stats = run_llm_opportunity_pipeline(settings, execute=execute, log=log)
+                n, run_stats = run_llm_opportunity_pipeline(
+                    settings,
+                    execute=execute,
+                    log=log,
+                    use_tape_universe=use_tape,
+                )
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             print(f"Orders submitted this run (0 = none or scan-only): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
+            print_portfolio_balance_line(_client_for_balance(settings, dash_client))
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
@@ -124,6 +138,7 @@ def cmd_discover_trade(
             print(f"Orders submitted this run (0 = none): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
+            print_portfolio_balance_line(_client_for_balance(settings, dash_client))
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
@@ -177,6 +192,7 @@ def cmd_tape_trade(
             print(f"Orders submitted this run (0 = none): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
+            print_portfolio_balance_line(_client_for_balance(settings, dash_client))
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
@@ -550,6 +566,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start local dashboard with live balance/exposure line chart (sets DASHBOARD_ENABLED)",
     )
+    lt.add_argument(
+        "--tape",
+        action="store_true",
+        help="Use public trade-tape ranking first (TRADE_TAPE_*), then LLM — combines with standalone tape-trade",
+    )
 
     dt = sub.add_parser(
         "discover-trade",
@@ -685,6 +706,7 @@ def main(argv: list[str] | None = None) -> None:
                 execute=args.execute,
                 loop=args.loop,
                 interval_seconds=max(5.0, float(args.interval)),
+                use_tape=getattr(args, "tape", False),
             )
         elif cmd == "discover-trade":
             cmd_discover_trade(

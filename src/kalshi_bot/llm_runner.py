@@ -8,7 +8,16 @@ from kalshi_bot.config import Settings
 from kalshi_bot.edge_math import implied_yes_ask_dollars, min_edge_threshold_for_mid, net_edge_buy_yes_long
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger, get_logger
-from kalshi_bot.market_data import best_no_bid_cents, best_yes_bid_cents, get_orderbook, list_open_markets, summarize_market_row
+from kalshi_bot.market_data import (
+    best_no_bid_cents,
+    best_yes_bid_cents,
+    build_tape_universe_for_llm,
+    fetch_yes_close_prices,
+    get_orderbook,
+    list_open_markets,
+    summarize_market_row,
+)
+from kalshi_bot.momentum import momentum_buy_intent_if_hot
 from kalshi_bot.portfolio import get_balance_cents
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import effective_max_contracts
@@ -21,12 +30,15 @@ class LLMTradeRunStats:
     """Counts why markets did not become orders (see end-of-run summary)."""
 
     markets: int = 0
+    tape_trades_fetched: int = 0
     skip_orderbook: int = 0
     skip_no_bids: int = 0
     llm_no_verdict: int = 0
     llm_declined: int = 0
     bot_math_rejected: int = 0
     skip_low_volume: int = 0
+    momentum_llm_bypass: int = 0
+    momentum_candle_error: int = 0
     skipped_cli_no_execute: int = 0
     blocked_trade_llm_auto_execute_false: int = 0
     submitted: int = 0
@@ -35,12 +47,15 @@ class LLMTradeRunStats:
         return [
             "--- llm-trade summary (why no orders?) ---",
             f"  markets scanned:              {self.markets}",
+            f"  public trades (tape mode):    {self.tape_trades_fetched}",
             f"  skip (orderbook error):       {self.skip_orderbook}",
             f"  skip (no YES/NO bids):        {self.skip_no_bids}",
             f"  LLM no JSON / API fail:       {self.llm_no_verdict}",
             f"  LLM declined (approve/buy):   {self.llm_declined}  <-- usually #1 when this is high",
             f"  blocked by bot math (edge):   {self.bot_math_rejected}",
             f"  skip (volume below min):      {self.skip_low_volume}",
+            f"  momentum bypass (chart YES):  {self.momentum_llm_bypass}",
+            f"  momentum candle fetch errors: {self.momentum_candle_error}",
             f"  skipped (--execute false):    {self.skipped_cli_no_execute}",
             f"  TRADE_LLM_AUTO_EXECUTE false: {self.blocked_trade_llm_auto_execute_false}",
             f"  reached trade_execute:        {self.submitted}",
@@ -82,8 +97,9 @@ def run_llm_opportunity_pipeline(
     *,
     execute: bool,
     log: StructuredLogger | None = None,
+    use_tape_universe: bool = False,
 ) -> tuple[int, LLMTradeRunStats]:
-    """Scan open markets, LLM verdict + bot math; optionally ``trade_execute`` when ``execute`` and allowed.
+    """Scan open markets **or** tape-ranked tickers; LLM verdict + bot math; optional ``trade_execute``.
 
     Returns (submitted_count, stats). ``submitted`` counts calls to ``trade_execute`` (risk may still block inside).
     """
@@ -97,26 +113,53 @@ def run_llm_opportunity_pipeline(
     risk = RiskManager(settings)
     ledger = DryRunLedger()
 
-    resp = list_open_markets(client, limit=settings.trade_llm_max_markets_per_run)
-    markets = list(getattr(resp, "markets", []) or [])
-    stats.markets = len(markets)
-    log.info(
-        "llm_trade_scan_start",
-        market_count=len(markets),
-        execute=execute,
-        trade_llm_auto_execute=settings.trade_llm_auto_execute,
-        dry_run=settings.dry_run,
-        live_trading=settings.live_trading,
-    )
-    if not markets:
-        log.warning("llm_trade_no_open_markets", note="API returned zero open markets for this limit")
+    rows: list[tuple[str, str]] = []
+    open_volumes: dict[str, int | None] = {}
+    if use_tape_universe:
+        rows, stats.tape_trades_fetched = build_tape_universe_for_llm(
+            client,
+            max_trades_fetch=settings.trade_tape_max_trades_fetch,
+            top_markets=settings.trade_tape_top_markets,
+            min_flow_usd=settings.trade_tape_min_flow_usd,
+            min_market_volume=settings.trade_min_market_volume,
+        )
+        stats.markets = len(rows)
+        log.info(
+            "llm_trade_scan_start",
+            universe="tape",
+            market_count=len(rows),
+            tape_trades_fetched=stats.tape_trades_fetched,
+            execute=execute,
+            trade_llm_auto_execute=settings.trade_llm_auto_execute,
+            dry_run=settings.dry_run,
+            live_trading=settings.live_trading,
+        )
+        if not rows:
+            log.warning("llm_trade_tape_empty", note="no tickers after tape rank + filters")
+    else:
+        resp = list_open_markets(client, limit=settings.trade_llm_max_markets_per_run)
+        markets = list(getattr(resp, "markets", []) or [])
+        for m in markets:
+            s = summarize_market_row(m)
+            rows.append((s.ticker, s.title))
+            open_volumes[s.ticker] = s.volume
+        stats.markets = len(rows)
+        log.info(
+            "llm_trade_scan_start",
+            universe="open",
+            market_count=len(rows),
+            execute=execute,
+            trade_llm_auto_execute=settings.trade_llm_auto_execute,
+            dry_run=settings.dry_run,
+            live_trading=settings.live_trading,
+        )
+        if not rows:
+            log.warning("llm_trade_no_open_markets", note="API returned zero open markets for this limit")
 
-    for m in markets:
-        s = summarize_market_row(m)
-        ticker = s.ticker
+    for ticker, title in rows:
         print(f"llm-trade: {ticker} …", flush=True)
-        if settings.trade_min_market_volume is not None:
-            vol = s.volume
+        if not use_tape_universe and settings.trade_min_market_volume is not None:
+            vol = open_volumes.get(ticker)
             if vol is None or vol < settings.trade_min_market_volume:
                 stats.skip_low_volume += 1
                 log.info("llm_trade_skip_low_volume", ticker=ticker, volume=vol)
@@ -148,10 +191,65 @@ def run_llm_opportunity_pipeline(
             settings, balance_cents=bal, yes_price_cents=yes_ask_c
         )
 
+        if settings.trade_momentum_enabled and settings.trade_momentum_llm_bypass:
+            try:
+                closes = fetch_yes_close_prices(
+                    client,
+                    ticker,
+                    period_interval_minutes=settings.trade_momentum_period_minutes,
+                    lookback_seconds=settings.trade_momentum_lookback_minutes * 60,
+                )
+            except Exception as exc:  # noqa: BLE001
+                stats.momentum_candle_error += 1
+                log.warning("llm_momentum_candles_fail", ticker=ticker, error=str(exc))
+                closes = []
+            if closes:
+                mintent, mwhy = momentum_buy_intent_if_hot(
+                    ticker=ticker,
+                    yes_bid_dollars=yes_bid_d,
+                    yes_ask_dollars=yes_ask_d,
+                    settings=settings,
+                    close_prices=closes,
+                )
+                if mintent is not None:
+                    cnt = max(1, min(mintent.count, max_allowed, settings.max_contracts_per_market))
+                    mintent = make_limit_intent(
+                        ticker=ticker,
+                        side="yes",
+                        action="buy",
+                        count=cnt,
+                        yes_price_cents=mintent.yes_price_cents,
+                    )
+                    log.info("llm_trade_momentum_bypass", ticker=ticker, detail=mwhy, count=cnt)
+                    print(f"llm-trade: {ticker} momentum bypass — {mwhy}", flush=True)
+                    if not execute:
+                        stats.skipped_cli_no_execute += 1
+                        log.warning(
+                            "llm_trade_momentum_candidate",
+                            ticker=ticker,
+                            count=cnt,
+                            yes_price_cents=mintent.yes_price_cents,
+                            note="re-run with --execute and TRADE_LLM_AUTO_EXECUTE=true",
+                        )
+                    elif not settings.trade_llm_auto_execute:
+                        stats.blocked_trade_llm_auto_execute_false += 1
+                        log.warning(
+                            "llm_trade_momentum_blocked",
+                            ticker=ticker,
+                            reason="TRADE_LLM_AUTO_EXECUTE_false",
+                        )
+                    else:
+                        trade_execute(
+                            client=client, settings=settings, risk=risk, log=log, intent=mintent, ledger=ledger
+                        )
+                        stats.momentum_llm_bypass += 1
+                        stats.submitted += 1
+                    continue
+
         verdict = llm_evaluate_opportunity(
             settings=settings,
             ticker=ticker,
-            title=s.title,
+            title=title,
             yes_bid_cents=yb_c,
             yes_ask_cents=yes_ask_c,
             yes_bid_dollars=yes_bid_d,

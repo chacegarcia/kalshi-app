@@ -9,10 +9,18 @@ from kalshi_bot.edge_math import implied_yes_ask_dollars
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger, get_logger
 from kalshi_bot.llm_screen import llm_discover_watchlist
-from kalshi_bot.market_data import best_no_bid_cents, best_yes_bid_cents, get_orderbook, list_open_markets, summarize_market_row
+from kalshi_bot.market_data import (
+    best_no_bid_cents,
+    best_yes_bid_cents,
+    fetch_yes_close_prices,
+    get_orderbook,
+    list_open_markets,
+    summarize_market_row,
+)
+from kalshi_bot.momentum import momentum_buy_intent_if_hot
 from kalshi_bot.portfolio import get_balance_cents
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.strategy import signal_edge_buy_yes_from_ticker, signal_from_bar
+from kalshi_bot.strategy import TradeIntent, signal_edge_buy_yes_from_ticker, signal_from_bar
 from kalshi_bot.trading import build_sdk_client, trade_execute
 
 
@@ -25,6 +33,8 @@ class DiscoverRuleRunStats:
     skip_orderbook: int = 0
     skip_no_bids: int = 0
     no_rule_signal: int = 0
+    momentum_signal: int = 0
+    momentum_candle_error: int = 0
     skipped_cli_no_execute: int = 0
     blocked_trade_discover_auto_execute_false: int = 0
     submitted: int = 0
@@ -38,6 +48,8 @@ class DiscoverRuleRunStats:
             f"  skip (volume below min):            {self.skip_low_volume}",
             f"  skip (orderbook error):             {self.skip_orderbook}",
             f"  skip (no YES/NO bids):              {self.skip_no_bids}",
+            f"  momentum (chart YES) signals:       {self.momentum_signal}",
+            f"  momentum candle fetch errors:       {self.momentum_candle_error}",
             f"  no signal from .env rules:          {self.no_rule_signal}",
             f"  skipped (--execute false):          {self.skipped_cli_no_execute}",
             f"  TRADE_DISCOVER_AUTO_EXECUTE false:  {self.blocked_trade_discover_auto_execute_false}",
@@ -115,14 +127,39 @@ def run_discover_rule_pipeline(
         yes_bid_d = yb_c / 100.0
         yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
 
-        if settings.trade_use_edge_strategy and settings.trade_fair_yes_prob is not None:
+        intent: TradeIntent | None = None
+        if settings.trade_momentum_enabled:
+            try:
+                closes = fetch_yes_close_prices(
+                    client,
+                    ticker,
+                    period_interval_minutes=settings.trade_momentum_period_minutes,
+                    lookback_seconds=settings.trade_momentum_lookback_minutes * 60,
+                )
+            except Exception as exc:  # noqa: BLE001
+                stats.momentum_candle_error += 1
+                log.warning("discover_momentum_candles_fail", ticker=ticker, error=str(exc))
+                closes = []
+            if closes:
+                intent, _mwhy = momentum_buy_intent_if_hot(
+                    ticker=ticker,
+                    yes_bid_dollars=yes_bid_d,
+                    yes_ask_dollars=yes_ask_d,
+                    settings=settings,
+                    close_prices=closes,
+                )
+                if intent is not None:
+                    stats.momentum_signal += 1
+                    log.info("discover_momentum_signal", ticker=ticker, note=_mwhy)
+
+        if intent is None and settings.trade_use_edge_strategy and settings.trade_fair_yes_prob is not None:
             intent = signal_edge_buy_yes_from_ticker(
                 ticker=ticker,
                 yes_bid_dollars=yes_bid_d,
                 yes_ask_dollars=yes_ask_d,
                 settings=settings,
             )
-        else:
+        elif intent is None:
             intent = signal_from_bar(
                 ticker=ticker,
                 yes_bid_dollars=yes_bid_d,

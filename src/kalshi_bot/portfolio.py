@@ -102,6 +102,20 @@ def get_market_position_row(client: KalshiSdkClient, ticker: str) -> object | No
     return None
 
 
+def print_portfolio_balance_line(client: KalshiSdkClient) -> None:
+    """Print cash balance and total exposure to stdout (e.g. after a trading pass summary)."""
+    try:
+        snap = fetch_portfolio_snapshot(client, ticker=None)
+        bal = snap.balance_cents
+        exp = float(snap.total_exposure_cents)
+        if bal is None:
+            print(f"Account: cash n/a · exposure ${exp / 100:.2f}", flush=True)
+        else:
+            print(f"Account: cash ${bal / 100:.2f} · exposure ${exp / 100:.2f}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Account balance: (could not fetch: {exc})", flush=True)
+
+
 def estimate_yes_entry_cents_from_position(p: object) -> int | None:
     """Rough average YES entry in cents from ``total_traded_dollars`` / ``position_fp`` (not always exact cost basis)."""
     fp = getattr(p, "position_fp", None)

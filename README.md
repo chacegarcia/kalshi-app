@@ -77,7 +77,7 @@ cp .env.example .env
 kalshi-bot                          # default: run strategy loop
 kalshi-bot list-markets
 kalshi-bot scan [--limit N] [--llm]
-kalshi-bot llm-trade [--execute]
+kalshi-bot llm-trade [--execute] [--tape]
 kalshi-bot discover-trade [--execute]
 kalshi-bot tape-trade [--execute]
 kalshi-bot watch-market TICKER

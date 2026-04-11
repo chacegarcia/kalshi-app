@@ -157,13 +157,21 @@ class Settings(BaseSettings):
         description="Buy YES: bump contracts to at least this $ at limit (0 = no floor). Requires TRADE_MAX_ORDER_NOTIONAL_USD ≥ this.",
     )
     trade_max_order_notional_usd: float | None = Field(
-        default=5.0,
+        default=10.0,
         ge=0.0,
         validation_alias=AliasChoices(
             "TRADE_MAX_ORDER_NOTIONAL_USD",
             "trade_max_order_notional_usd",
         ),
-        description="Cap buy-YES $ at limit price. Default 5; set 0 to disable cap only.",
+        description="Cap buy-YES $ at limit price. Default 10 (pair with min 3 for a 3–10 band); set 0 to disable cap only.",
+    )
+    trade_notional_sweep_usd: str | None = Field(
+        default="3,5,7,10",
+        validation_alias=AliasChoices(
+            "TRADE_NOTIONAL_SWEEP_USD",
+            "trade_notional_sweep_usd",
+        ),
+        description="Comma-separated USD targets; each buy-Y uses the next value as both min and max notional (round-robin). Empty = use TRADE_MIN/MAX_ORDER_NOTIONAL_USD only.",
     )
     strategy_limit_price_cents: int = Field(
         default=50,
@@ -254,7 +262,7 @@ class Settings(BaseSettings):
             "TRADE_MAX_ENTRY_SPREAD_DOLLARS",
             "trade_max_entry_spread_dollars",
         ),
-        description="If set, skip when (YES_ask − YES_bid) exceeds this — keeps tighter, more liquid books.",
+        description="If set, skip when (YES_ask − YES_bid) exceeds this. Higher = allow wider books (e.g. 0.20–0.35). Omit for no max-spread filter.",
     )
     trade_llm_relaxed_approval: bool = Field(
         default=False,
@@ -316,6 +324,65 @@ class Settings(BaseSettings):
             "trade_tape_auto_execute",
         ),
         description="If true, tape-trade may submit when --execute (still needs LIVE_TRADING and not DRY_RUN).",
+    )
+
+    # Prior-chart momentum (REST candlesticks): buy YES when YES trade price rose quickly in recent bars.
+    trade_momentum_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_MOMENTUM_ENABLED", "trade_momentum_enabled"),
+    )
+    trade_momentum_period_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=1440,
+        validation_alias=AliasChoices("TRADE_MOMENTUM_PERIOD_MINUTES", "trade_momentum_period_minutes"),
+        description="Candlestick interval for Kalshi batch_get_market_candlesticks.",
+    )
+    trade_momentum_lookback_minutes: int = Field(
+        default=120,
+        ge=5,
+        le=10080,
+        validation_alias=AliasChoices("TRADE_MOMENTUM_LOOKBACK_MINUTES", "trade_momentum_lookback_minutes"),
+        description="How far back to request candlesticks (converted to seconds for the API).",
+    )
+    trade_momentum_min_candles: int = Field(
+        default=4,
+        ge=2,
+        le=500,
+        validation_alias=AliasChoices("TRADE_MOMENTUM_MIN_CANDLES", "trade_momentum_min_candles"),
+        description="Minimum bars with a non-null trade close before evaluating momentum.",
+    )
+    trade_momentum_short_candles: int = Field(
+        default=6,
+        ge=2,
+        le=100,
+        validation_alias=AliasChoices("TRADE_MOMENTUM_SHORT_CANDLES", "trade_momentum_short_candles"),
+        description="How many recent bars define the 'fast move' (capped by available closes).",
+    )
+    trade_momentum_min_net_rise_dollars: float = Field(
+        default=0.015,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_MOMENTUM_MIN_NET_RISE_DOLLARS",
+            "trade_momentum_min_net_rise_dollars",
+        ),
+        description="Min YES price rise (0–1 scale on $1) over the short window, e.g. 0.015 = 1.5¢.",
+    )
+    trade_momentum_min_rise_per_candle_dollars: float = Field(
+        default=0.002,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_MOMENTUM_MIN_RISE_PER_CANDLE_DOLLARS",
+            "trade_momentum_min_rise_per_candle_dollars",
+        ),
+        description="Min average rise per candle in the short window (quick move vs slow drift).",
+    )
+    trade_momentum_llm_bypass: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_MOMENTUM_LLM_BYPASS", "trade_momentum_llm_bypass"),
+        description="If true, llm-trade submits on hot momentum before calling the LLM (tape/open scan).",
     )
 
     # Balance-scaled limits (bigger account → larger caps within fixed % of balance)
@@ -454,6 +521,14 @@ class Settings(BaseSettings):
     @field_validator("openai_api_key", mode="before")
     @classmethod
     def _blank_openai_to_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    @field_validator("trade_notional_sweep_usd", mode="before")
+    @classmethod
+    def _blank_notional_sweep_to_none(cls, v: object) -> str | None:
         if v is None:
             return None
         s = str(v).strip()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,41 @@ def rank_tickers_by_public_flow(trades: list[Any]) -> list[tuple[str, float, int
     return [(tk, float(v[0]), int(v[1])) for tk, v in ranked]
 
 
+def build_tape_universe_for_llm(
+    client: KalshiSdkClient,
+    *,
+    max_trades_fetch: int,
+    top_markets: int,
+    min_flow_usd: float,
+    min_market_volume: int | None,
+) -> tuple[list[tuple[str, str]], int]:
+    """Tape-ranked tickers with titles for ``llm-trade --tape``. Returns ``(ticker, title)`` rows and trades fetched."""
+    raw = fetch_public_trades(client, max_trades=max_trades_fetch)
+    ranked = rank_tickers_by_public_flow(raw)
+    out: list[tuple[str, str]] = []
+    for ticker, flow_usd, _n in ranked:
+        if len(out) >= top_markets:
+            break
+        if min_flow_usd > 0.0 and flow_usd < min_flow_usd:
+            continue
+        title = ticker
+        try:
+            mrow = get_market(client, ticker=ticker)
+            m = getattr(mrow, "market", None)
+            if m is not None:
+                s = summarize_market_row(m)
+                title = s.title or ticker
+                if min_market_volume is not None:
+                    vol = s.volume
+                    if vol is None or vol < min_market_volume:
+                        continue
+        except Exception:
+            if min_market_volume is not None:
+                continue
+        out.append((ticker, title))
+    return out, len(raw)
+
+
 @with_rest_retry
 def list_open_markets(
     client: KalshiSdkClient,
@@ -94,6 +130,55 @@ def get_market(client: KalshiSdkClient, ticker: str) -> GetMarketResponse:
 @with_rest_retry
 def get_orderbook(client: KalshiSdkClient, ticker: str) -> GetMarketOrderbookResponse:
     return client.markets.get_market_orderbook(ticker=ticker, depth=10)
+
+
+def _candle_close_dollars(candle: Any) -> float | None:
+    p = getattr(candle, "price", None)
+    if p is None:
+        return None
+    s = getattr(p, "close_dollars", None)
+    if s is None:
+        return None
+    try:
+        v = float(str(s))
+    except (TypeError, ValueError):
+        return None
+    return v
+
+
+@with_rest_retry
+def fetch_yes_close_prices(
+    client: KalshiSdkClient,
+    ticker: str,
+    *,
+    period_interval_minutes: int,
+    lookback_seconds: int,
+) -> list[float]:
+    """YES trade close prices (dollars 0–1) from market candlesticks, oldest → newest."""
+    end_ts = int(time.time())
+    start_ts = max(0, end_ts - max(60, lookback_seconds))
+    resp = client.markets.batch_get_market_candlesticks(
+        market_tickers=ticker,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        period_interval=period_interval_minutes,
+        include_latest_before_start=True,
+    )
+    markets = list(getattr(resp, "markets", []) or [])
+    for m in markets:
+        if getattr(m, "market_ticker", None) != ticker:
+            continue
+        sticks = list(getattr(m, "candlesticks", []) or [])
+        rows: list[tuple[int, float]] = []
+        for c in sticks:
+            ts = getattr(c, "end_period_ts", None)
+            cl = _candle_close_dollars(c)
+            if ts is None or cl is None:
+                continue
+            rows.append((int(ts), cl))
+        rows.sort(key=lambda x: x[0])
+        return [r[1] for r in rows]
+    return []
 
 
 def _best_bid_dollars(levels: list[list[str]] | None) -> float | None:

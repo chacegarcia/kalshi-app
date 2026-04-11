@@ -3,8 +3,42 @@
 from __future__ import annotations
 
 import math
+import threading
 
 from kalshi_bot.config import Settings
+
+_LOCK = threading.Lock()
+_NOTIONAL_SWEEP_I = 0
+
+
+def parse_notional_sweep_usd(raw: str | None) -> list[float]:
+    """Parse ``TRADE_NOTIONAL_SWEEP_USD`` like ``3,5,7,10`` into positive floats."""
+    if not raw or not str(raw).strip():
+        return []
+    out: list[float] = []
+    for part in str(raw).split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            v = float(p)
+        except ValueError:
+            continue
+        if v > 0:
+            out.append(v)
+    return out
+
+
+def next_buy_yes_notional_min_max(settings: Settings) -> tuple[float | None, float | None]:
+    """Return (min, max) USD notional for this buy-YES order. Sweep rotates targets when configured."""
+    vals = parse_notional_sweep_usd(settings.trade_notional_sweep_usd)
+    if not vals:
+        return settings.trade_min_order_notional_usd, settings.trade_max_order_notional_usd
+    global _NOTIONAL_SWEEP_I
+    with _LOCK:
+        t = vals[_NOTIONAL_SWEEP_I % len(vals)]
+        _NOTIONAL_SWEEP_I += 1
+    return (t, t)
 
 
 def effective_max_contracts(
