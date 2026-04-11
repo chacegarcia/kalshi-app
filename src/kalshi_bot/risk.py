@@ -102,8 +102,10 @@ class RiskManager:
         if self.in_cooldown():
             return RiskDecision(False, "cooldown")
 
-        if self.daily_loss_usd() >= self._s.max_daily_drawdown_usd:
-            return RiskDecision(False, "max_daily_drawdown_exceeded")
+        # Session drawdown / TRADE_STOP_MAX_SESSION_LOSS_USD: do not block while balance > $0.
+        # Only stop new risk once the account balance has been depleted (≤ 0¢ reported).
+        if self.state.last_balance_cents is not None and self.state.last_balance_cents <= 0:
+            return RiskDecision(False, "account_balance_zero_or_negative")
 
         max_c = max_contracts_override if max_contracts_override is not None else self._s.max_contracts_per_market
         if projected_abs_position > max_c:

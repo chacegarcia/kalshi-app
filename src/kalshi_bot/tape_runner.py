@@ -11,21 +11,21 @@ from dataclasses import dataclass
 from kalshi_bot.config import Settings
 from kalshi_bot.edge_math import implied_yes_ask_dollars
 from kalshi_bot.execution import DryRunLedger
-from kalshi_bot.logger import StructuredLogger, get_logger
+from kalshi_bot.logger import StructuredLogger, get_logger, maybe_clear_structured_log_after_tickers
+from kalshi_bot.risk import RiskManager
 from kalshi_bot.market_data import (
-    best_no_bid_cents,
-    best_yes_bid_cents,
     fetch_public_trades,
     fetch_yes_close_prices,
     get_market,
     get_orderbook,
     rank_tickers_by_public_flow,
     summarize_market_row,
+    yes_bid_and_no_bid_cents_for_trading,
 )
 from kalshi_bot.momentum import momentum_buy_intent_if_hot
-from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import TradeIntent, signal_edge_buy_yes_from_ticker, signal_from_bar
 from kalshi_bot.trading import build_sdk_client, trade_execute
+from kalshi_bot.bitcoin_runner import run_bitcoin_sidecar_if_due
 
 
 @dataclass
@@ -42,6 +42,8 @@ class TapeRuleRunStats:
     skipped_cli_no_execute: int = 0
     blocked_trade_tape_auto_execute_false: int = 0
     submitted: int = 0
+    bitcoin_sidecar_runs: int = 0
+    bitcoin_sidecar_orders_submitted: int = 0
 
     def lines(self) -> list[str]:
         return [
@@ -59,6 +61,8 @@ class TapeRuleRunStats:
             f"  skipped (--execute false):          {self.skipped_cli_no_execute}",
             f"  TRADE_TAPE_AUTO_EXECUTE false:      {self.blocked_trade_tape_auto_execute_false}",
             f"  reached trade_execute:              {self.submitted}",
+            f"  bitcoin sidecar runs:               {self.bitcoin_sidecar_runs}",
+            f"  bitcoin sidecar orders submitted:   {self.bitcoin_sidecar_orders_submitted}",
             "---",
         ]
 
@@ -68,6 +72,8 @@ def run_tape_rule_pipeline(
     *,
     execute: bool,
     log: StructuredLogger | None = None,
+    bitcoin_scan_counter: list[int] | None = None,
+    bitcoin_rotation_counter: list[int] | None = None,
 ) -> tuple[int, TapeRuleRunStats]:
     """Rank tickers by recent public trade $ flow, then apply deterministic rules from .env."""
     log = log or get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
@@ -95,109 +101,132 @@ def run_tape_rule_pipeline(
 
     top = ranked[: settings.trade_tape_top_markets]
     min_flow = settings.trade_tape_min_flow_usd
+    counter = bitcoin_scan_counter if bitcoin_scan_counter is not None else [0]
+    btc_rot = bitcoin_rotation_counter if bitcoin_rotation_counter is not None else [0]
 
-    for ticker, flow_usd, n_trades in top:
-        print(f"tape-trade: {ticker} (flow≈${flow_usd:.2f}, {n_trades} trades) …", flush=True)
+    for i, (ticker, flow_usd, n_trades) in enumerate(top):
+        counter[0] += 1
+        try:
+            print(f"tape-trade: {ticker} (flow≈${flow_usd:.2f}, {n_trades} trades) …", flush=True)
 
-        if min_flow > 0.0 and flow_usd < min_flow:
-            stats.skipped_min_flow += 1
-            continue
-
-        if settings.trade_min_market_volume is not None:
-            try:
-                mrow = get_market(client, ticker=ticker)
-                m = getattr(mrow, "market", None)
-                s = summarize_market_row(m) if m is not None else None
-                vol = getattr(s, "volume", None) if s is not None else None
-            except Exception:  # noqa: BLE001
-                vol = None
-            if vol is None or vol < settings.trade_min_market_volume:
-                stats.skip_low_volume += 1
-                log.info("tape_skip_low_volume", ticker=ticker, volume=vol)
+            if min_flow > 0.0 and flow_usd < min_flow:
+                stats.skipped_min_flow += 1
                 continue
 
-        try:
-            ob = get_orderbook(client, ticker)
-        except Exception as exc:  # noqa: BLE001
-            stats.skip_orderbook += 1
-            log.warning("tape_skip_orderbook", ticker=ticker, error=str(exc))
-            continue
+            if settings.trade_min_market_volume is not None:
+                try:
+                    mrow = get_market(client, ticker=ticker)
+                    m = getattr(mrow, "market", None)
+                    s = summarize_market_row(m) if m is not None else None
+                    vol = getattr(s, "volume", None) if s is not None else None
+                except Exception:  # noqa: BLE001
+                    vol = None
+                if vol is None or vol < settings.trade_min_market_volume:
+                    stats.skip_low_volume += 1
+                    log.info("tape_skip_low_volume", ticker=ticker, volume=vol)
+                    continue
 
-        yb_c = best_yes_bid_cents(ob)
-        nb_c = best_no_bid_cents(ob)
-        if yb_c is None or nb_c is None:
-            stats.skip_no_bids += 1
-            continue
-
-        yes_bid_d = yb_c / 100.0
-        yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
-
-        intent: TradeIntent | None = None
-        if settings.trade_momentum_enabled:
             try:
-                closes = fetch_yes_close_prices(
-                    client,
-                    ticker,
-                    period_interval_minutes=settings.trade_momentum_period_minutes,
-                    lookback_seconds=settings.trade_momentum_lookback_minutes * 60,
-                )
+                ob = get_orderbook(client, ticker)
             except Exception as exc:  # noqa: BLE001
-                stats.momentum_candle_error += 1
-                log.warning("tape_momentum_candles_fail", ticker=ticker, error=str(exc))
-                closes = []
-            if closes:
-                intent, _mwhy = momentum_buy_intent_if_hot(
+                stats.skip_orderbook += 1
+                log.warning("tape_skip_orderbook", ticker=ticker, error=str(exc))
+                continue
+
+            yb_c, nb_c = yes_bid_and_no_bid_cents_for_trading(ob)
+            if nb_c is None:
+                stats.skip_no_bids += 1
+                continue
+
+            yes_bid_d = yb_c / 100.0
+            yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
+
+            intent: TradeIntent | None = None
+            if settings.trade_momentum_enabled:
+                try:
+                    closes = fetch_yes_close_prices(
+                        client,
+                        ticker,
+                        period_interval_minutes=settings.trade_momentum_period_minutes,
+                        lookback_seconds=settings.trade_momentum_lookback_minutes * 60,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    stats.momentum_candle_error += 1
+                    log.warning("tape_momentum_candles_fail", ticker=ticker, error=str(exc))
+                    closes = []
+                if closes:
+                    intent, _mwhy = momentum_buy_intent_if_hot(
+                        ticker=ticker,
+                        yes_bid_dollars=yes_bid_d,
+                        yes_ask_dollars=yes_ask_d,
+                        settings=settings,
+                        close_prices=closes,
+                    )
+                    if intent is not None:
+                        stats.momentum_signal += 1
+                        log.info("tape_momentum_signal", ticker=ticker, note=_mwhy)
+
+            if intent is None and settings.trade_use_edge_strategy and settings.trade_fair_yes_prob is not None:
+                intent = signal_edge_buy_yes_from_ticker(
                     ticker=ticker,
                     yes_bid_dollars=yes_bid_d,
                     yes_ask_dollars=yes_ask_d,
                     settings=settings,
-                    close_prices=closes,
                 )
-                if intent is not None:
-                    stats.momentum_signal += 1
-                    log.info("tape_momentum_signal", ticker=ticker, note=_mwhy)
+            elif intent is None:
+                intent = signal_from_bar(
+                    ticker=ticker,
+                    yes_bid_dollars=yes_bid_d,
+                    yes_ask_dollars=yes_ask_d,
+                    max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                    min_spread_dollars=settings.strategy_min_spread_dollars,
+                    probability_gap=settings.strategy_probability_gap,
+                    order_count=settings.strategy_order_count,
+                    limit_price_cents=settings.strategy_limit_price_cents,
+                    max_spread_dollars=settings.trade_max_entry_spread_dollars,
+                )
 
-        if intent is None and settings.trade_use_edge_strategy and settings.trade_fair_yes_prob is not None:
-            intent = signal_edge_buy_yes_from_ticker(
-                ticker=ticker,
-                yes_bid_dollars=yes_bid_d,
-                yes_ask_dollars=yes_ask_d,
-                settings=settings,
+            if intent is None:
+                stats.no_rule_signal += 1
+                continue
+
+            if not execute:
+                stats.skipped_cli_no_execute += 1
+                log.warning(
+                    "tape_trade_candidate",
+                    ticker=ticker,
+                    count=intent.count,
+                    yes_price_cents=intent.yes_price_cents,
+                    note="re-run with --execute and TRADE_TAPE_AUTO_EXECUTE=true",
+                )
+                continue
+
+            if not settings.trade_tape_auto_execute:
+                stats.blocked_trade_tape_auto_execute_false += 1
+                log.warning("tape_trade_blocked", ticker=ticker, reason="TRADE_TAPE_AUTO_EXECUTE_false")
+                continue
+
+            trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+            stats.submitted += 1
+        finally:
+            dr, bo = run_bitcoin_sidecar_if_due(
+                settings,
+                client=client,
+                risk=risk,
+                ledger=ledger,
+                log=log,
+                execute=execute,
+                scan_counter=counter,
+                rotation_counter=btc_rot,
+                log_prefix="tape-trade",
             )
-        elif intent is None:
-            intent = signal_from_bar(
-                ticker=ticker,
-                yes_bid_dollars=yes_bid_d,
-                yes_ask_dollars=yes_ask_d,
-                max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
-                min_spread_dollars=settings.strategy_min_spread_dollars,
-                probability_gap=settings.strategy_probability_gap,
-                order_count=settings.strategy_order_count,
-                limit_price_cents=settings.strategy_limit_price_cents,
-                max_spread_dollars=settings.trade_max_entry_spread_dollars,
+            stats.bitcoin_sidecar_runs += dr
+            stats.bitcoin_sidecar_orders_submitted += bo
+            maybe_clear_structured_log_after_tickers(
+                log_path=settings.structured_log_path,
+                every_n=settings.structured_log_clear_every_n_tickers,
+                processed_count=i + 1,
+                log=log,
             )
 
-        if intent is None:
-            stats.no_rule_signal += 1
-            continue
-
-        if not execute:
-            stats.skipped_cli_no_execute += 1
-            log.warning(
-                "tape_trade_candidate",
-                ticker=ticker,
-                count=intent.count,
-                yes_price_cents=intent.yes_price_cents,
-                note="re-run with --execute and TRADE_TAPE_AUTO_EXECUTE=true",
-            )
-            continue
-
-        if not settings.trade_tape_auto_execute:
-            stats.blocked_trade_tape_auto_execute_false += 1
-            log.warning("tape_trade_blocked", ticker=ticker, reason="TRADE_TAPE_AUTO_EXECUTE_false")
-            continue
-
-        trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
-        stats.submitted += 1
-
-    return stats.submitted, stats
+    return stats.submitted + stats.bitcoin_sidecar_orders_submitted, stats

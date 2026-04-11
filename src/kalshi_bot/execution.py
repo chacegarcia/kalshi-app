@@ -26,6 +26,15 @@ from kalshi_bot.sizing import (
 from kalshi_bot.strategy import TradeIntent, projected_abs_position_after
 
 
+def _spacing_after_submitted_buy_yes(settings: Settings, intent: TradeIntent) -> None:
+    """Pause after a buy YES is accepted (dry-run or live) to spread out submissions."""
+    if intent.side != "yes" or intent.action != "buy":
+        return
+    sp = settings.trade_submit_spacing_seconds
+    if sp > 0:
+        time.sleep(float(sp))
+
+
 @dataclass
 class SimulatedOrder:
     client_order_id: str
@@ -146,7 +155,7 @@ def execute_intent(
     min_n = settings.trade_min_order_notional_usd
     max_n = settings.trade_max_order_notional_usd
     if intent.side == "yes" and intent.action == "buy":
-        min_n, max_n = next_buy_yes_notional_min_max(settings)
+        min_n, max_n = next_buy_yes_notional_min_max(settings, balance_cents=snap.balance_cents)
         if parse_notional_sweep_usd(settings.trade_notional_sweep_usd):
             log.info(
                 "notional_sweep_step",
@@ -234,6 +243,7 @@ def execute_intent(
             count=intent.count,
             yes_price_cents=intent.yes_price_cents,
         )
+        _spacing_after_submitted_buy_yes(settings, intent)
         return
 
     if not settings.can_send_real_orders:
@@ -252,3 +262,4 @@ def execute_intent(
     order_id = getattr(oid, "order_id", None) if oid is not None else getattr(resp, "order_id", None)
     log.info("live_order_ack", response_type=type(resp).__name__)
     record_event("live_ack", response_type=type(resp).__name__, order_id=order_id)
+    _spacing_after_submitted_buy_yes(settings, intent)

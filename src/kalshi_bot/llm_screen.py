@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import urllib.error
 import urllib.request
@@ -11,30 +12,78 @@ from typing import Any
 
 from kalshi_bot.config import Settings
 
+_log = logging.getLogger(__name__)
+
+
+def _normalize_openai_message_content(content: Any) -> str:
+    """Chat Completions message content may be a string or a list of blocks (some models)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and "text" in block:
+                    parts.append(str(block["text"]))
+                elif "text" in block:
+                    parts.append(str(block["text"]))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts).strip()
+    return str(content).strip()
+
+
+def _model_uses_gpt5_style_chat_params(model: str) -> bool:
+    """GPT-5 / o-series: ``max_completion_tokens`` (not ``max_tokens``), avoid non-default ``temperature``."""
+    m = (model or "").lower()
+    return "gpt-5" in m or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+
+
+def _parse_json_object_from_text(text: str) -> dict[str, Any] | None:
+    """Parse first JSON object from model output (handles fences and leading prose)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) >= 2 else raw
+        raw = raw.strip()
+        if raw.lstrip().startswith("json"):
+            raw = raw.lstrip()[4:].lstrip()
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(raw)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    if start == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(raw, start)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        return None
+    return None
+
 
 def _llm_approval_tail(settings: Settings) -> str:
-    """Approval instructions: default = accumulate small wins; relaxed = even more permissive."""
+    """Short tails to limit prompt tokens; code re-checks edge/fees."""
     fair_tail = ""
     if settings.trade_llm_accept_when_fair_covers_ask:
         fair_tail = (
-            f" You may also approve when fair_yes is within about {settings.trade_llm_fair_ask_slippage:.2f} of the implied "
-            "YES ask (fairly priced favorites / high-confidence sides), not only when there is a large mispricing."
+            f" You may approve when fair_yes is within ~{settings.trade_llm_fair_ask_slippage:.2f} of implied ask (favorites)."
         )
     if settings.trade_llm_relaxed_approval:
         return (
-            "Prefer approve=true and buy_yes=true when fair_yes is at or above the implied YES ask, or when fair_yes clears "
-            "the min net edge after fees from the parameters, or when the ask looks even slightly cheap vs your fair_yes. "
-            "Reserve decline for junk/empty titles, incoherent prices, or when YES is clearly overpriced vs fair_yes. "
-            "Do not decline merely because the edge is small—small edges are the point. Never invent facts not in the title."
+            "Prefer approve=true when fair_yes ≥ implied ask or small edge; decline only junk/nonsense prices."
             + fair_tail
         )
     return (
-        "Strategy: accumulate many small positive outcomes over time; the execution layer applies fee and risk checks. "
-        "Set approve=true and buy_yes=true when fair_yes supports buying at or near the implied ask—including modest edge, "
-        "fair value at the ask on favorites, or any reasonable case that is not an obvious overpay. "
-        "Decline only for unusable titles, nonsense prices, or when YES is clearly worse than the ask. "
-        "Bias toward approval when the setup is plausible; do not refuse good-enough trades in search of perfect mispricings. "
-        "Never invent facts not in the title."
+        "Approve when fair_yes supports buying near ask; decline only obvious overpay or junk."
         + fair_tail
     )
 
@@ -55,6 +104,23 @@ class LLMDiscoveryVerdict:
 
     watch: bool
     reason: str
+
+
+def _bitcoin_market_context(ticker: str, title: str) -> bool:
+    u = (ticker or "").upper()
+    if u.startswith("KXBTC"):
+        return True
+    low = (title or "").lower()
+    return "bitcoin" in low or " btc" in low or "btc " in low
+
+
+def _llm_prompt_edge_settings(settings: Settings) -> tuple[float, float]:
+    mn = settings.trade_llm_min_net_edge_after_fees
+    me = settings.trade_llm_edge_middle_extra_edge
+    return (
+        settings.trade_min_net_edge_after_fees if mn is None else mn,
+        settings.trade_edge_middle_extra_edge if me is None else me,
+    )
 
 
 def optional_llm_fair_yes(title: str, *, ticker: str, settings: Settings) -> float | None:
@@ -82,24 +148,31 @@ def llm_evaluate_opportunity(
     if not key:
         return None
 
-    bal_s = str(balance_cents) if balance_cents is not None else "unknown"
-    params = f"""Execution limits (the bot enforces these after your JSON; use them to guide fair_yes and approval, not to default to decline):
-- Target min net edge after fees (0–1 scale on $1 face): {settings.trade_min_net_edge_after_fees}
-- Extra edge suggested near 50% mid: {settings.trade_edge_middle_extra_edge}
-- Max YES ask (dollars): {settings.strategy_max_yes_ask_dollars}
-- Min spread (dollars): {settings.strategy_min_spread_dollars}
-- Max contracts this order (balance-scaled): {max_contracts_allowed}
-- Account balance (cents): {bal_s}
-"""
+    bal_s = str(balance_cents) if balance_cents is not None else "?"
+    min_e, mid_x = _llm_prompt_edge_settings(settings)
+    params = (
+        f"Enforced in code: min_net_edge_after_fees={min_e}, mid_price_extra_edge={mid_x}, "
+        f"max_yes_ask={settings.strategy_max_yes_ask_dollars}, min_spread={settings.strategy_min_spread_dollars}, "
+        f"max_contracts={max_contracts_allowed}, bal_cents={bal_s}"
+    )
+    btc = _bitcoin_market_context(ticker, title)
+    odds_block = (
+        "This is a Bitcoin-tilted or BTC-series market: weigh spot/volatility and headline risk; you may size slightly "
+        "higher only when fair_yes clearly exceeds the ask by a durable margin; otherwise favor consistency.\n"
+        if btc
+        else ""
+    )
+    style_block = (
+        "Style: Estimate fair_yes as a calibrated probability in [0,1] (not vibes). Compare fair_yes to the implied ask; "
+        "the bot rejects trades that fail fee-aware edge vs mid. Prefer smaller `contracts` when uncertain—goal is many "
+        "small wins, not home runs.\n"
+    )
 
-    user = f"""Market ticker: {ticker}
-Title: {title}
-Order book (YES): bid={yes_bid_cents}¢ implied ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.4f} dollars).
-
+    user = f"""{ticker} | {title}
+YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
 {params}
-
-Decide on a long YES for an accumulation strategy (many small wins, not only blockbuster mispricings). Output ONLY valid JSON:
-{{"approve": true/false, "fair_yes": 0.0-1.0, "buy_yes": true/false, "limit_yes_price_cents": 1-99, "contracts": 1-{max_contracts_allowed}, "reason": "short text"}}
+{style_block}{odds_block}JSON only:
+{{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"contracts":1-{max_contracts_allowed},"reason":"brief"}}
 {_llm_approval_tail(settings)}"""
 
     raw = _openai_chat_json(key, settings.trade_llm_model, user)
@@ -153,7 +226,9 @@ Output ONLY valid JSON: {{"watch": true/false, "reason": "short text"}}"""
         "You filter Kalshi binary prediction markets for downstream rule-based software. "
         "You never give trading instructions. Output strict JSON only."
     )
-    raw = _openai_chat_json_with_system(key, settings.trade_llm_model, system=system, user=user)
+    raw = _openai_chat_json_with_system(
+        key, settings.trade_llm_model, system=system, user=user, temperature=0.15, max_tokens=220, json_mode=True
+    )
     if raw is None:
         return None
     try:
@@ -164,18 +239,18 @@ Output ONLY valid JSON: {{"watch": true/false, "reason": "short text"}}"""
         return None
 
 
-def _openai_chat_json_with_system(
-    api_key: str, model: str, *, system: str, user: str, temperature: float = 0.15
-) -> dict[str, Any] | None:
+def _ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _openai_post_chat_completions(api_key: str, body: dict[str, Any]) -> dict[str, Any] | None:
+    """POST /v1/chat/completions; log HTTP errors (common: wrong max_* or temperature for GPT-5)."""
     url = "https://api.openai.com/v1/chat/completions"
-    body: dict[str, Any] = {
-        "model": model,
-        "temperature": temperature,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -187,19 +262,81 @@ def _openai_chat_json_with_system(
         method="POST",
     )
     try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-        text = raw["choices"][0]["message"]["content"]
-        text = text.strip()
-        if text.startswith("```"):
-            parts = text.split("```")
-            text = parts[1] if len(parts) >= 2 else text
-            if text.startswith("json"):
-                text = text[4:].lstrip()
-        return json.loads(text)
-    except (urllib.error.URLError, json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
+        with urllib.request.urlopen(req, timeout=90, context=_ssl_context()) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace")
+        _log.warning("openai_chat_completions_http_error status=%s body=%s", e.code, err[:3000])
         return None
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+        _log.warning("openai_chat_completions_request_error %s", e)
+        return None
+
+
+def _choice_message_to_parsed_json(raw: dict[str, Any]) -> dict[str, Any] | None:
+    choice0 = (raw.get("choices") or [{}])[0]
+    msg = choice0.get("message") or {}
+    text = _normalize_openai_message_content(msg.get("content"))
+    fr = choice0.get("finish_reason")
+    if not text:
+        _log.warning(
+            "openai_empty_assistant_content finish_reason=%s message_keys=%s",
+            fr,
+            list(msg.keys()),
+        )
+        return None
+    out = _parse_json_object_from_text(text)
+    if out is None:
+        _log.warning("openai_json_parse_failed snippet=%s", text[:800])
+    return out
+
+
+def _openai_chat_json_with_system(
+    api_key: str,
+    model: str,
+    *,
+    system: str,
+    user: str,
+    temperature: float = 0.15,
+    max_tokens: int | None = None,
+    json_mode: bool = True,
+) -> dict[str, Any] | None:
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    max_out = max_tokens if max_tokens is not None else 512
+    body: dict[str, Any] = {"model": model, "messages": messages}
+
+    if _model_uses_gpt5_style_chat_params(model):
+        # Reasoning models consume output budget before visible text; GPT-5 rejects max_tokens / low custom temperature.
+        body["max_completion_tokens"] = max(max_out, 2048)
+        body["reasoning_effort"] = "low"
+    else:
+        body["max_tokens"] = max_out
+        body["temperature"] = temperature
+
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+
+    raw = _openai_post_chat_completions(api_key, body)
+    if raw is None and "reasoning_effort" in body:
+        body = {k: v for k, v in body.items() if k != "reasoning_effort"}
+        raw = _openai_post_chat_completions(api_key, body)
+
+    if raw is None:
+        return None
+
+    parsed = _choice_message_to_parsed_json(raw)
+    if parsed is not None:
+        return parsed
+
+    if json_mode and _model_uses_gpt5_style_chat_params(model):
+        body2 = {k: v for k, v in body.items() if k != "response_format"}
+        raw2 = _openai_post_chat_completions(api_key, body2)
+        if raw2:
+            return _choice_message_to_parsed_json(raw2)
+    return None
 
 
 def _openai_chat_json(api_key: str, model: str, user_content: str) -> dict[str, Any] | None:
@@ -207,56 +344,45 @@ def _openai_chat_json(api_key: str, model: str, user_content: str) -> dict[str, 
         api_key,
         model,
         system=(
-            "You evaluate Kalshi binary prediction markets from title and top-of-book prices only. "
-            "The operator wants to accumulate many small winning or fairly priced entries over time—bias toward approving "
-            "when fair_yes aligns with or modestly exceeds the implied ask, not toward declining unless the case is weak. "
-            "Output strict JSON only."
+            "Kalshi binary markets: title + bid/ask only. Prefer approve when fair_yes fits the ask or small edge; "
+            "strict JSON only."
         ),
         user=user_content,
         temperature=0.22,
+        max_tokens=512,
+        json_mode=True,
     )
 
 
 def _openai_json_fair_only(api_key: str, model: str, title: str, ticker: str) -> float | None:
-    body: dict[str, Any] = {
-        "model": model,
-        "temperature": 0.2,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You estimate fair probability P(YES) for Kalshi binary markets. "
-                    "Output ONLY valid JSON: {\"fair_yes\":0.55} with fair_yes between 0 and 1."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Market ticker: {ticker}\nTitle: {title}\nReturn JSON only.",
-            },
-        ],
-    }
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You estimate fair probability P(YES) for Kalshi binary markets. "
+                'Output ONLY valid JSON: {"fair_yes":0.55} with fair_yes between 0 and 1.'
+            ),
         },
-        method="POST",
-    )
+        {
+            "role": "user",
+            "content": f"Market ticker: {ticker}\nTitle: {title}\nReturn JSON only.",
+        },
+    ]
+    body: dict[str, Any] = {"model": model, "messages": messages, "response_format": {"type": "json_object"}}
+    if _model_uses_gpt5_style_chat_params(model):
+        body["max_completion_tokens"] = 256
+        body["reasoning_effort"] = "low"
+    else:
+        body["temperature"] = 0.2
+        body["max_tokens"] = 40
+    raw = _openai_post_chat_completions(api_key, body)
+    if raw is None:
+        return None
+    parsed = _choice_message_to_parsed_json(raw)
+    if parsed is None:
+        return None
     try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-        text = raw["choices"][0]["message"]["content"]
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-        parsed = json.loads(text)
         fy = float(parsed.get("fair_yes", 0.5))
         return max(0.0, min(1.0, fy))
-    except (urllib.error.URLError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+    except (TypeError, ValueError):
         return None

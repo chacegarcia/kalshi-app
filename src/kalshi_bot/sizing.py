@@ -29,14 +29,34 @@ def parse_notional_sweep_usd(raw: str | None) -> list[float]:
     return out
 
 
-def next_buy_yes_notional_min_max(settings: Settings) -> tuple[float | None, float | None]:
+def effective_trade_max_order_notional_usd(
+    settings: Settings,
+    balance_cents: int | None,
+) -> float | None:
+    """Per-order $ cap at limit: ``(balance/100) × TRADE_RISK_PCT_OF_BALANCE_PER_TRADE`` when balance sizing is on.
+
+    Otherwise uses ``TRADE_MAX_ORDER_NOTIONAL_USD`` (may be ``None`` or ``0`` = no cap, per settings).
+    """
+    if settings.trade_balance_sizing_enabled and balance_cents is not None and balance_cents > 0:
+        return (float(balance_cents) / 100.0) * settings.trade_risk_pct_of_balance_per_trade
+    return settings.trade_max_order_notional_usd
+
+
+def next_buy_yes_notional_min_max(
+    settings: Settings,
+    *,
+    balance_cents: int | None = None,
+) -> tuple[float | None, float | None]:
     """Return (min, max) USD notional for this buy-YES order.
 
     When ``TRADE_NOTIONAL_SWEEP_USD`` is set, each step sets a **cap** (target max $ at limit); the **floor** always
     comes from ``TRADE_MIN_ORDER_NOTIONAL_USD`` only (so 0 = no minimum, sweep does not re-impose a floor).
+
+    When ``TRADE_BALANCE_SIZING_ENABLED`` is true and ``balance_cents`` is set, the max cap follows the same per-trade
+    budget as contract sizing (not ``TRADE_MAX_ORDER_NOTIONAL_USD``).
     """
     mn = settings.trade_min_order_notional_usd
-    mx = settings.trade_max_order_notional_usd
+    mx = effective_trade_max_order_notional_usd(settings, balance_cents)
     vals = parse_notional_sweep_usd(settings.trade_notional_sweep_usd)
     if not vals:
         return mn, mx
@@ -57,14 +77,20 @@ def effective_max_contracts(
     balance_cents: int | None,
     yes_price_cents: int,
 ) -> int:
-    """Cap order size: min(config max, balance × TRADE_RISK_PCT_OF_BALANCE_PER_TRADE / price)."""
+    """Cap order size in contracts.
+
+    With balance sizing and a positive balance: ``floor(balance × TRADE_RISK_PCT_OF_BALANCE_PER_TRADE / price)``,
+    or ``0`` if that budget cannot cover one contract at the limit price.
+
+    Otherwise: ``MAX_CONTRACTS_PER_MARKET`` (static fallback when balance is unknown or sizing is off).
+    """
     base = settings.max_contracts_per_market
     if not settings.trade_balance_sizing_enabled or balance_cents is None or balance_cents <= 0:
         return base
     price = max(1, min(99, yes_price_cents))
     budget = float(balance_cents) * settings.trade_risk_pct_of_balance_per_trade
     cap = int(budget // float(price))
-    return max(1, min(base, cap))
+    return max(0, cap)
 
 
 def cap_buy_yes_count_for_notional(
@@ -114,9 +140,13 @@ def adjust_buy_yes_count_for_notional_floor(
 
 
 def effective_max_exposure_cents(settings: Settings, balance_cents: int | None) -> float:
-    """Cap total exposure: min(MAX_EXPOSURE_CENTS, balance × TRADE_TOTAL_RISK_PCT_OF_BALANCE)."""
+    """Cap total portfolio exposure (cents).
+
+    With balance sizing and a positive balance: ``balance × TRADE_TOTAL_RISK_PCT_OF_BALANCE``.
+
+    Otherwise: ``MAX_EXPOSURE_CENTS`` (static fallback when balance is unknown or sizing is off).
+    """
     static = float(settings.max_exposure_cents)
     if not settings.trade_balance_sizing_enabled or balance_cents is None or balance_cents <= 0:
         return static
-    scaled = float(balance_cents) * settings.trade_total_risk_pct_of_balance
-    return min(static, scaled)
+    return float(balance_cents) * settings.trade_total_risk_pct_of_balance

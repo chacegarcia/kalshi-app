@@ -7,6 +7,7 @@ import asyncio
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
 from kalshi_bot.discover_runner import run_discover_rule_pipeline
 from kalshi_bot.tape_runner import run_tape_rule_pipeline
+from kalshi_bot.bitcoin_runner import run_bitcoin_trade_pass
 from kalshi_bot.monitor import heartbeat, record_portfolio_series_point, start_dashboard
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.ws import KalshiWS
@@ -76,7 +78,7 @@ def cmd_llm_trade(
 ) -> None:
     print(NO_GUARANTEE_DISCLAIMER)
     print()
-    from kalshi_bot.llm_runner import run_llm_opportunity_pipeline
+    from kalshi_bot.llm_runner import LLMTradeRunStats, run_llm_opportunity_pipeline
 
     log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
 
@@ -96,6 +98,8 @@ def cmd_llm_trade(
             iteration += 1
             if loop:
                 print(f"--- llm-trade iteration {iteration} ---", flush=True)
+            n = 0
+            run_stats: LLMTradeRunStats | None = None
             try:
                 n, run_stats = run_llm_opportunity_pipeline(
                     settings,
@@ -106,6 +110,18 @@ def cmd_llm_trade(
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
+            except Exception as exc:
+                print(f"\nllm-trade pipeline crashed: {exc}", file=sys.stderr)
+                traceback.print_exc()
+                err = LLMTradeRunStats()
+                err.cli_execute = execute
+                err.dry_run = settings.dry_run
+                err.live_trading = settings.live_trading
+                err.trade_llm_auto_execute = settings.trade_llm_auto_execute
+                err.pipeline_error = f"{type(exc).__name__}: {exc}"
+                n = 0
+                run_stats = err
+            assert run_stats is not None
             print(f"Orders submitted this run (0 = none or scan-only): {n}")
             for line in run_stats.lines():
                 print(line, flush=True)
@@ -147,6 +163,8 @@ def cmd_discover_trade(
         except Exception:
             pass
 
+    bitcoin_scan_counter: list[int] = [0]
+    bitcoin_rotation_counter: list[int] = [0]
     iteration = 0
     try:
         while True:
@@ -154,7 +172,13 @@ def cmd_discover_trade(
             if loop:
                 print(f"--- discover-trade iteration {iteration} ---", flush=True)
             try:
-                n, run_stats = run_discover_rule_pipeline(settings, execute=execute, log=log)
+                n, run_stats = run_discover_rule_pipeline(
+                    settings,
+                    execute=execute,
+                    log=log,
+                    bitcoin_scan_counter=bitcoin_scan_counter,
+                    bitcoin_rotation_counter=bitcoin_rotation_counter,
+                )
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
@@ -203,6 +227,8 @@ def cmd_tape_trade(
         except Exception:
             pass
 
+    bitcoin_scan_counter: list[int] = [0]
+    bitcoin_rotation_counter: list[int] = [0]
     iteration = 0
     try:
         while True:
@@ -210,7 +236,13 @@ def cmd_tape_trade(
             if loop:
                 print(f"--- tape-trade iteration {iteration} ---", flush=True)
             try:
-                n, run_stats = run_tape_rule_pipeline(settings, execute=execute, log=log)
+                n, run_stats = run_tape_rule_pipeline(
+                    settings,
+                    execute=execute,
+                    log=log,
+                    bitcoin_scan_counter=bitcoin_scan_counter,
+                    bitcoin_rotation_counter=bitcoin_rotation_counter,
+                )
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
@@ -232,6 +264,69 @@ def cmd_tape_trade(
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         print("\ntape-trade loop stopped.", file=sys.stderr)
+
+
+def cmd_bitcoin_trade(
+    settings: Settings,
+    *,
+    execute: bool,
+    loop: bool = False,
+    interval_seconds: float = 45.0,
+) -> None:
+    print(NO_GUARANTEE_DISCLAIMER)
+    print(
+        "bitcoin-trade: CoinGecko BTC/USD spot + Kalshi BTC binary contracts. "
+        "Pin TRADE_BITCOIN_KALSHI_TICKER for one market, or leave it empty to discover open tickers "
+        "with prefix TRADE_BITCOIN_TICKER_PREFIX (default KXBTC) and rotate — contracts roll frequently.\n",
+        flush=True,
+    )
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+
+    dash_client = None
+    if settings.dashboard_enabled:
+        start_dashboard(settings)
+        dash_client = build_sdk_client(settings)
+        try:
+            snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
+            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+        except Exception:
+            pass
+
+    bitcoin_rotation_counter: list[int] = [0]
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            if loop:
+                print(f"--- bitcoin-trade iteration {iteration} ---", flush=True)
+            try:
+                n, run_stats = run_bitcoin_trade_pass(
+                    settings,
+                    execute=execute,
+                    log=log,
+                    rotation_counter=bitcoin_rotation_counter,
+                )
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(2)
+            print(f"Orders submitted this run (0 = none): {n}")
+            for line in run_stats.lines():
+                print(line, flush=True)
+            bal_client = _client_for_balance(settings, dash_client)
+            print_portfolio_balance_line(bal_client)
+            _maybe_exit_scan_after_pass(settings, bal_client, log)
+            if dash_client is not None:
+                try:
+                    snap = fetch_portfolio_snapshot(dash_client, ticker=None)
+                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                except Exception:
+                    pass
+            if not loop:
+                break
+            print(f"Sleeping {interval_seconds:.0f}s… (Ctrl+C to stop)\n", flush=True)
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("\nbitcoin-trade loop stopped.", file=sys.stderr)
 
 
 def cmd_scan(settings: Settings, *, limit: int, use_llm: bool) -> None:
@@ -337,7 +432,7 @@ def cmd_auto_sell(
         cli_min_yes_bid_cents=min_yes_bid_cents,
         effective_min_yes_bid_cents=eff,
         take_profit_min_yes_bid_pct=settings.trade_exit_take_profit_min_yes_bid_pct,
-        min_profit_cents=settings.trade_exit_min_profit_cents_per_contract,
+        min_profit_cents=settings.trade_exit_effective_min_profit_cents_per_contract,
         sell_time_in_force=settings.trade_exit_sell_time_in_force,
         poll_seconds=poll,
         max_cycles=max_cycles,
@@ -637,6 +732,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tt.add_argument("--web", action="store_true", help="Local dashboard (sets DASHBOARD_ENABLED)")
 
+    btc = sub.add_parser(
+        "bitcoin-trade",
+        help="BTC/USD spot + Kalshi BTC markets (pin one ticker or prefix discovery + rotation); same rules as tape-trade",
+    )
+    btc.add_argument(
+        "--execute",
+        action="store_true",
+        help="Submit when rules fire (needs TRADE_BITCOIN_AUTO_EXECUTE=true)",
+    )
+    btc.add_argument("--loop", action="store_true", help="Repeat until Ctrl+C (use --interval for frequency)")
+    btc.add_argument(
+        "--interval",
+        type=float,
+        default=45.0,
+        metavar="SEC",
+        help="Seconds between iterations when --loop (default: 45; CoinGecko is rate-limited — avoid <15s)",
+    )
+    btc.add_argument("--web", action="store_true", help="Local dashboard (sets DASHBOARD_ENABLED)")
+
     w = sub.add_parser("watch-market", help="WebSocket ticker + orderbook stream")
     w.add_argument("ticker")
 
@@ -718,6 +832,8 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["DASHBOARD_ENABLED"] = "true"
     if cmd == "tape-trade" and getattr(args, "web", False):
         os.environ["DASHBOARD_ENABLED"] = "true"
+    if cmd == "bitcoin-trade" and getattr(args, "web", False):
+        os.environ["DASHBOARD_ENABLED"] = "true"
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -730,7 +846,7 @@ def main(argv: list[str] | None = None) -> None:
         elif cmd == "llm-trade":
             cmd_llm_trade(
                 settings,
-                execute=args.execute,
+                execute=bool(args.execute or settings.trade_llm_cli_execute),
                 loop=args.loop,
                 interval_seconds=max(5.0, float(args.interval)),
                 use_tape=getattr(args, "tape", False),
@@ -744,6 +860,13 @@ def main(argv: list[str] | None = None) -> None:
             )
         elif cmd == "tape-trade":
             cmd_tape_trade(
+                settings,
+                execute=args.execute,
+                loop=args.loop,
+                interval_seconds=max(5.0, float(args.interval)),
+            )
+        elif cmd == "bitcoin-trade":
+            cmd_bitcoin_trade(
                 settings,
                 execute=args.execute,
                 loop=args.loop,

@@ -66,6 +66,7 @@ class Settings(BaseSettings):
             "MAX_EXPOSURE_CENTS",
             "max_exposure_cents",
         ),
+        description="Max total exposure (cents) when TRADE_BALANCE_SIZING_ENABLED=false or balance is unknown. With balance sizing + live balance, cap is balance×TRADE_TOTAL_RISK_PCT_OF_BALANCE instead.",
     )
     max_contracts_per_market: int = Field(
         default=10,
@@ -76,6 +77,7 @@ class Settings(BaseSettings):
             "MAX_POSITION_CONTRACTS",
             "max_contracts_per_market",
         ),
+        description="Max contracts per market when TRADE_BALANCE_SIZING_ENABLED=false or balance is unknown. With balance sizing + balance, per-order cap is from balance×TRADE_RISK_PCT_OF_BALANCE_PER_TRADE÷price instead.",
     )
     max_daily_drawdown_usd: float = Field(
         default=25.0,
@@ -86,16 +88,17 @@ class Settings(BaseSettings):
             "MAX_DAILY_LOSS_USD",
             "max_daily_drawdown_usd",
         ),
+        description="Used for loss-step cooldown gating in RiskManager; order blocking uses balance≤0, not this USD cap.",
     )
     max_open_orders_per_market: int = Field(
         default=3, ge=1, validation_alias=_env("MAX_OPEN_ORDERS_PER_MARKET", "max_open_orders_per_market")
     )
     cooldown_after_loss_seconds: int = Field(
-        default=300, ge=0, validation_alias=_env("COOLDOWN_AFTER_LOSS_SECONDS", "cooldown_after_loss_seconds")
+        default=0, ge=0, validation_alias=_env("COOLDOWN_AFTER_LOSS_SECONDS", "cooldown_after_loss_seconds")
     )
     loss_streak_threshold: int = Field(default=3, ge=1, validation_alias=_env("LOSS_STREAK_THRESHOLD", "loss_streak_threshold"))
     cooldown_after_loss_streak_seconds: int = Field(
-        default=900, ge=0, validation_alias=_env("COOLDOWN_AFTER_LOSS_STREAK_SECONDS", "cooldown_after_loss_streak_seconds")
+        default=0, ge=0, validation_alias=_env("COOLDOWN_AFTER_LOSS_STREAK_SECONDS", "cooldown_after_loss_streak_seconds")
     )
     no_martingale: bool = Field(default=True, validation_alias=_env("NO_MARTINGALE", "no_martingale"))
     stale_order_seconds: int = Field(default=3600, ge=1, validation_alias=_env("STALE_ORDER_SECONDS", "stale_order_seconds"))
@@ -127,6 +130,7 @@ class Settings(BaseSettings):
             "STRATEGY_MIN_SPREAD_DOLLARS",
             "strategy_min_spread_dollars",
         ),
+        description="Require at least this YES bid–ask width (0–1 on $1). 0 = do not block on spread tightness.",
     )
     strategy_probability_gap: float = Field(
         default=0.0,
@@ -163,7 +167,7 @@ class Settings(BaseSettings):
             "TRADE_MAX_ORDER_NOTIONAL_USD",
             "trade_max_order_notional_usd",
         ),
-        description="Cap buy-YES $ at limit price. Default 10; min default 0 (no floor). Set max 0 to disable cap only.",
+        description="Cap buy-YES $ at limit when TRADE_BALANCE_SIZING_ENABLED=false or balance unknown. With balance sizing + balance, per-order cap is balance×TRADE_RISK_PCT_OF_BALANCE_PER_TRADE (USD). Set 0 to disable static cap when sizing is off.",
     )
     trade_notional_sweep_usd: str | None = Field(
         default="1,3,5,7,10",
@@ -184,13 +188,23 @@ class Settings(BaseSettings):
         ),
     )
     strategy_min_seconds_between_signals: int = Field(
-        default=45,
+        default=0,
         ge=0,
         validation_alias=AliasChoices(
             "TRADE_MIN_SECONDS_BETWEEN_ORDERS",
             "STRATEGY_MIN_SECONDS_BETWEEN_SIGNALS",
             "strategy_min_seconds_between_signals",
         ),
+        description="WebSocket `run` command only: min seconds between signals. 0 = no spacing.",
+    )
+    trade_submit_spacing_seconds: float = Field(
+        default=5.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "TRADE_SUBMIT_SPACING_SECONDS",
+            "trade_submit_spacing_seconds",
+        ),
+        description="After each submitted buy YES (dry-run or live), sleep this many seconds. 0 = off.",
     )
 
     # --- Edge-aware entry (fair value vs market + Kalshi taker fee curve) ---
@@ -205,25 +219,50 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TRADE_USE_EDGE_STRATEGY", "trade_use_edge_strategy"),
     )
     trade_min_net_edge_after_fees: float = Field(
-        default=0.005,
+        default=0.0,
         ge=0.0,
         le=0.5,
         validation_alias=AliasChoices("TRADE_MIN_NET_EDGE_AFTER_FEES", "trade_min_net_edge_after_fees"),
-        description="Min (fair_yes − YES_ask − taker fee), 0–1 scale on $1 face. 0.005≈0.5¢ edge; 0.05≈5¢ — looser = more signals.",
+        description="Min (fair_yes − YES_ask − taker fee), 0–1 on $1 face. 0 = no minimum edge gate (still subject to fees in math). Raise (e.g. 0.005) to require edge.",
     )
     trade_edge_middle_extra_edge: float = Field(
-        default=0.002,
+        default=0.0,
         ge=0.0,
         le=0.2,
         validation_alias=AliasChoices("TRADE_EDGE_MIDDLE_EXTRA_EDGE", "trade_edge_middle_extra_edge"),
+        description="Extra edge required near 50¢ mid. 0 = no extra mid-price hurdle.",
+    )
+    trade_llm_min_net_edge_after_fees: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_MIN_NET_EDGE_AFTER_FEES",
+            "trade_llm_min_net_edge_after_fees",
+        ),
+        description="If set, llm-trade uses this min net edge instead of TRADE_MIN_NET_EDGE_AFTER_FEES (looser = more fills).",
+    )
+    trade_llm_edge_middle_extra_edge: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=0.2,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_EDGE_MIDDLE_EXTRA_EDGE",
+            "trade_llm_edge_middle_extra_edge",
+        ),
+        description="If set, replaces TRADE_EDGE_MIDDLE_EXTRA_EDGE for llm-trade only (try 0 to drop mid-price penalty).",
     )
     trade_llm_screen_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("TRADE_LLM_SCREEN_ENABLED", "trade_llm_screen_enabled"),
     )
     trade_llm_model: str = Field(
-        default="gpt-4o-mini",
+        default="gpt-5.4-mini",
         validation_alias=AliasChoices("TRADE_LLM_MODEL", "trade_llm_model"),
+        description=(
+            "Chat Completions model for llm-trade / discover. Small GPT-5-class: gpt-5.4-mini (default), "
+            "gpt-5.4-nano (cheapest), or legacy gpt-5-nano. Fallback: gpt-4o-mini if your key lacks GPT-5 family access."
+        ),
     )
     openai_api_key: str | None = Field(
         default=None,
@@ -236,14 +275,77 @@ class Settings(BaseSettings):
             "trade_llm_auto_execute",
         ),
     )
+    trade_llm_cli_execute: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_CLI_EXECUTE",
+            "trade_llm_cli_execute",
+        ),
+        description="If true, llm-trade runs with execute=True without passing --execute (still needs TRADE_LLM_AUTO_EXECUTE; DRY_RUN respected).",
+    )
     trade_llm_max_markets_per_run: int = Field(
-        default=500,
+        default=900,
         ge=1,
-        le=500,
+        le=2000,
         validation_alias=AliasChoices(
             "TRADE_LLM_MAX_MARKETS_PER_RUN",
             "trade_llm_max_markets_per_run",
         ),
+        description="How many distinct open-market tickers llm-trade considers per pass (paginated + deduped).",
+    )
+    trade_llm_open_markets_max_pages: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_OPEN_MARKETS_MAX_PAGES",
+            "trade_llm_open_markets_max_pages",
+        ),
+        description="llm-trade (open universe): max get_markets pages while collecting distinct tickers.",
+    )
+    trade_llm_random_skip_pages_max: int = Field(
+        default=35,
+        ge=0,
+        le=120,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_RANDOM_SKIP_PAGES_MAX",
+            "trade_llm_random_skip_pages_max",
+        ),
+        description="Each llm-trade open-universe run skips 0..N list_markets pages before sampling so tickers rotate across runs.",
+    )
+    trade_llm_bitcoin_priority_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_BITCOIN_PRIORITY_ENABLED",
+            "trade_llm_bitcoin_priority_enabled",
+        ),
+        description="Prepend open Bitcoin-series markets (by ticker prefix) before the general open-market walk.",
+    )
+    trade_llm_bitcoin_priority_prefix: str = Field(
+        default="KXBTC",
+        validation_alias=AliasChoices(
+            "TRADE_LLM_BITCOIN_PRIORITY_PREFIX",
+            "trade_llm_bitcoin_priority_prefix",
+        ),
+        description="Ticker prefix for Bitcoin contracts to prioritize in llm-trade (volume-sorted within prefix).",
+    )
+    trade_llm_bitcoin_priority_max_markets: int = Field(
+        default=150,
+        ge=0,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_BITCOIN_PRIORITY_MAX_MARKETS",
+            "trade_llm_bitcoin_priority_max_markets",
+        ),
+        description="Max BTC-prefix markets to merge at the front of the llm-trade list (0 = disable merge despite TRADE_LLM_BITCOIN_PRIORITY_ENABLED).",
+    )
+    trade_llm_shuffle_open_markets: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_SHUFFLE_OPEN_MARKETS",
+            "trade_llm_shuffle_open_markets",
+        ),
+        description="If true, randomize order of open-market rows each run so the same API ordering does not always star the same tickers.",
     )
     trade_min_market_volume: int | None = Field(
         default=None,
@@ -262,7 +364,7 @@ class Settings(BaseSettings):
             "TRADE_MAX_ENTRY_SPREAD_DOLLARS",
             "trade_max_entry_spread_dollars",
         ),
-        description="If set, skip when (YES_ask − YES_bid) exceeds this. Higher = allow wider books (e.g. 0.20–0.35). Omit for no max-spread filter.",
+        description="If set, skip when (YES_ask − YES_bid) exceeds this. None = no maximum spread filter (only min_spread if >0).",
     )
     trade_llm_relaxed_approval: bool = Field(
         default=True,
@@ -317,9 +419,9 @@ class Settings(BaseSettings):
         description="How many recent public trades to pull for tape-trade ranking (paginated).",
     )
     trade_tape_top_markets: int = Field(
-        default=100,
+        default=200,
         ge=1,
-        le=500,
+        le=2000,
         validation_alias=AliasChoices(
             "TRADE_TAPE_TOP_MARKETS",
             "trade_tape_top_markets",
@@ -342,6 +444,68 @@ class Settings(BaseSettings):
             "trade_tape_auto_execute",
         ),
         description="If true, tape-trade may submit when --execute (still needs LIVE_TRADING and not DRY_RUN).",
+    )
+    trade_bitcoin_kalshi_ticker: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_KALSHI_TICKER",
+            "trade_bitcoin_kalshi_ticker",
+        ),
+        description="Optional: pin one Kalshi BTC contract. If empty, bitcoin-trade / sidecar discovers open markets whose ticker starts with TRADE_BITCOIN_TICKER_PREFIX (contracts roll often).",
+    )
+    trade_bitcoin_ticker_prefix: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_TICKER_PREFIX",
+            "trade_bitcoin_ticker_prefix",
+        ),
+        description="When TRADE_BITCOIN_KALSHI_TICKER is empty: only open markets with tickers starting with this prefix (e.g. KXBTC for Bitcoin series).",
+    )
+    trade_bitcoin_max_universe: int = Field(
+        default=80,
+        ge=1,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_MAX_UNIVERSE",
+            "trade_bitcoin_max_universe",
+        ),
+        description="Max open BTC contracts to collect when discovering by prefix (sorted by volume desc).",
+    )
+    trade_bitcoin_discovery_max_pages: int = Field(
+        default=40,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_DISCOVERY_MAX_PAGES",
+            "trade_bitcoin_discovery_max_pages",
+        ),
+        description="Safety cap on get_markets pages while scanning for TRADE_BITCOIN_TICKER_PREFIX matches.",
+    )
+    trade_bitcoin_auto_execute: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_AUTO_EXECUTE",
+            "trade_bitcoin_auto_execute",
+        ),
+        description="If true, bitcoin-trade may submit when --execute (still needs LIVE_TRADING and not DRY_RUN).",
+    )
+    trade_bitcoin_sidecar_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_SIDECAR_ENABLED",
+            "trade_bitcoin_sidecar_enabled",
+        ),
+        description="During tape-trade / discover-trade, run Bitcoin logic every N ticker scans (pinned ticker or rotating prefix universe; shared counters across loop iterations).",
+    )
+    trade_bitcoin_every_n_ticker_scans: int = Field(
+        default=50,
+        ge=1,
+        le=10_000,
+        validation_alias=AliasChoices(
+            "TRADE_BITCOIN_EVERY_N_TICKER_SCANS",
+            "trade_bitcoin_every_n_ticker_scans",
+        ),
+        description="With TRADE_BITCOIN_SIDECAR_ENABLED: run Bitcoin Kalshi check every N tape/discover ticker iterations.",
     )
 
     # Prior-chart momentum (REST candlesticks): buy YES when YES trade price rose quickly in recent bars.
@@ -405,11 +569,12 @@ class Settings(BaseSettings):
 
     # Balance-scaled limits (bigger account → larger caps within fixed % of balance)
     trade_balance_sizing_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices(
             "TRADE_BALANCE_SIZING_ENABLED",
             "trade_balance_sizing_enabled",
         ),
+        description="Scale exposure, per-order contracts, and per-order notional from account balance (percent fields below). Static MAX_* values apply when this is false or balance is unavailable.",
     )
     trade_risk_pct_of_balance_per_trade: float = Field(
         default=0.02,
@@ -456,7 +621,7 @@ class Settings(BaseSettings):
             "TRADE_AUTO_SELL_AFTER_EACH_PASS",
             "trade_auto_sell_after_each_pass",
         ),
-        description="After each llm-trade / discover-trade / tape-trade pass, scan long YES positions and run take-profit (same rules as auto-sell).",
+        description="After each llm-trade / discover-trade / tape-trade / bitcoin-trade pass, scan long YES positions and run take-profit (same rules as auto-sell).",
     )
 
     # Exit quality: implied-% floor, optional profit-margin vs entry, IOC-style sells (Kalshi API TIF)
@@ -477,6 +642,7 @@ class Settings(BaseSettings):
             "TRADE_EXIT_MIN_PROFIT_CENTS",
             "trade_exit_min_profit_cents_per_contract",
         ),
+        description="Min profit vs entry (¢/contract). If unset but TRADE_EXIT_ONLY_PROFIT_MARGIN=true, code uses 1¢ (see trade_exit_effective_min_profit_cents_per_contract).",
     )
     trade_exit_entry_reference_yes_cents: int | None = Field(
         default=None,
@@ -500,6 +666,7 @@ class Settings(BaseSettings):
             "TRADE_EXIT_ONLY_PROFIT_MARGIN",
             "trade_exit_only_profit_margin",
         ),
+        description="If true, skip implied-% TP; exit when bid ≥ entry + min profit (default 1¢/contract if min profit unset).",
     )
     trade_exit_sell_time_in_force: Literal["immediate_or_cancel", "fill_or_kill", "good_till_canceled"] = Field(
         default="immediate_or_cancel",
@@ -534,6 +701,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", validation_alias=_env("LOG_LEVEL", "log_level"))
     structured_log_path: Path = Field(
         default_factory=_default_log_path, validation_alias=_env("STRUCTURED_LOG_PATH", "structured_log_path")
+    )
+    structured_log_clear_every_n_tickers: int = Field(
+        default=1000,
+        ge=0,
+        validation_alias=_env("STRUCTURED_LOG_CLEAR_EVERY_N_TICKERS", "structured_log_clear_every_n_tickers"),
+        description="llm-trade / tape-trade / discover-trade: truncate STRUCTURED_LOG_PATH after every N ticker iterations (0 = never).",
     )
 
     @field_validator("kalshi_rest_base_url", "kalshi_ws_url", mode="before")
@@ -590,10 +763,15 @@ class Settings(BaseSettings):
         "trade_use_edge_strategy",
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
+        "trade_llm_cli_execute",
         "trade_llm_relaxed_approval",
         "trade_llm_accept_when_fair_covers_ask",
+        "trade_llm_shuffle_open_markets",
+        "trade_llm_bitcoin_priority_enabled",
         "trade_discover_auto_execute",
         "trade_tape_auto_execute",
+        "trade_bitcoin_auto_execute",
+        "trade_bitcoin_sidecar_enabled",
         "trade_balance_sizing_enabled",
         "trade_auto_sell_after_each_pass",
         mode="before",
@@ -657,6 +835,14 @@ class Settings(BaseSettings):
         if self.auto_sell_min_yes_bid_cents is not None:
             return self.auto_sell_min_yes_bid_cents
         return int(round(self.trade_exit_take_profit_min_yes_bid_pct))
+
+    def trade_exit_effective_min_profit_cents_per_contract(self) -> float | None:
+        """Explicit min profit, or 1.0 when TRADE_EXIT_ONLY_PROFIT_MARGIN=true and unset (any green vs entry)."""
+        if self.trade_exit_min_profit_cents_per_contract is not None:
+            return float(self.trade_exit_min_profit_cents_per_contract)
+        if self.trade_exit_only_profit_margin:
+            return 1.0
+        return None
 
 
 @lru_cache

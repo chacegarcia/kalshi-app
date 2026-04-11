@@ -50,8 +50,9 @@ def _should_fire_exit(
     pct_hit = t_min is not None and best_bid_cents >= t_min
 
     profit_hit = False
-    if settings.trade_exit_min_profit_cents_per_contract is not None and entry_ref_cents is not None:
-        need = entry_ref_cents + settings.trade_exit_min_profit_cents_per_contract
+    mpc = settings.trade_exit_effective_min_profit_cents_per_contract
+    if mpc is not None and entry_ref_cents is not None:
+        need = entry_ref_cents + mpc
         profit_hit = best_bid_cents >= need
 
     if settings.trade_exit_only_profit_margin:
@@ -88,11 +89,7 @@ def try_auto_sell_exit_for_ticker(
         return "no_long_yes"
 
     entry_ref = _resolve_entry_reference_yes_cents(settings, client, ticker, log)
-    if (
-        settings.trade_exit_min_profit_cents_per_contract is not None
-        and entry_ref is None
-        and not settings.trade_exit_only_profit_margin
-    ):
+    if settings.trade_exit_effective_min_profit_cents_per_contract is not None and entry_ref is None:
         log.warning(
             "auto_sell_no_entry_reference",
             ticker=ticker,
@@ -165,9 +162,6 @@ def auto_sell_scan_all_long_yes(
 
     Returns ``(sell_count, human_lines)`` for terminal summary.
     """
-    if settings.trade_exit_only_profit_margin and settings.trade_exit_min_profit_cents_per_contract is None:
-        raise ValueError("TRADE_EXIT_ONLY_PROFIT_MARGIN=true requires TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT")
-
     risk = RiskManager(settings)
     ledger = DryRunLedger()
     snap = fetch_portfolio_snapshot(client, ticker=None)
@@ -201,9 +195,6 @@ def run_auto_sell_loop(
     stop_after_one_sell: bool,
     log: StructuredLogger,
 ) -> None:
-    if settings.trade_exit_only_profit_margin and settings.trade_exit_min_profit_cents_per_contract is None:
-        raise ValueError("TRADE_EXIT_ONLY_PROFIT_MARGIN=true requires TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT")
-
     client = build_sdk_client(settings)
     risk = RiskManager(settings)
     ledger = DryRunLedger()

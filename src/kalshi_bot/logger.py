@@ -87,3 +87,24 @@ class StructuredLogger:
 
 def get_logger(name: str, *, log_path: Path, level: str) -> StructuredLogger:
     return StructuredLogger(name, log_path=log_path, level=level)
+
+
+def maybe_clear_structured_log_after_tickers(
+    *,
+    log_path: Path,
+    every_n: int,
+    processed_count: int,
+    log: StructuredLogger | None = None,
+) -> None:
+    """Truncate the JSONL file every ``every_n`` processed tickers (multi-ticker scans). ``every_n`` 0 = disabled."""
+    if every_n <= 0 or processed_count <= 0 or processed_count % every_n != 0:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    if log is not None:
+        log.info(
+            "structured_log_cleared",
+            reason="every_n_tickers",
+            every_n_tickers=every_n,
+            processed_tickers=processed_count,
+        )
