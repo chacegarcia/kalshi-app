@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         description="Max total exposure (cents) when TRADE_BALANCE_SIZING_ENABLED=false or balance is unknown. With balance sizing + live balance, cap is balance×TRADE_TOTAL_RISK_PCT_OF_BALANCE instead.",
     )
     max_contracts_per_market: int = Field(
-        default=2,
+        default=1,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_MAX_CONTRACTS_PER_MARKET",
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
             "MAX_POSITION_CONTRACTS",
             "max_contracts_per_market",
         ),
-        description="Max YES shares (Kalshi contracts) per market; values >2 are clamped to 2.",
+        description="Max YES shares (Kalshi contracts) per market; values >1 are clamped to 1.",
     )
     max_daily_drawdown_usd: float = Field(
         default=25.0,
@@ -219,7 +219,7 @@ class Settings(BaseSettings):
         ),
     )
     trade_entry_theta_seconds_to_close_max: int = Field(
-        default=86_400,
+        default=3_600,
         ge=60,
         le=31_536_000,
         validation_alias=AliasChoices(
@@ -228,7 +228,7 @@ class Settings(BaseSettings):
         ),
         description=(
             "Theta gate: skip when seconds until close/expiration are ≤ this value AND implied YES ask is in the "
-            "theta band (default 24h)."
+            "theta band (default 1h)."
         ),
     )
     trade_entry_theta_min_yes_ask_cents: int = Field(
@@ -335,7 +335,7 @@ class Settings(BaseSettings):
         ),
     )
     strategy_order_count: int = Field(
-        default=2,
+        default=1,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_BUY_CONTRACTS_PER_ORDER",
@@ -343,7 +343,7 @@ class Settings(BaseSettings):
             "STRATEGY_ORDER_COUNT",
             "strategy_order_count",
         ),
-        description="Shares per buy signal (sample strategies / momentum); values >2 are clamped to 2.",
+        description="Shares per buy signal (sample strategies / momentum); values >1 are clamped to 1.",
     )
     trade_min_order_notional_usd: float | None = Field(
         default=0.0,
@@ -852,6 +852,61 @@ class Settings(BaseSettings):
         ),
         description="After each llm-trade / discover-trade / tape-trade / bitcoin-trade pass, scan long YES positions and run take-profit (same rules as auto-sell).",
     )
+    trade_position_watch_before_auto_sell: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_POSITION_WATCH_BEFORE_AUTO_SELL",
+            "trade_position_watch_before_auto_sell",
+        ),
+        description=(
+            "When TRADE_AUTO_SELL_AFTER_EACH_PASS runs, print a short positions-watch table (book + tape lean) "
+            "before the exit scan — same data as `positions-watch` without a second terminal."
+        ),
+    )
+    trade_exit_tape_no_heavy_relax_min_profit_cents: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TAPE_NO_HEAVY_RELAX_MIN_PROFIT_CENTS",
+            "trade_exit_tape_no_heavy_relax_min_profit_cents",
+        ),
+        description=(
+            "Auto-sell / exit-scan: if recent public tape for that ticker is NO-heavy (taker YES share ≤ "
+            "TRADE_EXIT_TAPE_NO_HEAVY_MAX_YES_SHARE) and enough prints exist, reduce required min-profit ¢ by this "
+            "amount for take-profit only (0 = off). Helps exit when flow turns against YES."
+        ),
+    )
+    trade_exit_tape_no_heavy_max_yes_share: float = Field(
+        default=0.38,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TAPE_NO_HEAVY_MAX_YES_SHARE",
+            "trade_exit_tape_no_heavy_max_yes_share",
+        ),
+        description="Tape is NO-heavy when taker YES notional share ≤ this (0.38 ≈ 38% on YES side).",
+    )
+    trade_exit_tape_min_trades_for_exit: int = Field(
+        default=8,
+        ge=1,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TAPE_MIN_TRADES_FOR_EXIT",
+            "trade_exit_tape_min_trades_for_exit",
+        ),
+        description="Minimum parsed taker prints on this ticker before tape relax can apply.",
+    )
+    trade_exit_tape_lookback_max_trades: int = Field(
+        default=150,
+        ge=10,
+        le=1000,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TAPE_LOOKBACK_MAX_TRADES",
+            "trade_exit_tape_lookback_max_trades",
+        ),
+        description="How many recent public trades to fetch per ticker for tape lean during auto-sell.",
+    )
     trade_exit_hold_to_settlement_min_chance_cents: int = Field(
         default=90,
         ge=0,
@@ -863,6 +918,48 @@ class Settings(BaseSettings):
         description=(
             "If >0: while long YES and implied YES chance (mid of best bid and lift YES ask, 1–99¢) ≥ this, "
             "do not auto-sell—hold for final payout. 0 disables (always allow TP/stops per other rules)."
+        ),
+    )
+    trade_exit_sell_within_cents_of_max_payout: int = Field(
+        default=2,
+        ge=0,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_SELL_WITHIN_CENTS_OF_MAX_PAYOUT",
+            "trade_exit_sell_within_cents_of_max_payout",
+        ),
+        description=(
+            "If >0: when implied YES chance is within this many cents of 100¢ (i.e. chance ≥ 100 − N), "
+            "do not apply hold-to-settlement—allow exits. If other exit rules do not fire, still sell "
+            "(take-profit near max). 0 disables. Takes precedence over "
+            "TRADE_EXIT_HOLD_TO_SETTLEMENT_MIN_CHANCE_CENTS when both would apply."
+        ),
+    )
+    trade_exit_min_profit_cents_when_no_full_payout_indication: int = Field(
+        default=5,
+        ge=0,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_MIN_PROFIT_CENTS_NO_FULL_PAYOUT_INDICATION",
+            "trade_exit_min_profit_cents_when_no_full_payout_indication",
+        ),
+        description=(
+            "If >0 and TRADE_EXIT_FULL_PAYOUT_INDICATION_MIN_CHANCE_CENTS >0: when implied YES chance is **below** "
+            "that threshold (no strong indication the contract resolves YES at $1), take profit when best bid ≥ "
+            "entry + this many ¢ per share. 0 disables (use normal TRADE_EXIT_MIN_PROFIT_* only)."
+        ),
+    )
+    trade_exit_full_payout_indication_min_chance_cents: int = Field(
+        default=90,
+        ge=0,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_FULL_PAYOUT_INDICATION_MIN_CHANCE_CENTS",
+            "trade_exit_full_payout_indication_min_chance_cents",
+        ),
+        description=(
+            "If >0: implied YES chance ≥ this counts as an indication of winning the full $1 payout for exit math—"
+            "the relaxed min-profit rule above is not used; normal min-profit rules apply. If 0: relaxed rule off."
         ),
     )
 
@@ -901,6 +998,19 @@ class Settings(BaseSettings):
         description=(
             "If >0: require at least this fraction of entry (in ¢) as profit, e.g. 0.25 → 25% of entry. "
             "Effective min profit = max(TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT, entry×this). 0 = floor only."
+        ),
+    )
+    trade_exit_take_profit_min_bid_vs_entry_multiplier: float = Field(
+        default=1.5,
+        ge=0.0,
+        le=3.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TAKE_PROFIT_MIN_BID_VS_ENTRY_MULTIPLIER",
+            "trade_exit_take_profit_min_bid_vs_entry_multiplier",
+        ),
+        description=(
+            "When >1.0: take-profit when best YES bid ≥ ceil(entry×this), e.g. 1.5 with entry 50¢ → exit at bid ≥75¢ "
+            "(+50% vs entry in ¢ terms). This path also bypasses hold-to-settlement. 0 or 1.0 = off."
         ),
     )
     trade_exit_min_profit_cents_cap: float | None = Field(
@@ -1032,7 +1142,24 @@ class Settings(BaseSettings):
             "TRADE_EXIT_TRAILING_COMBINE_WITH_FIXED_STOP",
             "trade_exit_trailing_combine_with_fixed_stop",
         ),
-        description="If true: exit stop uses max(fixed_stop_floor, peak−pullback) so the stop rises with favorable prints.",
+        description=(
+            "If true: combine peak−pullback with a fraction stop. When TRADE_EXIT_TRAILING_BID_FRACTION_CAPS_PEAK_TRAIL "
+            "is true (default), exit threshold is min(peak−pullback, best_bid×fraction) so the level moves **down** "
+            "when price falls; if false, legacy max(entry×fraction, peak−pullback)."
+        ),
+    )
+    trade_exit_trailing_bid_fraction_caps_peak_trail: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_BID_FRACTION_CAPS_PEAK_TRAIL",
+            "trade_exit_trailing_bid_fraction_caps_peak_trail",
+        ),
+        description=(
+            "When true and trailing is combined with fixed stop: exit when bid ≤ min(peak−pullback, "
+            "round(best_bid×effective_fraction)) (then profit-lock floor). Lets the stop **decrease** as the "
+            "market trades lower (fraction of current bid), while still using peak−pullback on the way up. "
+            "If false: legacy max(entry×fraction, peak−pullback)."
+        ),
     )
     trade_exit_trailing_stop_loss_floor_fraction: float | None = Field(
         default=None,
@@ -1062,6 +1189,165 @@ class Settings(BaseSettings):
             "TRADE_EXIT_SELL_AGGRESSION_CENTS",
             "trade_exit_sell_aggression_cents",
         ),
+    )
+    trade_rebuy_after_stop_loss_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_REBUY_AFTER_STOP_LOSS_ENABLED",
+            "trade_rebuy_after_stop_loss_enabled",
+        ),
+        description=(
+            "If true: after a fixed stop-loss sell (and optionally trailing/profit-lock), submit a new buy YES "
+            "on the same ticker using TRADE_BUY_LIMIT_YES_PRICE_CENTS / TRADE_BUY_MAX_YES_ASK_DOLLARS gates."
+        ),
+    )
+    trade_rebuy_after_stop_loss_include_trailing_and_profit_lock: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_REBUY_AFTER_STOP_LOSS_INCLUDE_TRAILING_AND_PROFIT_LOCK",
+            "trade_rebuy_after_stop_loss_include_trailing_and_profit_lock",
+        ),
+        description="If true: also re-enter after trailing_stop_pullback or profit_lock_stop (not only stop_loss_entry_fraction).",
+    )
+    trade_rebuy_after_stop_loss_delay_seconds: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=120.0,
+        validation_alias=AliasChoices(
+            "TRADE_REBUY_AFTER_STOP_LOSS_DELAY_SECONDS",
+            "trade_rebuy_after_stop_loss_delay_seconds",
+        ),
+        description="Sleep this long after the stop sell before placing the rebuy (lets the book update).",
+    )
+    trade_rebuy_after_stop_loss_cooldown_seconds: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=3600.0,
+        validation_alias=AliasChoices(
+            "TRADE_REBUY_AFTER_STOP_LOSS_COOLDOWN_SECONDS",
+            "trade_rebuy_after_stop_loss_cooldown_seconds",
+        ),
+        description="Minimum seconds between stop-loss rebuys on the same ticker (0 = no cooldown).",
+    )
+    trade_rebuy_after_stop_loss_time_in_force: Literal["immediate_or_cancel", "fill_or_kill", "good_till_canceled"] = Field(
+        default="immediate_or_cancel",
+        validation_alias=AliasChoices(
+            "TRADE_REBUY_AFTER_STOP_LOSS_TIME_IN_FORCE",
+            "trade_rebuy_after_stop_loss_time_in_force",
+        ),
+        description="Time-in-force for the rebuy limit order (IOC default avoids resting).",
+    )
+    trade_double_down_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_DOUBLE_DOWN_ENABLED",
+            "trade_double_down_enabled",
+        ),
+        description=(
+            "llm-trade only: if you already hold long YES on a ticker, allow another buy YES "
+            "(up to TRADE_DOUBLE_DOWN_MAX_POSITION_CONTRACTS total) when the LLM and fee-edge still pass."
+        ),
+    )
+    trade_double_down_max_position_contracts: int = Field(
+        default=2,
+        ge=2,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_DOUBLE_DOWN_MAX_POSITION_CONTRACTS",
+            "trade_double_down_max_position_contracts",
+        ),
+        description="Max total YES contracts per market when adding to a winner (base max is still 1 for new entries).",
+    )
+    trade_double_down_extra_min_net_edge_after_fees: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_DOUBLE_DOWN_EXTRA_MIN_NET_EDGE_AFTER_FEES",
+            "trade_double_down_extra_min_net_edge_after_fees",
+        ),
+        description="Extra fee-edge hurdle (0–1 on $1 face) on add-on buys only; 0 = same as normal llm-trade edge.",
+    )
+    trade_spike_fade_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_ENABLED",
+            "trade_spike_fade_enabled",
+        ),
+        description=(
+            "llm-trade only: if recent YES candle closes show a sharp rise, tighten fee-edge for buy YES "
+            "unless net edge clears TRADE_SPIKE_FADE_HUGE_NET_EDGE_AFTER_FEES (fade the spike unless mispricing is huge)."
+        ),
+    )
+    trade_spike_fade_period_interval_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=1440,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_PERIOD_INTERVAL_MINUTES",
+            "trade_spike_fade_period_interval_minutes",
+        ),
+        description="Candle size (minutes) for spike detection (same REST endpoint as momentum).",
+    )
+    trade_spike_fade_lookback_minutes: int = Field(
+        default=120,
+        ge=5,
+        le=10080,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_LOOKBACK_MINUTES",
+            "trade_spike_fade_lookback_minutes",
+        ),
+        description="How far back to fetch YES trade closes for spike detection.",
+    )
+    trade_spike_fade_min_candles: int = Field(
+        default=4,
+        ge=2,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_MIN_CANDLES",
+            "trade_spike_fade_min_candles",
+        ),
+        description="Minimum candles required before evaluating a spike.",
+    )
+    trade_spike_fade_short_candles: int = Field(
+        default=6,
+        ge=2,
+        le=200,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_SHORT_CANDLES",
+            "trade_spike_fade_short_candles",
+        ),
+        description="Last N bars used to measure net YES rise (spike if rise >= min_net_rise).",
+    )
+    trade_spike_fade_min_net_rise_dollars: float = Field(
+        default=0.025,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_MIN_NET_RISE_DOLLARS",
+            "trade_spike_fade_min_net_rise_dollars",
+        ),
+        description="YES rise (dollars on $1 face) over the short window counts as a spike (e.g. 0.025 = 2.5¢).",
+    )
+    trade_spike_fade_extra_min_net_edge_after_fees: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_EXTRA_MIN_NET_EDGE_AFTER_FEES",
+            "trade_spike_fade_extra_min_net_edge_after_fees",
+        ),
+        description="Added to the usual min net edge when a spike is detected and net edge is below the huge bypass.",
+    )
+    trade_spike_fade_huge_net_edge_after_fees: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_SPIKE_FADE_HUGE_NET_EDGE_AFTER_FEES",
+            "trade_spike_fade_huge_net_edge_after_fees",
+        ),
+        description="If fee-adjusted net edge (per share) is at or above this, allow buy YES despite spike fade tightening.",
     )
 
     # Paper / backtest defaults (override in CLI or code)
@@ -1135,17 +1421,21 @@ class Settings(BaseSettings):
 
     @field_validator("max_contracts_per_market", "strategy_order_count", mode="before")
     @classmethod
-    def _cap_order_shares_at_two(cls, v: object) -> object:
-        """Env may still say 10 from older configs; enforce max 2 shares per policy."""
+    def _cap_order_shares_at_one(cls, v: object) -> object:
+        """Env may still say 10 from older configs; enforce max 1 share per policy."""
         if v is None or (isinstance(v, str) and not str(v).strip()):
             return v
         try:
             n = int(v)
         except (TypeError, ValueError):
             return v
-        return min(2, max(1, n))
+        return min(1, max(1, n))
 
-    @field_validator("trade_exit_sell_time_in_force", mode="before")
+    @field_validator(
+        "trade_exit_sell_time_in_force",
+        "trade_rebuy_after_stop_loss_time_in_force",
+        mode="before",
+    )
     @classmethod
     def _normalize_exit_time_in_force(cls, v: object) -> str:
         if v is None or (isinstance(v, str) and not str(v).strip()):
@@ -1160,7 +1450,7 @@ class Settings(BaseSettings):
         s = aliases.get(s, s)
         if s not in ("immediate_or_cancel", "fill_or_kill", "good_till_canceled"):
             raise ValueError(
-                "trade_exit_sell_time_in_force must be immediate_or_cancel, fill_or_kill, or good_till_canceled "
+                "time_in_force must be immediate_or_cancel, fill_or_kill, or good_till_canceled "
                 f"(got {v!r})"
             )
         return s
@@ -1190,12 +1480,18 @@ class Settings(BaseSettings):
         "trade_bitcoin_sidecar_enabled",
         "trade_balance_sizing_enabled",
         "trade_auto_sell_after_each_pass",
+        "trade_position_watch_before_auto_sell",
         "trade_exit_only_profit_margin",
         "trade_exit_estimate_entry_from_portfolio",
         "trade_exit_stop_loss_enabled",
         "trade_exit_stop_loss_skip_suspect_portfolio_estimate",
         "trade_exit_trailing_enabled",
         "trade_exit_trailing_combine_with_fixed_stop",
+        "trade_exit_trailing_bid_fraction_caps_peak_trail",
+        "trade_rebuy_after_stop_loss_enabled",
+        "trade_rebuy_after_stop_loss_include_trailing_and_profit_lock",
+        "trade_double_down_enabled",
+        "trade_spike_fade_enabled",
         "structured_log_clear_every_other_pass",
         mode="before",
     )

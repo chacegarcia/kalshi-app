@@ -12,6 +12,7 @@ from kalshi_python_sync.models.get_market_response import GetMarketResponse
 from kalshi_python_sync.models.get_markets_response import GetMarketsResponse
 
 from kalshi_bot.client import KalshiSdkClient, with_rest_retry
+from kalshi_bot.edge_math import implied_no_ask_dollars, implied_yes_ask_dollars  # re-export for convenience
 
 
 @dataclass
@@ -37,6 +38,77 @@ class TapeUniverseEntry:
     rank: int
 
 
+@dataclass(frozen=True)
+class TakerTapeLean:
+    """Aggregate taker flow on one market: YES-taker vs NO-taker notional (anonymous public prints)."""
+
+    trade_count: int
+    taker_yes_notional_usd: float
+    taker_no_notional_usd: float
+
+    @property
+    def total_notional_usd(self) -> float:
+        return self.taker_yes_notional_usd + self.taker_no_notional_usd
+
+    @property
+    def yes_share(self) -> float | None:
+        """Fraction of taker $ on YES side; None if no parsed tape."""
+        tot = self.total_notional_usd
+        if tot <= 0.0:
+            return None
+        return self.taker_yes_notional_usd / tot
+
+    def lean_label(self) -> str:
+        """Short text for dashboards: which side anonymous takers leaned recently."""
+        if self.trade_count == 0:
+            return "no_tape"
+        sp = self.yes_share
+        if sp is None:
+            return "unknown"
+        if sp >= 0.6:
+            return "yes-heavy"
+        if sp <= 0.4:
+            return "no-heavy"
+        return "mixed"
+
+
+def summarize_taker_tape_lean(trades: list[Any]) -> TakerTapeLean:
+    """Split public prints by ``taker_side`` (Kalshi: taker lifted YES vs NO)."""
+    yes_usd = 0.0
+    no_usd = 0.0
+    n = 0
+    for t in trades:
+        side = getattr(t, "taker_side", None)
+        if side is None:
+            continue
+        s = str(side).strip().lower()
+        try:
+            cnt = float(str(getattr(t, "count_fp", "0")))
+        except (TypeError, ValueError):
+            continue
+        if cnt <= 0:
+            continue
+        if s == "yes":
+            try:
+                yp = float(str(getattr(t, "yes_price_dollars", "0")))
+            except (TypeError, ValueError):
+                continue
+            yes_usd += cnt * yp
+            n += 1
+        elif s == "no":
+            try:
+                np_ = float(str(getattr(t, "no_price_dollars", "0")))
+            except (TypeError, ValueError):
+                continue
+            no_usd += cnt * np_
+            n += 1
+    return TakerTapeLean(
+        trade_count=n,
+        taker_yes_notional_usd=yes_usd,
+        taker_no_notional_usd=no_usd,
+    )
+
+
 @with_rest_retry
 def fetch_public_trades(
     client: KalshiSdkClient,
@@ -54,6 +126,29 @@ def fetch_public_trades(
     while len(out) < max_trades:
         take = min(page_limit, max_trades - len(out))
         resp = client.markets.get_trades(limit=take, cursor=cursor)
+        batch = list(getattr(resp, "trades", []) or [])
+        out.extend(batch)
+        cursor = getattr(resp, "cursor", None)
+        if not batch or not cursor:
+            break
+    return out[:max_trades]
+
+
+@with_rest_retry
+def fetch_public_trades_for_ticker(
+    client: KalshiSdkClient,
+    ticker: str,
+    *,
+    max_trades: int,
+    page_limit: int = 1000,
+) -> list[Any]:
+    """Recent public trades for a single market (taker_side + prices). Used for position / flow lean."""
+    out: list[Any] = []
+    cursor: str | None = None
+    page_limit = max(1, min(1000, page_limit))
+    while len(out) < max_trades:
+        take = min(page_limit, max_trades - len(out))
+        resp = client.markets.get_trades(limit=take, cursor=cursor, ticker=ticker)
         batch = list(getattr(resp, "trades", []) or [])
         out.extend(batch)
         cursor = getattr(resp, "cursor", None)
@@ -417,6 +512,15 @@ def yes_bid_and_no_bid_cents_for_trading(
     return yb, nb
 
 
+def lift_yes_ask_cents_from_orderbook(orderbook: GetMarketOrderbookResponse) -> int | None:
+    """Lift YES ask (¢) from complement of best NO bid; ``None`` if the book cannot be used for trading."""
+    _yb, nb = yes_bid_and_no_bid_cents_for_trading(orderbook)
+    if nb is None:
+        return None
+    ya_d = implied_yes_ask_dollars(nb / 100.0)
+    return int(max(1, min(99, round(ya_d * 100.0))))
+
+
 def summarize_market_row(m: Any) -> MarketSummary:
     """Narrow SDK model to a stable dataclass for CLI/tests."""
     return MarketSummary(
@@ -536,7 +640,37 @@ def fetch_event_top_yes_tickers(
     return [t for t, _ in rows[:top_n]]
 
 
-_MARKET_TITLE_CACHE: dict[str, str] = {}
+_MARKET_DISPLAY_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def _market_title_and_category(client: KalshiSdkClient, ticker: str) -> tuple[str, str]:
+    """Return ``(title, category)``. Category comes from the event (e.g. Sports, Crypto); may be empty."""
+    if ticker in _MARKET_DISPLAY_CACHE:
+        return _MARKET_DISPLAY_CACHE[ticker]
+    title = ""
+    category = ""
+    try:
+        row = get_market(client, ticker=ticker)
+        m = getattr(row, "market", None)
+        if m is None:
+            _MARKET_DISPLAY_CACHE[ticker] = ("", "")
+            return "", ""
+        title = (summarize_market_row(m).title or "").strip()
+        et = getattr(m, "event_ticker", None)
+        if et:
+            try:
+                evr = client.events.get_event(event_ticker=str(et))
+                ev = getattr(evr, "event", None)
+                if ev is not None:
+                    c = getattr(ev, "category", None)
+                    if c is not None:
+                        category = str(c).strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _MARKET_DISPLAY_CACHE[ticker] = (title, category)
+    return title, category
 
 
 def market_title_for_ticker(client: KalshiSdkClient, ticker: str) -> str:
@@ -544,16 +678,11 @@ def market_title_for_ticker(client: KalshiSdkClient, ticker: str) -> str:
 
     Cached per ticker for the process. Returns ``\"\"`` if the lookup fails.
     """
-    if ticker in _MARKET_TITLE_CACHE:
-        return _MARKET_TITLE_CACHE[ticker]
-    try:
-        row = get_market(client, ticker=ticker)
-        m = getattr(row, "market", None)
-        if m is None:
-            _MARKET_TITLE_CACHE[ticker] = ""
-            return ""
-        title = (summarize_market_row(m).title or "").strip()
-        _MARKET_TITLE_CACHE[ticker] = title
-        return title
-    except Exception:
-        return ""
+    t, _c = _market_title_and_category(client, ticker)
+    return t
+
+
+def market_category_for_ticker(client: KalshiSdkClient, ticker: str) -> str:
+    """Event ``category`` from Kalshi (e.g. sports-oriented labels); may be empty if unknown."""
+    _t, c = _market_title_and_category(client, ticker)
+    return c

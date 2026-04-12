@@ -228,6 +228,8 @@ class TradeIntent:
     count: int
     yes_price_cents: int
     time_in_force: str = "good_till_canceled"
+    # If true: allow buy-YES to reach TRADE_DOUBLE_DOWN_MAX_POSITION_CONTRACTS (add-on to existing long).
+    double_down: bool = False
 
 
 def signed_position_delta(intent: TradeIntent) -> float:

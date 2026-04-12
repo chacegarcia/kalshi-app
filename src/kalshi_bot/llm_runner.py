@@ -26,6 +26,7 @@ from kalshi_bot.market_data import (
     yes_bid_and_no_bid_cents_for_trading,
 )
 from kalshi_bot.momentum import momentum_buy_intent_if_hot
+from kalshi_bot.spike_fade import detect_yes_spike_up
 from kalshi_bot.portfolio import PortfolioSnapshot, fetch_portfolio_snapshot, get_balance_cents
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import effective_max_contracts
@@ -57,6 +58,8 @@ class LLMTradeRunStats:
     skip_low_volume: int = 0
     momentum_llm_bypass: int = 0
     momentum_candle_error: int = 0
+    spike_fade_candle_error: int = 0
+    skip_spike_fade_weak_edge: int = 0
     skipped_cli_no_execute: int = 0
     blocked_zero_contracts_balance: int = 0
     skip_zero_contracts_after_verdict: int = 0
@@ -69,6 +72,9 @@ class LLMTradeRunStats:
     skip_multi_choice_below_min: int = 0
     skip_multi_choice_not_in_event: int = 0
     blocked_trade_llm_auto_execute_false: int = 0
+    skip_already_long_yes: int = 0
+    skip_double_down_at_cap: int = 0
+    double_down_submitted: int = 0
     submitted: int = 0
     # Filled each run so the summary explains why nothing submitted without reading logs
     cli_execute: bool = False
@@ -108,10 +114,15 @@ class LLMTradeRunStats:
                 f"  skip (multi-choice not top-N):    {self.skip_multi_choice_not_top_n}",
                 f"  skip (multi-choice < min chance): {self.skip_multi_choice_below_min}",
                 f"  skip (multi-choice ticker missing): {self.skip_multi_choice_not_in_event}",
+                f"  skip (already long YES, DD off): {self.skip_already_long_yes}",
+                f"  skip (at max DD position):     {self.skip_double_down_at_cap}",
                 f"  momentum bypass (chart YES):  {self.momentum_llm_bypass}",
                 f"  momentum candle fetch errors: {self.momentum_candle_error}",
+                f"  spike-fade candle errors:    {self.spike_fade_candle_error}",
+                f"  skip (spike fade, edge weak): {self.skip_spike_fade_weak_edge}",
                 f"  skipped (--execute false):    {self.skipped_cli_no_execute}",
                 f"  TRADE_LLM_AUTO_EXECUTE false: {self.blocked_trade_llm_auto_execute_false}",
+                f"  double-down submits (add-on): {self.double_down_submitted}",
                 f"  reached trade_execute:        {self.submitted}",
                 "  (If submitted > 0 but no fills: see structured logs for order_blocked / dry_run / risk.)",
                 "---",
@@ -211,6 +222,8 @@ def _passes_bot_math_for_llm(
     llm_decline_overridden: bool,
     adaptive_min_add: float = 0.0,
     adaptive_mid_add: float = 0.0,
+    is_double_down: bool = False,
+    spike_fade_spike_up: bool = False,
 ) -> bool:
     """Strict fee-edge check, or when LLM declined but fair is near ask, only book-quality checks."""
     if entry_side == "no":
@@ -231,6 +244,8 @@ def _passes_bot_math_for_llm(
         mn, me = _llm_effective_edge_thresholds(
             settings, adaptive_min_add=adaptive_min_add, adaptive_mid_add=adaptive_mid_add
         )
+        if is_double_down and settings.trade_double_down_extra_min_net_edge_after_fees > 0:
+            mn = mn + settings.trade_double_down_extra_min_net_edge_after_fees
         return _passes_bot_edge_no(
             settings,
             fair_no=fair_no,
@@ -259,6 +274,20 @@ def _passes_bot_math_for_llm(
     mn, me = _llm_effective_edge_thresholds(
         settings, adaptive_min_add=adaptive_min_add, adaptive_mid_add=adaptive_mid_add
     )
+    if is_double_down and settings.trade_double_down_extra_min_net_edge_after_fees > 0:
+        mn = mn + settings.trade_double_down_extra_min_net_edge_after_fees
+    if (
+        settings.trade_spike_fade_enabled
+        and spike_fade_spike_up
+        and settings.trade_spike_fade_extra_min_net_edge_after_fees > 0
+    ):
+        edge_now = net_edge_buy_yes_long(
+            fair_yes=fair_yes,
+            yes_ask_dollars=yes_ask_dollars,
+            contracts=contracts,
+        )
+        if edge_now < settings.trade_spike_fade_huge_net_edge_after_fees:
+            mn = mn + settings.trade_spike_fade_extra_min_net_edge_after_fees
     return _passes_bot_edge(
         settings,
         fair_yes=fair_yes,
@@ -419,6 +448,14 @@ def run_llm_opportunity_pipeline(
             log.warning("llm_trade_portfolio_snapshot_fail", error=str(exc))
             snap_for_cap = None
 
+    loop_portfolio_snap: PortfolioSnapshot | None = snap_for_cap
+    if loop_portfolio_snap is None:
+        try:
+            loop_portfolio_snap = fetch_portfolio_snapshot(client, ticker=None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("llm_trade_portfolio_snapshot_loop_fail", error=str(exc))
+            loop_portfolio_snap = None
+
     event_data_cache: dict[str, list[tuple[str, float]] | None] = {}
 
     for i, (ticker, title) in enumerate(rows):
@@ -474,6 +511,14 @@ def run_llm_opportunity_pipeline(
                 settings, yes_ask_cents=yes_ask_c, yes_bid_cents=yb_c, no_bid_cents=nb_c
             )
 
+            held = 0.0
+            if loop_portfolio_snap is not None:
+                held = float(loop_portfolio_snap.positions_by_ticker.get(ticker, 0.0))
+            if entry_side == "yes" and held > 0.5 and not settings.trade_double_down_enabled:
+                stats.skip_already_long_yes += 1
+                log.info("llm_trade_skip_already_long_yes", ticker=ticker, held_yes=held)
+                continue
+
             if should_skip_buy_ticker_substrings(settings, ticker):
                 stats.skip_ticker_substring += 1
                 log.info("llm_trade_skip_ticker_substring", ticker=ticker)
@@ -526,40 +571,99 @@ def run_llm_opportunity_pipeline(
                 )
                 continue
 
-            max_allowed = effective_max_contracts(
+            base_max = effective_max_contracts(
                 settings, balance_cents=bal, yes_price_cents=chosen_ask_c
             )
-            if max_allowed < 1:
-                stats.blocked_zero_contracts_balance += 1
-                log.info(
-                    "llm_trade_skip_zero_contracts_balance",
-                    ticker=ticker,
-                    balance_cents=bal,
-                    yes_ask_cents=yes_ask_c,
-                    chosen_ask_cents=chosen_ask_c,
-                    entry_side=entry_side,
+            add_room = 0
+            if settings.trade_double_down_enabled and entry_side == "yes" and held > 0.5:
+                add_room = max(
+                    0,
+                    int(settings.trade_double_down_max_position_contracts) - int(held),
                 )
+            if held > 0.5 and entry_side == "yes" and settings.trade_double_down_enabled:
+                max_allowed = min(base_max, add_room) if add_room > 0 else 0
+            else:
+                max_allowed = base_max
+            if max_allowed < 1:
+                if held > 0.5 and entry_side == "yes" and settings.trade_double_down_enabled:
+                    stats.skip_double_down_at_cap += 1
+                    log.info(
+                        "llm_trade_skip_double_down_at_cap",
+                        ticker=ticker,
+                        held_yes=held,
+                        max_pos=settings.trade_double_down_max_position_contracts,
+                    )
+                else:
+                    stats.blocked_zero_contracts_balance += 1
+                    log.info(
+                        "llm_trade_skip_zero_contracts_balance",
+                        ticker=ticker,
+                        balance_cents=bal,
+                        yes_ask_cents=yes_ask_c,
+                        chosen_ask_cents=chosen_ask_c,
+                        entry_side=entry_side,
+                    )
                 continue
 
-            if entry_side == "yes" and settings.trade_momentum_enabled and settings.trade_momentum_llm_bypass:
+            spike_up = False
+            closes_for_chart: list[float] = []
+            needs_momentum = (
+                entry_side == "yes"
+                and settings.trade_momentum_enabled
+                and settings.trade_momentum_llm_bypass
+                and not (held > 0.5 and settings.trade_double_down_enabled)
+            )
+            needs_spike = entry_side == "yes" and settings.trade_spike_fade_enabled
+            if needs_momentum or needs_spike:
+                if needs_momentum and needs_spike:
+                    period_iv = max(
+                        settings.trade_momentum_period_minutes,
+                        settings.trade_spike_fade_period_interval_minutes,
+                    )
+                    lookback_sec = max(
+                        settings.trade_momentum_lookback_minutes * 60,
+                        settings.trade_spike_fade_lookback_minutes * 60,
+                    )
+                elif needs_spike:
+                    period_iv = settings.trade_spike_fade_period_interval_minutes
+                    lookback_sec = settings.trade_spike_fade_lookback_minutes * 60
+                else:
+                    period_iv = settings.trade_momentum_period_minutes
+                    lookback_sec = settings.trade_momentum_lookback_minutes * 60
                 try:
-                    closes = fetch_yes_close_prices(
+                    closes_for_chart = fetch_yes_close_prices(
                         client,
                         ticker,
-                        period_interval_minutes=settings.trade_momentum_period_minutes,
-                        lookback_seconds=settings.trade_momentum_lookback_minutes * 60,
+                        period_interval_minutes=period_iv,
+                        lookback_seconds=lookback_sec,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    stats.momentum_candle_error += 1
-                    log.warning("llm_momentum_candles_fail", ticker=ticker, error=str(exc))
-                    closes = []
-                if closes:
+                    if needs_momentum:
+                        stats.momentum_candle_error += 1
+                        log.warning("llm_momentum_candles_fail", ticker=ticker, error=str(exc))
+                    if needs_spike:
+                        stats.spike_fade_candle_error += 1
+                        log.warning("llm_spike_fade_candles_fail", ticker=ticker, error=str(exc))
+                    closes_for_chart = []
+                if needs_spike and closes_for_chart:
+                    spike_up, spike_why = detect_yes_spike_up(closes_for_chart, settings)
+                    if spike_up:
+                        log.info("llm_trade_spike_fade_detected", ticker=ticker, detail=spike_why)
+
+            if (
+                entry_side == "yes"
+                and settings.trade_momentum_enabled
+                and settings.trade_momentum_llm_bypass
+                and not (held > 0.5 and settings.trade_double_down_enabled)
+                and not (spike_up and settings.trade_spike_fade_enabled)
+            ):
+                if closes_for_chart:
                     mintent, mwhy = momentum_buy_intent_if_hot(
                         ticker=ticker,
                         yes_bid_dollars=yes_bid_d,
                         yes_ask_dollars=yes_ask_d,
                         settings=settings,
-                        close_prices=closes,
+                        close_prices=closes_for_chart,
                     )
                     if mintent is not None:
                         cnt = min(mintent.count, max_allowed)
@@ -573,6 +677,7 @@ def run_llm_opportunity_pipeline(
                             action="buy",
                             count=cnt,
                             yes_price_cents=mintent.yes_price_cents,
+                            double_down=False,
                         )
                         log.info("llm_trade_momentum_bypass", ticker=ticker, detail=mwhy, count=cnt)
                         print(f"llm-trade: {ticker} momentum bypass — {mwhy}", flush=True)
@@ -622,6 +727,8 @@ def run_llm_opportunity_pipeline(
                 no_bid_dollars=no_bid_d,
                 no_ask_dollars=no_ask_d,
                 entry_side=entry_side,
+                existing_long_yes_shares=held,
+                recent_yes_spike_up=spike_up,
             )
             if verdict is None:
                 stats.llm_no_verdict += 1
@@ -688,7 +795,12 @@ def run_llm_opportunity_pipeline(
                 limit_c = max(limit_c, eff_floor)
                 limit_c = min(limit_c, yes_ask_c if entry_side == "yes" else no_ask_c)
 
-            if not _passes_bot_math_for_llm(
+            is_double_down = (
+                settings.trade_double_down_enabled
+                and entry_side == "yes"
+                and held > 0.5
+            )
+            passed_math = _passes_bot_math_for_llm(
                 settings,
                 fair_yes=verdict.fair_yes,
                 yes_bid_dollars=yes_bid_d,
@@ -700,7 +812,37 @@ def run_llm_opportunity_pipeline(
                 llm_decline_overridden=llm_decline_overridden,
                 adaptive_min_add=ad_min,
                 adaptive_mid_add=ad_mid,
-            ):
+                is_double_down=is_double_down,
+                spike_fade_spike_up=spike_up,
+            )
+            if not passed_math:
+                if (
+                    settings.trade_spike_fade_enabled
+                    and spike_up
+                    and entry_side == "yes"
+                    and _passes_bot_math_for_llm(
+                        settings,
+                        fair_yes=verdict.fair_yes,
+                        yes_bid_dollars=yes_bid_d,
+                        yes_ask_dollars=yes_ask_d,
+                        no_bid_dollars=no_bid_d,
+                        no_ask_dollars=no_ask_d,
+                        entry_side=entry_side,
+                        contracts=count,
+                        llm_decline_overridden=llm_decline_overridden,
+                        adaptive_min_add=ad_min,
+                        adaptive_mid_add=ad_mid,
+                        is_double_down=is_double_down,
+                        spike_fade_spike_up=False,
+                    )
+                ):
+                    stats.skip_spike_fade_weak_edge += 1
+                    log.info(
+                        "llm_trade_skip_spike_fade_weak_edge",
+                        ticker=ticker,
+                        fair_yes=verdict.fair_yes,
+                        yes_ask_dollars=yes_ask_d,
+                    )
                 stats.bot_math_rejected += 1
                 log.info(
                     "llm_trade_rejected_by_bot_math",
@@ -716,6 +858,7 @@ def run_llm_opportunity_pipeline(
                 action="buy",
                 count=count,
                 yes_price_cents=limit_c,
+                double_down=is_double_down,
             )
 
             if not execute:
@@ -740,6 +883,8 @@ def run_llm_opportunity_pipeline(
 
             trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
             stats.submitted += 1
+            if is_double_down:
+                stats.double_down_submitted += 1
         finally:
             maybe_clear_structured_log_after_tickers(
                 log_path=settings.structured_log_path,

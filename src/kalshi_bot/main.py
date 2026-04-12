@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import traceback
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,12 @@ from kalshi_bot.metrics import NO_GUARANTEE_DISCLAIMER, fee_slippage_sensitivity
 from kalshi_bot.scanner import format_scan_report, scan_kalshi_opportunities
 from kalshi_bot.paper_engine import PaperFillConfig
 from kalshi_bot.portfolio import fetch_portfolio_snapshot, print_portfolio_balance_line
+from kalshi_bot.position_watch import (
+    collect_position_watch_rows,
+    format_position_watch_lines,
+    rows_to_json,
+    run_position_watch_loop,
+)
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import SampleSpreadGapStrategy, make_bar_strategy_fn
 from kalshi_bot.discover_runner import run_discover_rule_pipeline
@@ -46,6 +53,7 @@ from kalshi_bot.bitcoin_runner import run_bitcoin_trade_pass
 from kalshi_bot.monitor import (
     heartbeat,
     record_portfolio_series_point,
+    record_trade_pass_summary,
     start_dashboard,
     start_portfolio_series_poller,
 )
@@ -58,10 +66,53 @@ def _client_for_balance(settings: Settings, dash_client: KalshiSdkClient | None)
     return dash_client if dash_client is not None else build_sdk_client(settings)
 
 
+def _record_trade_pass_for_dashboard(
+    *,
+    command: str,
+    iteration: int,
+    orders_submitted: int,
+    run_stats: Any,
+) -> None:
+    """Update in-process state served by GET /api/pass_summary (no HTML)."""
+    try:
+        stats = asdict(run_stats) if is_dataclass(run_stats) else {"repr": repr(run_stats)}
+    except Exception:
+        stats = {"error": "serialize_failed"}
+    record_trade_pass_summary(
+        command=command,
+        iteration=iteration,
+        orders_submitted=orders_submitted,
+        stats=stats,
+    )
+
+
+def _maybe_position_watch_before_auto_sell(settings: Settings, client: KalshiSdkClient, log: StructuredLogger) -> None:
+    """Same table as ``positions-watch`` (book + tape lean), printed before exit-scan — no extra terminal."""
+    if not settings.trade_position_watch_before_auto_sell:
+        return
+    try:
+        rows = collect_position_watch_rows(
+            client,
+            settings,
+            max_trades_per_ticker=max(50, int(settings.trade_exit_tape_lookback_max_trades)),
+            include_candles=False,
+            log=log,
+        )
+        if not rows:
+            return
+        print("--- position watch (before auto-sell) ---", flush=True)
+        for line in format_position_watch_lines(rows):
+            print(line, flush=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("position_watch_before_auto_sell_fail", error=str(exc))
+        print(f"position watch skipped: {exc}", flush=True)
+
+
 def _maybe_exit_scan_after_pass(settings: Settings, client: KalshiSdkClient, log: StructuredLogger) -> None:
     """After a trading pass summary, optionally scan all long YES and submit take-profit sells (TRADE_EXIT_*)."""
     if not settings.trade_auto_sell_after_each_pass:
         return
+    _maybe_position_watch_before_auto_sell(settings, client, log)
     try:
         n, lines = auto_sell_scan_all_long_yes(
             client, settings, cli_min_yes_bid_cents=None, log=log
@@ -100,7 +151,11 @@ def cmd_llm_trade(
         start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
-            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
         except Exception:
             pass
 
@@ -138,13 +193,23 @@ def cmd_llm_trade(
             summary_lines = run_stats.lines()
             for line in summary_lines:
                 print(line, flush=True)
+            _record_trade_pass_for_dashboard(
+                command="llm-trade",
+                iteration=iteration,
+                orders_submitted=n,
+                run_stats=run_stats,
+            )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
             _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
-                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                    record_portfolio_series_point(
+                        snap.balance_cents,
+                        snap.portfolio_value_cents,
+                        exposure_sum_cents=float(snap.total_exposure_cents),
+                    )
                 except Exception:
                     pass
             maybe_clear_structured_log_every_other_pass(
@@ -179,7 +244,11 @@ def cmd_discover_trade(
         start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
-            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
         except Exception:
             pass
 
@@ -206,13 +275,23 @@ def cmd_discover_trade(
             summary_lines = run_stats.lines()
             for line in summary_lines:
                 print(line, flush=True)
+            _record_trade_pass_for_dashboard(
+                command="discover-trade",
+                iteration=iteration,
+                orders_submitted=n,
+                run_stats=run_stats,
+            )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
             _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
-                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                    record_portfolio_series_point(
+                        snap.balance_cents,
+                        snap.portfolio_value_cents,
+                        exposure_sum_cents=float(snap.total_exposure_cents),
+                    )
                 except Exception:
                     pass
             maybe_clear_structured_log_every_other_pass(
@@ -251,7 +330,11 @@ def cmd_tape_trade(
         start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
-            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
         except Exception:
             pass
 
@@ -278,13 +361,23 @@ def cmd_tape_trade(
             summary_lines = run_stats.lines()
             for line in summary_lines:
                 print(line, flush=True)
+            _record_trade_pass_for_dashboard(
+                command="tape-trade",
+                iteration=iteration,
+                orders_submitted=n,
+                run_stats=run_stats,
+            )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
             _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
-                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                    record_portfolio_series_point(
+                        snap.balance_cents,
+                        snap.portfolio_value_cents,
+                        exposure_sum_cents=float(snap.total_exposure_cents),
+                    )
                 except Exception:
                     pass
             maybe_clear_structured_log_every_other_pass(
@@ -324,7 +417,11 @@ def cmd_bitcoin_trade(
         start_portfolio_series_poller(settings, dash_client)
         try:
             snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
-            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
         except Exception:
             pass
 
@@ -349,13 +446,23 @@ def cmd_bitcoin_trade(
             summary_lines = run_stats.lines()
             for line in summary_lines:
                 print(line, flush=True)
+            _record_trade_pass_for_dashboard(
+                command="bitcoin-trade",
+                iteration=iteration,
+                orders_submitted=n,
+                run_stats=run_stats,
+            )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
             _maybe_exit_scan_after_pass(settings, bal_client, log)
             if dash_client is not None:
                 try:
                     snap = fetch_portfolio_snapshot(dash_client, ticker=None)
-                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                    record_portfolio_series_point(
+                        snap.balance_cents,
+                        snap.portfolio_value_cents,
+                        exposure_sum_cents=float(snap.total_exposure_cents),
+                    )
                 except Exception:
                     pass
             maybe_clear_structured_log_every_other_pass(
@@ -470,6 +577,7 @@ def cmd_exit_scan(
             if loop:
                 print(f"--- exit-scan iteration {iteration} ---", flush=True)
             client = build_sdk_client(settings)
+            _maybe_position_watch_before_auto_sell(settings, client, log)
             rows = collect_exit_scan_rows(client, settings, cli_min_yes_bid_cents=min_yes_bid_cents, log=log)
             for line in format_exit_scan_summary(rows):
                 print(line, flush=True)
@@ -600,7 +708,11 @@ def cmd_run_bot(settings: Settings) -> None:
     if settings.dashboard_enabled:
         try:
             snap0 = fetch_portfolio_snapshot(client, ticker=settings.strategy_market_ticker)
-            record_portfolio_series_point(snap0.balance_cents, float(snap0.total_exposure_cents))
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
         except Exception:
             pass
 
@@ -612,9 +724,14 @@ def cmd_run_bot(settings: Settings) -> None:
                 risk.record_balance_sample(snap.balance_cents)
                 cancel_stale_orders(client, settings, log)
                 if settings.dashboard_enabled:
-                    record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                    record_portfolio_series_point(
+                        snap.balance_cents,
+                        snap.portfolio_value_cents,
+                        exposure_sum_cents=float(snap.total_exposure_cents),
+                    )
                     heartbeat(
-                        f"balance_cents={snap.balance_cents} exposure_cents={snap.total_exposure_cents:.0f}"
+                        f"balance_cents={snap.balance_cents} portfolio_value_cents={snap.portfolio_value_cents} "
+                        f"exposure_sum_cents={snap.total_exposure_cents:.0f}"
                     )
             except Exception as exc:  # noqa: BLE001
                 log.error("maintenance_loop_error", error=str(exc))
@@ -703,6 +820,45 @@ def cmd_sweep(settings: Settings, path: Path) -> None:
         print("---")
         print(r["params"])
         print(r["report"])
+
+
+def cmd_positions_watch(
+    settings: Settings,
+    *,
+    loop: bool,
+    interval_seconds: float,
+    json_mode: bool,
+    include_candles: bool,
+    max_trades_per_ticker: int,
+) -> None:
+    """Poll each long-YES: orderbook mid/spread, per-ticker public tape lean, optional candle drift."""
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    client = build_sdk_client(settings)
+    if loop:
+        try:
+            run_position_watch_loop(
+                client,
+                settings,
+                interval_seconds=max(5.0, float(interval_seconds)),
+                json_mode=json_mode,
+                include_candles=include_candles,
+                max_trades_per_ticker=max(10, int(max_trades_per_ticker)),
+            )
+        except KeyboardInterrupt:
+            print("\npositions-watch stopped.", file=sys.stderr)
+        return
+    rows = collect_position_watch_rows(
+        client,
+        settings,
+        max_trades_per_ticker=max(10, int(max_trades_per_ticker)),
+        include_candles=include_candles,
+    )
+    if json_mode:
+        print(rows_to_json(rows), flush=True)
+    else:
+        for line in format_position_watch_lines(rows):
+            print(line, flush=True)
 
 
 def cmd_walk_forward(settings: Settings, path: Path) -> None:
@@ -944,6 +1100,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between scans when --loop (default: 30; min 5)",
     )
 
+    pw = sub.add_parser(
+        "positions-watch",
+        help="Long YES only: per-ticker book, taker tape lean (YES vs NO), optional candle drift — read-only",
+    )
+    pw.add_argument(
+        "--loop",
+        action="store_true",
+        help="Refresh every --interval until Ctrl+C",
+    )
+    pw.add_argument(
+        "--interval",
+        type=float,
+        default=45.0,
+        metavar="SEC",
+        help="Seconds between refreshes when --loop (default: 45; min 5)",
+    )
+    pw.add_argument("--json", action="store_true", help="Print one JSON array per refresh (for scripts)")
+    pw.add_argument(
+        "--no-candles",
+        action="store_true",
+        help="Skip REST candlesticks (faster; tape + book only)",
+    )
+    pw.add_argument(
+        "--max-trades",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Max public prints per ticker for tape lean (default: 200)",
+    )
+
     run = sub.add_parser("run", help="Run strategy loop (default command); opens local monitor in browser")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--live", action="store_true")
@@ -960,6 +1146,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sens = sub.add_parser("sensitivity", help="Fee/slippage stress on JSONL")
     sens.add_argument("data", type=Path)
+
+    exx = sub.add_parser(
+        "exit-expectancy",
+        help="Break-even avg win vs your closes: parse auto_sell_profit_estimate from structured JSONL (fee-aware)",
+    )
+    exx.add_argument(
+        "--log",
+        type=Path,
+        default=None,
+        help="JSONL path (default: STRUCTURED_LOG_PATH or logs/kalshi_bot.jsonl)",
+    )
+    exx.add_argument(
+        "--max-lines",
+        type=int,
+        default=200_000,
+        help="Parse at most this many tail lines (default: 200000)",
+    )
 
     return p
 
@@ -1040,6 +1243,15 @@ def main(argv: list[str] | None = None) -> None:
                 count=args.count,
                 yes_price_cents=args.yes_price_cents,
             )
+        elif cmd == "positions-watch":
+            cmd_positions_watch(
+                settings,
+                loop=bool(getattr(args, "loop", False)),
+                interval_seconds=max(5.0, float(getattr(args, "interval", 45.0))),
+                json_mode=bool(getattr(args, "json", False)),
+                include_candles=not bool(getattr(args, "no_candles", False)),
+                max_trades_per_ticker=int(getattr(args, "max_trades", 200)),
+            )
         elif cmd == "exit-scan":
             cmd_exit_scan(
                 settings,
@@ -1071,6 +1283,15 @@ def main(argv: list[str] | None = None) -> None:
             cmd_walk_forward(settings, args.data)
         elif cmd == "sensitivity":
             cmd_sensitivity(settings, args.data)
+        elif cmd == "exit-expectancy":
+            from kalshi_bot.expectancy_report import run_expectancy_report
+
+            print(
+                run_expectancy_report(
+                    log_path=getattr(args, "log", None),
+                    max_lines=max(1000, int(getattr(args, "max_lines", 200_000))),
+                )
+            )
         else:
             raise AssertionError(cmd)
     except AuthError as e:

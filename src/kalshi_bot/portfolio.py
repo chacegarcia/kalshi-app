@@ -11,10 +11,13 @@ from kalshi_bot.client import KalshiSdkClient, with_rest_retry
 
 @dataclass
 class PortfolioSnapshot:
+    """``total_exposure_cents`` sums ``market_exposure_dollars`` (risk). ``portfolio_value_cents`` is MTM from balance API (app)."""
+
     positions_by_ticker: dict[str, float]
     resting_orders_by_ticker: dict[str, int]
     balance_cents: int | None
     total_exposure_cents: float
+    portfolio_value_cents: int | None
 
 
 def _position_contracts(market_positions: list[object]) -> dict[str, float]:
@@ -56,6 +59,12 @@ def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = No
     """Aggregate resting orders and positions. Exposure sums all markets (for risk cap)."""
     bal = client.portfolio.get_balance()
     balance_cents = getattr(bal, "balance", None)
+    portfolio_value_cents = getattr(bal, "portfolio_value", None)
+    if portfolio_value_cents is not None:
+        try:
+            portfolio_value_cents = int(portfolio_value_cents)
+        except (TypeError, ValueError):
+            portfolio_value_cents = None
 
     pos_resp = client.portfolio.get_positions(
         ticker=ticker,
@@ -85,6 +94,7 @@ def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = No
         resting_orders_by_ticker=resting_by,
         balance_cents=balance_cents,
         total_exposure_cents=exposure,
+        portfolio_value_cents=portfolio_value_cents,
     )
 
 
@@ -116,10 +126,23 @@ def print_portfolio_balance_line(client: KalshiSdkClient) -> None:
         snap = fetch_portfolio_snapshot(client, ticker=None)
         bal = snap.balance_cents
         exp = float(snap.total_exposure_cents)
+        pv = snap.portfolio_value_cents
         if bal is None:
-            print(f"Account: cash n/a · exposure ${exp / 100:.2f}", flush=True)
+            if pv is not None:
+                print(
+                    f"Account: cash n/a · positions (MTM) ${pv / 100:.2f} · exposure sum ${exp / 100:.2f}",
+                    flush=True,
+                )
+            else:
+                print(f"Account: cash n/a · exposure sum ${exp / 100:.2f}", flush=True)
         else:
-            print(f"Account: cash ${bal / 100:.2f} · exposure ${exp / 100:.2f}", flush=True)
+            if pv is not None:
+                print(
+                    f"Account: cash ${bal / 100:.2f} · positions (MTM) ${pv / 100:.2f} · exposure sum ${exp / 100:.2f}",
+                    flush=True,
+                )
+            else:
+                print(f"Account: cash ${bal / 100:.2f} · exposure sum ${exp / 100:.2f}", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"Account balance: (could not fetch: {exc})", flush=True)
 

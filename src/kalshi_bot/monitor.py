@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import threading
 import time
 import urllib.error
@@ -11,16 +13,20 @@ import webbrowser
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from kalshi_bot.client import KalshiSdkClient
-from kalshi_bot.config import Settings
+from kalshi_bot.config import Settings, project_root
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 
+_LOG = logging.getLogger(__name__)
 _LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
-# Time series for dashboard line chart (cash balance, exposure, total = cash + exposure)
+# Last trade-pass summary (JSON-safe dict) for GET /api/pass_summary — no HTML panel.
+_LAST_PASS_SUMMARY: dict[str, Any] = {}
+# Time series for dashboard line chart (cash, positions MTM from portfolio_value, total = cash + positions)
 _SERIES: deque[dict[str, Any]] = deque(maxlen=2000)
 # Closed-trade tally (auto-sell: estimated gross vs entry, or take-profit without basis)
 _WINS = 0
@@ -143,12 +149,51 @@ def win_loss_snapshot() -> dict[str, int]:
         return {"wins": _WINS, "losses": _LOSSES, "ties": _TIES}
 
 
-def record_portfolio_series_point(balance_cents: int | float | None, exposure_cents: float) -> None:
+def structured_log_path_for_dashboard() -> Path:
+    """Path to structured JSONL for GET /api/log_summary (``STRUCTURED_LOG_PATH`` or repo default)."""
+    raw = os.environ.get("STRUCTURED_LOG_PATH", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return project_root() / "logs" / "kalshi_bot.jsonl"
+
+
+def record_trade_pass_summary(
+    *,
+    command: str,
+    iteration: int,
+    orders_submitted: int,
+    stats: dict[str, Any],
+) -> None:
+    """Store last pipeline pass stats for ``GET /api/pass_summary`` (API/background only; no HTML card)."""
+    global _LAST_PASS_SUMMARY
+    row: dict[str, Any] = {
+        "updated_unix": time.time(),
+        "ts_iso": datetime.now(timezone.utc).isoformat(),
+        "command": command,
+        "iteration": iteration,
+        "orders_submitted": orders_submitted,
+        "stats": stats,
+    }
+    with _LOCK:
+        _LAST_PASS_SUMMARY = row
+    _LOG.debug(
+        "trade_pass_summary_recorded",
+        extra={"command": command, "iteration": iteration, "orders_submitted": orders_submitted},
+    )
+
+
+def record_portfolio_series_point(
+    balance_cents: int | float | None,
+    positions_value_cents: int | float | None,
+    *,
+    exposure_sum_cents: float | None = None,
+) -> None:
     """Append one point for the live line chart (thread-safe).
 
-    ``total_account_cents`` is cash plus rounded exposure when cash is known; otherwise omitted.
+    ``positions_value_cents`` should be Kalshi's balance API ``portfolio_value`` (mark-to-market positions),
+    which matches the mobile app. If omitted, falls back to ``exposure_sum_cents`` (sum of per-market
+    ``market_exposure_dollars``). ``total_account_cents`` is cash plus rounded positions value when cash is known.
     """
-    exposure_f = float(exposure_cents)
     balance_known = balance_cents is not None
     bal = 0
     if balance_known:
@@ -157,15 +202,27 @@ def record_portfolio_series_point(balance_cents: int | float | None, exposure_ce
         except (TypeError, ValueError):
             bal = 0
             balance_known = False
+
+    if positions_value_cents is not None:
+        display_pv = float(positions_value_cents)
+    elif exposure_sum_cents is not None:
+        display_pv = float(exposure_sum_cents)
+    else:
+        display_pv = 0.0
+
     total_cents: int | None = None
     if balance_known:
-        total_cents = bal + int(round(exposure_f))
+        total_cents = bal + int(round(display_pv))
     row: dict[str, Any] = {
         "unix": time.time(),
         "ts_iso": datetime.now(timezone.utc).isoformat(),
         "balance_cents": bal,
         "balance_known": balance_known,
-        "exposure_cents": exposure_f,
+        "positions_value_cents": float(positions_value_cents)
+        if positions_value_cents is not None
+        else None,
+        "exposure_sum_cents": float(exposure_sum_cents) if exposure_sum_cents is not None else None,
+        "exposure_cents": display_pv,
     }
     if total_cents is not None:
         row["total_account_cents"] = total_cents
@@ -203,7 +260,45 @@ _HTML = """<!DOCTYPE html>
   <style>
     :root { --bg:#0f1419; --card:#1a2332; --text:#e7ecf3; --muted:#8b9aab; --ok:#3ecf8e; --warn:#f5a623; --err:#f25151; }
     * { box-sizing: border-box; }
-    body { font-family: ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); margin:0; padding:1rem 1.25rem 2rem; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); margin:0; padding:0; display: flex; min-height: 100vh; align-items: stretch; }
+    .main-wrap { flex: 1; padding: 1rem 1.25rem 2rem; min-width: 0; }
+    .sidebar {
+      width: 320px; flex-shrink: 0; background: #151b26; border-right: 1px solid #2a3544;
+      display: flex; flex-direction: column; transition: margin-left 0.2s ease, width 0.2s ease;
+    }
+    .sidebar.collapsed { width: 0; margin-left: -320px; overflow: hidden; border: none; }
+    .sidebar__head { display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1rem; border-bottom: 1px solid #2a3544; }
+    .sidebar__head button { background: #243044; border: none; color: var(--text); padding: 0.35rem 0.55rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+    .sidebar__head button:hover { background: #2d3d52; }
+    .sidebar__body { padding: 0.75rem 1rem 1.25rem; overflow: auto; flex: 1; }
+    .sidebar__hint { font-size: 0.75rem; color: var(--muted); margin: 0 0 0.75rem; line-height: 1.4; }
+    .sidebar__hint code { font-size: 0.7rem; }
+    .sidebar label { display: block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 0.35rem; }
+    .seg { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.75rem; }
+    .seg button {
+      flex: 1; min-width: 3.2rem; padding: 0.45rem 0.35rem; border-radius: 6px; border: 1px solid #2a3544;
+      background: #1e2838; color: var(--text); cursor: pointer; font-weight: 600; font-size: 0.85rem;
+    }
+    .seg button:hover { background: #243044; }
+    .seg button.active { border-color: #6eb5ff; background: rgba(110,181,255,0.15); color: #b8d9ff; }
+    .sidebar__stat { font-size: 0.8rem; margin: 0 0 1rem; color: var(--muted); }
+    .sidebar__pre { font-size: 0.65rem; color: #a8b4c5; background: #0b0e14; padding: 0.5rem; border-radius: 6px; max-height: 10rem; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+    .open-pos { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid #2a3544; }
+    .open-pos h3 { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 0.45rem; font-weight: 600; }
+    .mini-pos { border-radius: 8px; border: 1px solid #2a3544; background: #0b0e14; padding: 0.5rem 0.55rem; margin-bottom: 0.45rem; font-size: 0.78rem; }
+    .mini-pos__title { font-size: 0.72rem; color: var(--text); line-height: 1.3; margin-bottom: 0.3rem; word-break: break-word; }
+    .mini-pos__ticker { font-family: ui-monospace, monospace; font-size: 0.65rem; color: #8b9aab; margin-bottom: 0.25rem; }
+    .mini-pos__row { display: flex; justify-content: space-between; gap: 0.5rem; color: #a8b4c5; font-variant-numeric: tabular-nums; font-size: 0.72rem; }
+    .mini-pos__actions { display: flex; gap: 0.35rem; margin-top: 0.4rem; }
+    .mini-pos__actions button {
+      flex: 1; font-size: 0.7rem; padding: 0.32rem 0.2rem; border-radius: 5px; border: 1px solid #2a3544;
+      background: #1e2838; color: var(--text); cursor: pointer; font-weight: 600;
+    }
+    .mini-pos__actions button:hover:not(:disabled) { background: #243044; }
+    .mini-pos__actions button.dd { border-color: rgba(110,181,255,0.35); }
+    .mini-pos__actions button.sell { border-color: rgba(245,166,35,0.4); }
+    .mini-pos__actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #posStatus { font-size: 0.68rem; color: var(--muted); margin: 0 0 0.4rem; min-height: 1.1em; line-height: 1.35; }
     h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
     p.sub { color: var(--muted); font-size: 0.875rem; margin: 0 0 1rem; }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.75rem; color: #c5d0dc; }
@@ -239,6 +334,11 @@ _HTML = """<!DOCTYPE html>
       text-transform: uppercase; letter-spacing: 0.04em;
       padding: 0.2rem 0.45rem; border-radius: 4px; background: #243044; color: #b8c5d6;
     }
+    .trade-card__badge--cat {
+      text-transform: none; letter-spacing: 0.02em; background: #2a2438; color: #d4c4f7;
+      font-weight: 500; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .trade-card__shares { font-size: 1rem; font-weight: 600; color: #e7ecf3; margin: 0 0 0.35rem; font-variant-numeric: tabular-nums; }
     .trade-card__market { font-size: 0.9rem; color: var(--text); line-height: 1.35; margin-bottom: 0.35rem; }
     .trade-card__meta { font-size: 0.8rem; color: #a8b4c5; display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; }
     .trade-card__meta span { font-variant-numeric: tabular-nums; }
@@ -250,28 +350,62 @@ _HTML = """<!DOCTYPE html>
     .trade-card__pl--zero { color: var(--muted); }
     .trade-card__detail { margin-top: 0.5rem; font-size: 0.7rem; color: var(--muted); max-height: 5rem; overflow: auto; }
     .trade-card__detail pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+    @media (max-width: 900px) {
+      body { flex-direction: column; }
+      .sidebar { width: 100%; border-right: none; border-bottom: 1px solid #2a3544; max-height: 50vh; }
+      .sidebar.collapsed { max-height: 0; margin-left: 0; width: 100%; padding: 0; border: none; }
+    }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar__head">
+      <button type="button" id="sidebarToggle" title="Collapse sidebar">☰</button>
+      <strong>Controller</strong>
+    </div>
+    <div class="sidebar__body">
+      <p class="sidebar__hint">Live controls apply to <strong>this</strong> process only (run with <code>--web</code>). Restart the bot to pick up <code>.env</code> edits.</p>
+      <label>Buy size multiplier</label>
+      <div class="seg" id="multSeg" role="group" aria-label="Order size multiplier">
+        <button type="button" data-m="1">1×</button>
+        <button type="button" data-m="2">2×</button>
+        <button type="button" data-m="5">5×</button>
+        <button type="button" data-m="10">10×</button>
+      </div>
+      <p class="sidebar__stat">Active: <strong id="multActive">1×</strong> · base contracts from strategy × multiplier (caps still apply).</p>
+      <label>Settings snapshot</label>
+      <pre id="settingsSnap" class="sidebar__pre">Loading…</pre>
+      <div class="open-pos">
+        <h3>Open positions</h3>
+        <p class="sidebar__hint" style="margin:0 0 0.35rem;">Entry from manual override or portfolio estimate. Bid / lift ask from the book. Buttons only work from <strong>this machine</strong> (localhost).</p>
+        <p id="posStatus"></p>
+        <div id="openPositions">Loading…</div>
+      </div>
+    </div>
+  </aside>
+  <div class="main-wrap">
+  <main class="main">
   <h1>Kalshi bot — trading monitor</h1>
-  <p class="sub">YES positions as <strong>shares</strong> (Kalshi contracts) at an implied <strong>share price</strong> in ¢. Live feed of orders and blocks; chart polls every 2s when the bot records balance/exposure snapshots.</p>
+  <p class="sub">YES positions as <strong>shares</strong> (Kalshi contracts) at an implied <strong>share price</strong> in ¢. Live feed of orders and blocks. Cash / positions / total use Kalshi&rsquo;s balance API (<strong>portfolio_value</strong> for mark-to-market positions — same notion as the app), not the sum of per-market <code>market_exposure</code> fields.</p>
   <div class="status" id="status">Loading…</div>
   <div class="status" id="wlBanner">W–L <strong id="wlStat">0–0</strong> <span class="muted" id="wlTies"></span> <span class="muted">(auto-sell / exit-scan; P/L from entry estimate when available; separate CLI posts to this page)</span></div>
   <div class="balance-banner" id="balanceBanner" style="display:none;">
     <span><strong>Cash</strong> <span id="balCash">—</span></span>
-    <span><strong>Exposure</strong> <span id="balExp">—</span></span>
-    <span><strong>Total</strong> <span id="balTotal">—</span></span>
+    <span title="portfolio_value from GET /portfolio/balance (MTM; matches Kalshi app)"><strong>Positions</strong> <span id="balExp">—</span></span>
+    <span title="portfolio_value + cash (when both known)"><strong>Total</strong> <span id="balTotal">—</span></span>
     <span class="muted" id="balTs"></span>
   </div>
   <div class="chart-wrap">
-    <h2>Cash, exposure &amp; total account (USD)</h2>
+    <h2>Cash, positions value (MTM) &amp; total account (USD)</h2>
     <canvas id="seriesChart" width="800" height="220"></canvas>
   </div>
   <div class="chart-wrap">
     <h2>Trades &amp; orders</h2>
     <p class="sub" style="margin:0 0 0.75rem;">Exit P/L uses green / red hues. Buys (dry-run / live submit) use a blue accent. Expand <strong>Raw JSON</strong> for the full payload.</p>
     <div class="trade-feed" id="tradeFeed"></div>
+  </div>
+  </main>
   </div>
   <script>
     let seriesChart = null;
@@ -310,6 +444,14 @@ _HTML = """<!DOCTYPE html>
         badge.textContent = (k || 'event').replace(/_/g, ' ');
         head.appendChild(tm);
         head.appendChild(badge);
+        const catStr = (ev.market_category || '').trim();
+        if (catStr) {
+          const catBadge = document.createElement('span');
+          catBadge.className = 'trade-card__badge trade-card__badge--cat';
+          catBadge.title = 'Kalshi event category';
+          catBadge.textContent = catStr;
+          head.appendChild(catBadge);
+        }
         card.appendChild(head);
 
         const market = document.createElement('div');
@@ -318,15 +460,22 @@ _HTML = """<!DOCTYPE html>
         market.textContent = title || (ticker ? '— ' + ticker : '—');
         card.appendChild(market);
 
+        const cntRaw = ev.order_contracts != null && ev.order_contracts !== '' ? ev.order_contracts
+          : (ev.count != null && ev.count !== '' ? ev.count : (ev.shares != null && ev.shares !== '' ? ev.shares : intent.count));
+        if (cntRaw != null && cntRaw !== '' && !isNaN(Number(cntRaw))) {
+          const shr = document.createElement('div');
+          shr.className = 'trade-card__shares';
+          shr.textContent = Number(cntRaw) + ' shares';
+          card.appendChild(shr);
+        }
+
         const meta = document.createElement('div');
         meta.className = 'trade-card__meta';
         const bits = [];
         if (ticker) bits.push('Ticker ' + ticker);
-        const cnt = ev.count != null ? ev.count : intent.count;
         const yp = ev.yes_price_cents != null ? ev.yes_price_cents : intent.yes_price_cents;
         const lim = ev.limit_yes_price_cents;
         const price = lim != null ? lim : yp;
-        if (cnt != null) bits.push(cnt + ' sh');
         if (price != null) bits.push('@ ' + price + '¢ YES');
         if (intent.side && intent.action) bits.push(intent.side + ' ' + intent.action);
         if (ev.entry_yes_cents != null) bits.push('entry ~' + ev.entry_yes_cents + '¢');
@@ -370,7 +519,10 @@ _HTML = """<!DOCTYPE html>
         return t.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       });
       const bal = points.map(p => dollarsFromCents(p.balance_cents));
-      const exp = points.map(p => dollarsFromCents(p.exposure_cents));
+      const exp = points.map(p => {
+        const pv = p.positions_value_cents != null && p.positions_value_cents !== '' ? p.positions_value_cents : p.exposure_cents;
+        return dollarsFromCents(pv);
+      });
       const total = points.map(p => (p.total_account_cents != null ? dollarsFromCents(p.total_account_cents) : null));
       const ctx = document.getElementById('seriesChart');
       if (!seriesChart) {
@@ -380,8 +532,8 @@ _HTML = """<!DOCTYPE html>
             labels,
             datasets: [
               { label: 'Cash', data: bal, borderColor: '#3ecf8e', backgroundColor: 'rgba(62,207,142,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
-              { label: 'Exposure', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
-              { label: 'Total (cash + exposure)', data: total, borderColor: '#f5a623', backgroundColor: 'rgba(245,166,35,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false }
+              { label: 'Positions value (MTM)', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
+              { label: 'Total (cash + positions)', data: total, borderColor: '#f5a623', backgroundColor: 'rgba(245,166,35,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false }
             ]
           },
           options: {
@@ -435,7 +587,8 @@ _HTML = """<!DOCTYPE html>
           const totalEl = document.getElementById('balTotal');
           const tsEl = document.getElementById('balTs');
           const banner = document.getElementById('balanceBanner');
-          const exp = dollarsFromCents(last.exposure_cents);
+          const pvRaw = last.positions_value_cents != null && last.positions_value_cents !== '' ? last.positions_value_cents : last.exposure_cents;
+          const exp = dollarsFromCents(pvRaw);
           expEl.textContent = '$' + exp.toFixed(2);
           if (last.balance_known === false) {
             cashEl.textContent = 'n/a';
@@ -462,8 +615,136 @@ _HTML = """<!DOCTYPE html>
         }
       }
     }
+    document.getElementById('sidebarToggle').addEventListener('click', function() {
+      document.getElementById('sidebar').classList.toggle('collapsed');
+    });
+    function renderOpenPositions(data) {
+      const wrap = document.getElementById('openPositions');
+      const st = document.getElementById('posStatus');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      if (data && data.error) {
+        if (st) st.textContent = String(data.error);
+      } else if (st) { st.textContent = ''; }
+      const pos = (data && data.positions) ? data.positions : [];
+      const ddGlob = data && data.double_down_enabled;
+      const mult = Math.max(1, Number(data && data.order_size_multiplier) || 1);
+      if (!pos.length) {
+        const p = document.createElement('p');
+        p.className = 'sidebar__hint';
+        p.style.margin = '0';
+        p.textContent = (data && data.error) ? '' : 'No long YES positions.';
+        wrap.appendChild(p);
+        return;
+      }
+      for (const row of pos) {
+        const card = document.createElement('div');
+        card.className = 'mini-pos';
+        const title = document.createElement('div');
+        title.className = 'mini-pos__title';
+        title.textContent = (row.market_title || '').trim() || row.ticker || '—';
+        const tk = document.createElement('div');
+        tk.className = 'mini-pos__ticker';
+        tk.textContent = row.ticker || '';
+        const r1 = document.createElement('div');
+        r1.className = 'mini-pos__row';
+        const e = row.entry_yes_cents != null ? row.entry_yes_cents + '¢' : '—';
+        const bid = row.best_yes_bid_cents != null ? row.best_yes_bid_cents + '¢' : '—';
+        const ask = row.lift_yes_ask_cents != null ? row.lift_yes_ask_cents + '¢' : '—';
+        const sp1 = document.createElement('span');
+        sp1.textContent = 'Entry ~' + e;
+        const sp2 = document.createElement('span');
+        sp2.textContent = 'Bid ' + bid + ' · Ask ' + ask;
+        r1.appendChild(sp1);
+        r1.appendChild(sp2);
+        const actions = document.createElement('div');
+        actions.className = 'mini-pos__actions';
+        const bSell = document.createElement('button');
+        bSell.type = 'button';
+        bSell.className = 'sell';
+        bSell.textContent = 'Sell';
+        bSell.addEventListener('click', function() { positionAction(row.ticker, 'sell'); });
+        const bDd = document.createElement('button');
+        bDd.type = 'button';
+        bDd.className = 'dd';
+        bDd.textContent = 'Double down';
+        const room = Number(row.double_down_room) || 0;
+        const ddOk = ddGlob && room >= mult;
+        bDd.disabled = !ddOk;
+        bDd.title = !ddGlob ? 'TRADE_DOUBLE_DOWN_ENABLED=false' : (room < mult ? 'Need headroom ≥ buy multiplier (room ' + room + ' < ' + mult + '×)' : '');
+        bDd.addEventListener('click', function() { positionAction(row.ticker, 'double_down'); });
+        actions.appendChild(bSell);
+        actions.appendChild(bDd);
+        card.appendChild(title);
+        card.appendChild(tk);
+        card.appendChild(r1);
+        card.appendChild(actions);
+        wrap.appendChild(card);
+      }
+    }
+    async function refreshPositions() {
+      try {
+        const r = await fetch('/api/positions', { cache: 'no-store' });
+        const data = await r.json();
+        renderOpenPositions(data);
+      } catch (e) {
+        renderOpenPositions({ positions: [], error: 'Could not load positions (is the bot running?)' });
+      }
+    }
+    async function positionAction(ticker, action) {
+      const st = document.getElementById('posStatus');
+      if (st) st.textContent = 'Submitting…';
+      try {
+        const r = await fetch('/api/positions/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker: ticker, action: action }),
+        });
+        const j = await r.json().catch(function() { return {}; });
+        if (!r.ok || !j.ok) {
+          if (st) st.textContent = (j && j.error) ? String(j.error) : ('HTTP ' + r.status);
+          return;
+        }
+        if (st) st.textContent = j.detail ? String(j.detail) : 'OK';
+        await refreshPositions();
+      } catch (e) {
+        if (st) st.textContent = 'Network error';
+      }
+    }
+    async function refreshControl() {
+      try {
+        const r = await fetch('/api/control', { cache: 'no-store' });
+        const d = await r.json();
+        const m = Number(d.order_size_multiplier) || 1;
+        document.getElementById('multActive').textContent = m + '×';
+        document.querySelectorAll('#multSeg button').forEach(function(btn) {
+          btn.classList.toggle('active', Number(btn.getAttribute('data-m')) === m);
+        });
+        const snap = d.settings_snapshot || {};
+        document.getElementById('settingsSnap').textContent = JSON.stringify(snap, null, 2);
+      } catch (e) {
+        document.getElementById('settingsSnap').textContent = '(could not load /api/control)';
+      }
+    }
+    document.querySelectorAll('#multSeg button').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        const m = Number(btn.getAttribute('data-m')) || 1;
+        try {
+          const r = await fetch('/api/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ order_size_multiplier: m }),
+          });
+          if (r.ok) await refreshControl();
+        } catch (e) { /* ignore */ }
+      });
+    });
     poll();
+    refreshControl();
+    refreshPositions();
     setInterval(poll, 2000);
+    setInterval(refreshControl, 8000);
+    setInterval(refreshPositions, 4000);
   </script>
 </body>
 </html>"""
@@ -518,6 +799,221 @@ def _create_app() -> Any:
     def api_stats() -> Any:
         return jsonify(win_loss_snapshot())
 
+    @app.get("/api/log_summary")
+    def api_log_summary() -> Any:
+        """Structured JSONL tail stats for scripts / old clients — not rendered on the dashboard page."""
+        path = structured_log_path_for_dashboard()
+        payload = aggregate_structured_log_tail(path)
+        _LOG.debug("log_summary_served", extra={"log_path": str(path)})
+        return jsonify(payload)
+
+    @app.get("/api/pass_summary")
+    def api_pass_summary() -> Any:
+        """Last llm/discover/tape/bitcoin pass counters — updated by CLI; not rendered on the dashboard page."""
+        with _LOCK:
+            body = dict(_LAST_PASS_SUMMARY) if _LAST_PASS_SUMMARY else {}
+        _LOG.debug("pass_summary_served", extra={"has_data": bool(body)})
+        return jsonify(body)
+
+    def _request_localhost() -> bool:
+        return request.environ.get("REMOTE_ADDR", "") in ("127.0.0.1", "::1")
+
+    @app.get("/api/control")
+    def api_control_get() -> Any:
+        """Live session controls + read-only settings snapshot (same process as ``--web``)."""
+        from kalshi_bot.config import get_settings
+        from kalshi_bot.runtime_controls import get_order_size_multiplier
+
+        s = get_settings()
+        snap = {
+            "trade_min_net_edge_after_fees": s.trade_min_net_edge_after_fees,
+            "trade_double_down_enabled": s.trade_double_down_enabled,
+            "trade_spike_fade_enabled": s.trade_spike_fade_enabled,
+            "trade_llm_auto_execute": s.trade_llm_auto_execute,
+            "dry_run": s.dry_run,
+            "live_trading": s.live_trading,
+            "max_contracts_per_market": s.max_contracts_per_market,
+            "strategy_order_count": s.strategy_order_count,
+            "kalshi_env": s.kalshi_env,
+        }
+        return jsonify(
+            {
+                "order_size_multiplier": get_order_size_multiplier(),
+                "settings_snapshot": snap,
+                "note": "Multiplier applies to buy contract count before risk/notional caps. Edit .env and restart for other changes.",
+            }
+        )
+
+    @app.post("/api/control")
+    def api_control_post() -> Any:
+        """Set ``order_size_multiplier`` (1, 2, 5, or 10). Localhost only."""
+        if not _request_localhost():
+            return jsonify({"ok": False, "error": "forbidden"}), 403
+        from kalshi_bot.runtime_controls import set_order_size_multiplier
+
+        data = request.get_json(force=True, silent=True) or {}
+        raw = data.get("order_size_multiplier", 1)
+        try:
+            m = int(raw)
+        except (TypeError, ValueError):
+            m = 1
+        v = set_order_size_multiplier(m)
+        _LOG.info("dashboard_control_multiplier", order_size_multiplier=v)
+        return jsonify({"ok": True, "order_size_multiplier": v})
+
+    @app.get("/api/positions")
+    def api_positions() -> Any:
+        """Long YES positions with entry estimate and best bid (read-only). Uses same entry logic as auto-sell."""
+        from kalshi_bot.auto_sell import _resolve_entry_reference
+        from kalshi_bot.config import get_settings
+        from kalshi_bot.logger import get_logger
+        from kalshi_bot.market_data import (
+            best_yes_bid_cents,
+            get_orderbook,
+            lift_yes_ask_cents_from_orderbook,
+            market_title_for_ticker,
+        )
+        from kalshi_bot.runtime_controls import get_order_size_multiplier
+        from kalshi_bot.trading import build_sdk_client
+
+        try:
+            settings = get_settings()
+            client = build_sdk_client(settings)
+            log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+            odm = max(1, int(get_order_size_multiplier()))
+            snap = fetch_portfolio_snapshot(client, ticker=None)
+            positions: list[dict[str, Any]] = []
+            for ticker in sorted(t for t, s in snap.positions_by_ticker.items() if float(s) > 0):
+                signed = float(snap.positions_by_ticker.get(ticker, 0.0))
+                entry_ref = _resolve_entry_reference(settings, client, ticker, log)
+                ob = get_orderbook(client, ticker)
+                bid = best_yes_bid_cents(ob)
+                lift = lift_yes_ask_cents_from_orderbook(ob)
+                held = int(round(signed))
+                max_pos = int(settings.trade_double_down_max_position_contracts)
+                room = max(0, max_pos - held)
+                positions.append(
+                    {
+                        "ticker": ticker,
+                        "shares": signed,
+                        "entry_yes_cents": entry_ref.cents,
+                        "entry_source": entry_ref.source,
+                        "best_yes_bid_cents": bid,
+                        "lift_yes_ask_cents": lift,
+                        "market_title": market_title_for_ticker(client, ticker) or "",
+                        "double_down_room": room,
+                    }
+                )
+            return jsonify(
+                {
+                    "positions": positions,
+                    "double_down_enabled": bool(settings.trade_double_down_enabled),
+                    "order_size_multiplier": odm,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("api_positions_failed", error=str(exc))
+            return jsonify(
+                {
+                    "positions": [],
+                    "double_down_enabled": False,
+                    "order_size_multiplier": 1,
+                    "error": str(exc),
+                }
+            )
+
+    @app.post("/api/positions/action")
+    def api_positions_action() -> Any:
+        """Sell all long YES at best bid (minus aggression) or double-down buy at lift YES ask. Localhost only."""
+        if not _request_localhost():
+            return jsonify({"ok": False, "error": "forbidden"}), 403
+        from kalshi_bot.config import get_settings
+        from kalshi_bot.execution import DryRunLedger
+        from kalshi_bot.logger import get_logger
+        from kalshi_bot.market_data import best_yes_bid_cents, get_orderbook, lift_yes_ask_cents_from_orderbook
+        from kalshi_bot.risk import RiskManager
+        from kalshi_bot.runtime_controls import get_order_size_multiplier
+        from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
+
+        data = request.get_json(force=True, silent=True) or {}
+        ticker = str(data.get("ticker") or "").strip()
+        action = str(data.get("action") or "").strip().lower()
+        if not ticker or action not in ("sell", "double_down"):
+            return jsonify({"ok": False, "error": "bad_request"}), 400
+
+        settings = get_settings()
+        log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+        client = build_sdk_client(settings)
+        risk = RiskManager(settings)
+        ledger = DryRunLedger()
+
+        snap = fetch_portfolio_snapshot(client, ticker=ticker)
+        signed = float(snap.positions_by_ticker.get(ticker, 0.0))
+        if signed <= 0:
+            return jsonify({"ok": False, "error": "no_long_yes"}), 400
+
+        try:
+            if action == "sell":
+                cnt = int(round(signed))
+                if cnt < 1:
+                    return jsonify({"ok": False, "error": "zero_contracts"}), 400
+                ob = get_orderbook(client, ticker)
+                best = best_yes_bid_cents(ob)
+                if best is None:
+                    return jsonify({"ok": False, "error": "no_yes_bids"}), 400
+                limit_cents = max(1, int(best) - int(settings.trade_exit_sell_aggression_cents))
+                tif = settings.trade_exit_sell_time_in_force
+                intent = make_limit_intent(
+                    ticker=ticker,
+                    side="yes",
+                    action="sell",
+                    count=cnt,
+                    yes_price_cents=limit_cents,
+                    time_in_force=tif,
+                )
+                trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+                detail = f"sell {cnt} YES @ {limit_cents}¢ ({'dry-run' if settings.dry_run else 'live'})"
+                _LOG.info("dashboard_position_sell", ticker=ticker, count=cnt, limit_yes_price_cents=limit_cents)
+                return jsonify({"ok": True, "action": "sell", "detail": detail})
+
+            if not settings.trade_double_down_enabled:
+                return jsonify({"ok": False, "error": "double_down_disabled"}), 400
+            ob = get_orderbook(client, ticker)
+            lift = lift_yes_ask_cents_from_orderbook(ob)
+            if lift is None:
+                return jsonify({"ok": False, "error": "no_lift_yes_ask"}), 400
+            held = int(round(signed))
+            mult = max(1, int(get_order_size_multiplier()))
+            room = max(0, int(settings.trade_double_down_max_position_contracts) - held)
+            # execute_intent multiplies buy count by mult afterward — cap pre-mult contracts so we stay within room.
+            max_pre_mult = room // mult
+            if max_pre_mult < 1:
+                return jsonify({"ok": False, "error": "at_max_position"}), 400
+            count = min(int(settings.strategy_order_count), max_pre_mult)
+            if count < 1:
+                return jsonify({"ok": False, "error": "at_max_position"}), 400
+            intent = make_limit_intent(
+                ticker=ticker,
+                side="yes",
+                action="buy",
+                count=count,
+                yes_price_cents=int(lift),
+                time_in_force="good_till_canceled",
+                double_down=True,
+            )
+            trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+            detail = f"buy {count} YES @ {lift}¢ double-down ({'dry-run' if settings.dry_run else 'live'})"
+            _LOG.info(
+                "dashboard_position_double_down",
+                ticker=ticker,
+                count=count,
+                yes_price_cents=lift,
+            )
+            return jsonify({"ok": True, "action": "double_down", "detail": detail})
+        except Exception as exc:  # noqa: BLE001
+            _LOG.exception("api_positions_action_failed", ticker=ticker, action=action)
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
     return app
 
 
@@ -555,7 +1051,11 @@ def start_portfolio_series_poller(settings: Settings, client: KalshiSdkClient) -
             time.sleep(interval)
             try:
                 snap = fetch_portfolio_snapshot(client, ticker=None)
-                record_portfolio_series_point(snap.balance_cents, float(snap.total_exposure_cents))
+                record_portfolio_series_point(
+                    snap.balance_cents,
+                    snap.portfolio_value_cents,
+                    exposure_sum_cents=float(snap.total_exposure_cents),
+                )
             except Exception:
                 pass
 

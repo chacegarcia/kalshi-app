@@ -7,6 +7,7 @@ from typing import Callable, TypeVar
 from kalshi_python_sync import (
     ApiClient,
     Configuration,
+    EventsApi,
     KalshiAuth,
     MarketApi,
     OrdersApi,
@@ -33,6 +34,7 @@ class KalshiSdkClient:
         self.markets = MarketApi(self._api_client)
         self.orders = OrdersApi(self._api_client)
         self.portfolio = PortfolioApi(self._api_client)
+        self.events = EventsApi(self._api_client)
 
 
 def with_rest_retry(fn: Callable[..., T]) -> Callable[..., T]:

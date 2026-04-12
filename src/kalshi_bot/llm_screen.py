@@ -170,6 +170,8 @@ def llm_evaluate_opportunity(
     no_bid_dollars: float | None = None,
     no_ask_dollars: float | None = None,
     entry_side: Literal["yes", "no"] = "yes",
+    existing_long_yes_shares: float = 0.0,
+    recent_yes_spike_up: bool = False,
 ) -> LLMOpportunityVerdict | None:
     """Ask the model to reason about a market; output must be JSON with ``shares`` (or legacy ``contracts``).
 
@@ -250,8 +252,26 @@ def llm_evaluate_opportunity(
             "Estimate fair_yes as usual; fee-aware checks use fair_no = 1 − fair_yes vs the NO ask.\n"
         )
 
+    dd_block = ""
+    if existing_long_yes_shares > 0.5 and entry_side == "yes":
+        dd_block = (
+            f"\n**Existing position:** ~{existing_long_yes_shares:.0f} YES share(s) already held in this market. "
+            f"You may approve adding up to {max_contracts_allowed} more share(s) on this order **only** if fee-adjusted "
+            "edge vs the ask is still clearly favorable — otherwise set approve=false.\n"
+        )
+
+    spike_block = ""
+    if entry_side == "yes" and recent_yes_spike_up and settings.trade_spike_fade_enabled:
+        huge = settings.trade_spike_fade_huge_net_edge_after_fees
+        extra = settings.trade_spike_fade_extra_min_net_edge_after_fees
+        spike_block = (
+            f"\n**Spike fade (chart):** YES trade price rose sharply in recent candles — avoid **chasing** unless you "
+            f"believe fair_yes exceeds the ask by a **large** margin. The bot adds +{extra:.3f} to the usual min net edge "
+            f"unless fee-adjusted net edge per share is already ≥ {huge:.3f} (on the $1 face).\n"
+        )
+
     user = f"""{ticker} | {title}
-YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).{no_line}{side_note}
+{dd_block}{spike_block}YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).{no_line}{side_note}
 {flow_block}{perf_block}{params}
 {style_block}{odds_block}JSON only:
 {{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"shares":1-{max_contracts_allowed},"reason":"brief"}}

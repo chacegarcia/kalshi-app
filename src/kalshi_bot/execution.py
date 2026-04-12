@@ -12,7 +12,7 @@ from kalshi_python_sync.models.order import Order
 from kalshi_bot.client import KalshiSdkClient, with_rest_retry
 from kalshi_bot.config import Settings
 from kalshi_bot.logger import StructuredLogger
-from kalshi_bot.market_data import market_title_for_ticker
+from kalshi_bot.market_data import market_category_for_ticker, market_title_for_ticker
 from kalshi_bot.monitor import record_event
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
@@ -24,6 +24,7 @@ from kalshi_bot.sizing import (
     next_buy_yes_notional_min_max,
     parse_notional_sweep_usd,
 )
+from kalshi_bot.runtime_controls import get_order_size_multiplier
 from kalshi_bot.strategy import TradeIntent, projected_abs_position_after
 
 
@@ -150,7 +151,19 @@ def execute_intent(
     ledger: DryRunLedger | None = None,
 ) -> None:
     """Risk-check then either simulate or place a real order."""
+    if intent.action == "buy" and intent.side in ("yes", "no"):
+        mult = get_order_size_multiplier()
+        if mult > 1:
+            new_c = max(1, int(intent.count) * mult)
+            intent = replace(intent, count=new_c)
+            log.info(
+                "order_size_multiplier_applied",
+                multiplier=mult,
+                count_after=intent.count,
+                ticker=intent.ticker,
+            )
     market_title = market_title_for_ticker(client, intent.ticker)
+    market_category = market_category_for_ticker(client, intent.ticker)
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
 
@@ -181,6 +194,15 @@ def execute_intent(
     max_c = effective_max_contracts(
         settings, balance_cents=snap.balance_cents, yes_price_cents=intent.yes_price_cents
     )
+    if (
+        intent.action == "buy"
+        and intent.side == "yes"
+        and getattr(intent, "double_down", False)
+        and settings.trade_double_down_enabled
+    ):
+        signed = float(snap.positions_by_ticker.get(intent.ticker, 0.0))
+        if signed > 0:
+            max_c = max(max_c, int(settings.trade_double_down_max_position_contracts))
     # Balance-based contract cap is for *buys* only. Applying it to sells incorrectly
     # shrinks exit size to a per-trade cash budget unrelated to contracts held.
     if intent.action == "buy" and intent.count > max_c:
@@ -208,6 +230,8 @@ def execute_intent(
                 reason="min_order_notional_unreachable",
                 intent=intent,
                 market_title=market_title,
+                market_category=market_category,
+                order_contracts=intent.count,
             )
             return
         if floored != intent.count:
@@ -225,6 +249,8 @@ def execute_intent(
             reason="zero_contracts_after_balance_sizing",
             intent=intent,
             market_title=market_title,
+            market_category=market_category,
+            order_contracts=intent.count,
         )
         return
 
@@ -270,6 +296,8 @@ def execute_intent(
             count=intent.count,
             yes_price_cents=intent.yes_price_cents,
             market_title=market_title,
+            market_category=market_category,
+            order_contracts=intent.count,
         )
         _spacing_after_submitted_buy_yes(settings, intent)
         return
@@ -286,6 +314,8 @@ def execute_intent(
             reason="LIVE_TRADING_false_or_misconfigured",
             intent=intent,
             market_title=market_title,
+            market_category=market_category,
+            order_contracts=intent.count,
         )
         return
 
@@ -293,7 +323,14 @@ def execute_intent(
         _warn_live_banner(settings)
 
     log.info("live_order_submit", intent=intent, env=settings.kalshi_env, market_title=market_title)
-    record_event("live_submit", env=settings.kalshi_env, intent=intent, market_title=market_title)
+    record_event(
+        "live_submit",
+        env=settings.kalshi_env,
+        intent=intent,
+        market_title=market_title,
+        market_category=market_category,
+        order_contracts=intent.count,
+    )
     resp = place_limit_order_live(client, intent)
     risk.record_order_submitted(intent.count)
     oid = getattr(resp, "order", None)
@@ -305,5 +342,7 @@ def execute_intent(
         order_id=order_id,
         ticker=intent.ticker,
         market_title=market_title,
+        market_category=market_category,
+        order_contracts=intent.count,
     )
     _spacing_after_submitted_buy_yes(settings, intent)
