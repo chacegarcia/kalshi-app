@@ -8,7 +8,7 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from kalshi_bot.config import Settings
 
@@ -165,6 +165,11 @@ def llm_evaluate_opportunity(
     tape_rank: int | None = None,
     tape_public_trade_count: int | None = None,
     tape_universe_size: int | None = None,
+    no_bid_cents: int | None = None,
+    no_ask_cents: int | None = None,
+    no_bid_dollars: float | None = None,
+    no_ask_dollars: float | None = None,
+    entry_side: Literal["yes", "no"] = "yes",
 ) -> LLMOpportunityVerdict | None:
     """Ask the model to reason about a market; output must be JSON with ``shares`` (or legacy ``contracts``).
 
@@ -181,8 +186,22 @@ def llm_evaluate_opportunity(
         adaptive_extra_min_net_edge=adaptive_extra_min_net_edge,
         adaptive_extra_mid_edge=adaptive_extra_mid_edge,
     )
+    min_chance = settings.trade_entry_effective_min_yes_ask_cents
+    chance_line = (
+        f"min_implied_yes_chance_pct={min_chance} (same as Kalshi 'chance' column; do not recommend buys below this implied %%), "
+        if min_chance > 0
+        else ""
+    )
+    mi_line = ""
+    if settings.trade_entry_market_intelligence_enabled:
+        mi_line = (
+            f"market_intelligence: multi-outcome events (2+ open markets under same event) → only top "
+            f"{settings.trade_entry_multi_choice_top_n} by implied YES and min ask "
+            f"{settings.trade_entry_multi_choice_min_yes_ask_cents}¢; single-market events = binary. "
+        )
     params = (
-        f"Enforced in code: min_net_edge_after_fees={min_e}, mid_price_extra_edge={mid_x}, "
+        f"Enforced in code: {chance_line}{mi_line}"
+        f"min_net_edge_after_fees={min_e}, mid_price_extra_edge={mid_x}, "
         f"max_yes_ask={settings.strategy_max_yes_ask_dollars}, min_spread={settings.strategy_min_spread_dollars}, "
         f"max_shares={max_contracts_allowed}, bal_cents={bal_s}"
     )
@@ -216,8 +235,23 @@ def llm_evaluate_opportunity(
             "still compare fair_yes to the ask and avoid chasing.\n\n"
         )
 
+    no_line = ""
+    if (
+        no_bid_cents is not None
+        and no_ask_cents is not None
+        and no_bid_dollars is not None
+        and no_ask_dollars is not None
+    ):
+        no_line = f"\nNO bid {no_bid_cents}¢ ask≈{no_ask_cents}¢ ({no_ask_dollars:.3f})."
+    side_note = ""
+    if entry_side == "no":
+        side_note = (
+            "\nExecution note: the bot will buy NO for this pass (higher implied lift vs YES). "
+            "Estimate fair_yes as usual; fee-aware checks use fair_no = 1 − fair_yes vs the NO ask.\n"
+        )
+
     user = f"""{ticker} | {title}
-YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
+YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).{no_line}{side_note}
 {flow_block}{perf_block}{params}
 {style_block}{odds_block}JSON only:
 {{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"shares":1-{max_contracts_allowed},"reason":"brief"}}
@@ -236,6 +270,11 @@ YES bid {yes_bid_cents}¢ ask≈{yes_ask_cents}¢ ({yes_ask_dollars:.3f}).
         reason = str(raw.get("reason", ""))[:2000]
         fair_yes = max(0.0, min(1.0, fair_yes))
         limit_c = max(1, min(99, limit_c))
+        eff = settings.trade_entry_effective_min_yes_ask_cents
+        clamp_ask = no_ask_cents if entry_side == "no" else yes_ask_cents
+        if eff > 0:
+            limit_c = max(limit_c, eff)
+            limit_c = min(limit_c, clamp_ask)
         contracts = max(1, min(max_contracts_allowed, contracts))
         return LLMOpportunityVerdict(
             approve=approve,

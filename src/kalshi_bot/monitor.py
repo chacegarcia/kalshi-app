@@ -9,7 +9,6 @@ import urllib.error
 import urllib.request
 import webbrowser
 from collections import deque
-from pathlib import Path
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from threading import Lock
@@ -21,8 +20,6 @@ from kalshi_bot.portfolio import fetch_portfolio_snapshot
 
 _LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
-# Set when dashboard starts so /api/log_summary can locate JSONL without Settings in Flask context
-_STRUCTURED_LOG_PATH_FOR_STATS: Path | None = None
 # Time series for dashboard line chart (cash balance, exposure, total = cash + exposure)
 _SERIES: deque[dict[str, Any]] = deque(maxlen=2000)
 # Closed-trade tally (auto-sell: estimated gross vs entry, or take-profit without basis)
@@ -131,6 +128,10 @@ def record_auto_sell_outcome(*, gross_profit_cents: int | None, exit_reason: str
         with _LOCK:
             _WINS += 1
         return
+    if exit_reason.startswith("trailing_stop") or exit_reason.startswith("profit_lock"):
+        with _LOCK:
+            _TIES += 1
+        return
     if exit_reason.startswith("stop_loss"):
         with _LOCK:
             _LOSSES += 1
@@ -205,16 +206,6 @@ _HTML = """<!DOCTYPE html>
     body { font-family: ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); margin:0; padding:1rem 1.25rem 2rem; }
     h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
     p.sub { color: var(--muted); font-size: 0.875rem; margin: 0 0 1rem; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
-    th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #2a3544; vertical-align: top; }
-    th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--bg); }
-    tr:hover td { background: #141c26; }
-    .kind { font-family: ui-monospace, monospace; font-size: 0.75rem; }
-    .kind-dry_run { color: var(--ok); }
-    .kind-live { color: #6eb5ff; }
-    .kind-blocked { color: var(--warn); }
-    .kind-refused { color: var(--err); }
-    .kind-heartbeat { color: var(--muted); }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.75rem; color: #c5d0dc; }
     .status { display: inline-block; padding: 0.15rem 0.45rem; border-radius: 4px; background: var(--card); font-size: 0.75rem; color: var(--muted); margin-bottom: 0.75rem; }
     .balance-banner { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; align-items: baseline; background: var(--card); border-radius: 8px; padding: 0.65rem 1rem; margin-bottom: 0.75rem; font-size: 0.9375rem; }
@@ -223,6 +214,42 @@ _HTML = """<!DOCTYPE html>
     .chart-wrap { background: var(--card); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.25rem; max-width: 100%; }
     .chart-wrap h2 { font-size: 0.9375rem; font-weight: 600; margin: 0 0 0.5rem; color: var(--muted); }
     .chart-wrap canvas { max-height: 220px; }
+    .trade-feed { display: flex; flex-direction: column; gap: 0.65rem; max-width: 52rem; }
+    .trade-card {
+      border-radius: 10px; padding: 0.75rem 1rem; border: 1px solid #2a3544;
+      background: linear-gradient(145deg, #1e2838 0%, #1a2332 100%);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    .trade-card--positive {
+      border-color: rgba(62,207,142,0.45);
+      background: linear-gradient(145deg, rgba(62,207,142,0.14) 0%, #1a2332 55%);
+    }
+    .trade-card--negative {
+      border-color: rgba(242,81,81,0.45);
+      background: linear-gradient(145deg, rgba(242,81,81,0.12) 0%, #1a2332 55%);
+    }
+    .trade-card--neutral { border-color: #2e3d52; }
+    .trade-card--buy { border-left: 3px solid #6eb5ff; }
+    .trade-card--warn { border-left: 3px solid var(--warn); }
+    .trade-card--err { border-left: 3px solid var(--err); }
+    .trade-card__head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; margin-bottom: 0.4rem; }
+    .trade-card__time { font-size: 0.75rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .trade-card__badge {
+      font-family: ui-monospace, monospace; font-size: 0.7rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 0.2rem 0.45rem; border-radius: 4px; background: #243044; color: #b8c5d6;
+    }
+    .trade-card__market { font-size: 0.9rem; color: var(--text); line-height: 1.35; margin-bottom: 0.35rem; }
+    .trade-card__meta { font-size: 0.8rem; color: #a8b4c5; display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; }
+    .trade-card__meta span { font-variant-numeric: tabular-nums; }
+    .trade-card__pl {
+      margin-top: 0.45rem; font-size: 0.95rem; font-weight: 600; font-variant-numeric: tabular-nums;
+    }
+    .trade-card__pl--pos { color: #5ee4a8; }
+    .trade-card__pl--neg { color: #ff8a8a; }
+    .trade-card__pl--zero { color: var(--muted); }
+    .trade-card__detail { margin-top: 0.5rem; font-size: 0.7rem; color: var(--muted); max-height: 5rem; overflow: auto; }
+    .trade-card__detail pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -242,17 +269,101 @@ _HTML = """<!DOCTYPE html>
     <canvas id="seriesChart" width="800" height="220"></canvas>
   </div>
   <div class="chart-wrap">
-    <h2>Structured log tail (event counts)</h2>
-    <p class="sub" style="margin:0 0 0.5rem;">Recent lines of <code>STRUCTURED_LOG_PATH</code> — which events fired most often.</p>
-    <pre id="logSummaryPre" style="font-size:0.75rem;max-height:160px;overflow:auto;color:#c5d0dc;">—</pre>
+    <h2>Trades &amp; orders</h2>
+    <p class="sub" style="margin:0 0 0.75rem;">Exit P/L uses green / red hues. Buys (dry-run / live submit) use a blue accent. Expand <strong>Raw JSON</strong> for the full payload.</p>
+    <div class="trade-feed" id="tradeFeed"></div>
   </div>
-  <table>
-    <thead><tr><th>Time (UTC)</th><th>Kind</th><th>Detail</th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
   <script>
     let seriesChart = null;
     function dollarsFromCents(c) { return (Number(c) || 0) / 100; }
+    function renderTradeCards(events) {
+      const feed = document.getElementById('tradeFeed');
+      if (!feed) return;
+      feed.innerHTML = '';
+      const tradeKinds = /^(dry_run|live_submit|live_ack|blocked|refused|auto_sell_profit_estimate)$/;
+      for (const ev of events) {
+        const k = ev.kind || '';
+        if (!tradeKinds.test(k)) continue;
+        const intent = ev.intent && typeof ev.intent === 'object' ? ev.intent : {};
+        const ticker = ev.ticker || intent.ticker || '';
+        const grossRaw = ev.estimated_gross_profit_cents;
+        let tone = 'neutral';
+        if (k === 'auto_sell_profit_estimate' && grossRaw != null && grossRaw !== '') {
+          const g = Number(grossRaw);
+          if (g > 0) tone = 'positive';
+          else if (g < 0) tone = 'negative';
+          else tone = 'neutral';
+        }
+        const card = document.createElement('article');
+        card.className = 'trade-card trade-card--' + tone;
+        if (k === 'dry_run' || k === 'live_submit') card.classList.add('trade-card--buy');
+        if (k === 'blocked') card.classList.add('trade-card--warn');
+        if (k === 'refused') card.classList.add('trade-card--err');
+
+        const head = document.createElement('div');
+        head.className = 'trade-card__head';
+        const tm = document.createElement('span');
+        tm.className = 'trade-card__time';
+        tm.textContent = ev.ts_iso || '';
+        const badge = document.createElement('span');
+        badge.className = 'trade-card__badge';
+        badge.textContent = (k || 'event').replace(/_/g, ' ');
+        head.appendChild(tm);
+        head.appendChild(badge);
+        card.appendChild(head);
+
+        const market = document.createElement('div');
+        market.className = 'trade-card__market';
+        const title = (ev.market_title || '').trim();
+        market.textContent = title || (ticker ? '— ' + ticker : '—');
+        card.appendChild(market);
+
+        const meta = document.createElement('div');
+        meta.className = 'trade-card__meta';
+        const bits = [];
+        if (ticker) bits.push('Ticker ' + ticker);
+        const cnt = ev.count != null ? ev.count : intent.count;
+        const yp = ev.yes_price_cents != null ? ev.yes_price_cents : intent.yes_price_cents;
+        const lim = ev.limit_yes_price_cents;
+        const price = lim != null ? lim : yp;
+        if (cnt != null) bits.push(cnt + ' sh');
+        if (price != null) bits.push('@ ' + price + '¢ YES');
+        if (intent.side && intent.action) bits.push(intent.side + ' ' + intent.action);
+        if (ev.entry_yes_cents != null) bits.push('entry ~' + ev.entry_yes_cents + '¢');
+        if (ev.reason) bits.push(String(ev.reason));
+        if (ev.env) bits.push('env ' + ev.env);
+        if (ev.order_id) bits.push('order ' + ev.order_id);
+        meta.textContent = bits.length ? bits.join(' · ') : '—';
+        card.appendChild(meta);
+
+        if (k === 'auto_sell_profit_estimate' && grossRaw != null && grossRaw !== '') {
+          const g = Number(grossRaw);
+          const pl = document.createElement('div');
+          pl.className = 'trade-card__pl ' + (g > 0 ? 'trade-card__pl--pos' : g < 0 ? 'trade-card__pl--neg' : 'trade-card__pl--zero');
+          const sign = g > 0 ? '+' : '';
+          pl.textContent = 'Est. gross P/L ' + sign + (g / 100).toFixed(2) + ' USD (before fees)';
+          card.appendChild(pl);
+        }
+
+        const det = document.createElement('details');
+        det.className = 'trade-card__detail';
+        const summ = document.createElement('summary');
+        summ.textContent = 'Raw JSON';
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(ev, null, 2);
+        det.appendChild(summ);
+        det.appendChild(pre);
+        card.appendChild(det);
+        feed.appendChild(card);
+      }
+      if (feed.children.length === 0) {
+        const empty = document.createElement('p');
+        empty.className = 'sub';
+        empty.style.margin = '0';
+        empty.textContent = 'No trade events yet — dry-run, live orders, or auto-sell will appear here.';
+        feed.appendChild(empty);
+      }
+    }
     function buildOrUpdateChart(points) {
       const labels = points.map(p => {
         const t = new Date((p.unix || 0) * 1000);
@@ -309,20 +420,7 @@ _HTML = """<!DOCTYPE html>
         const r = await fetch('/api/events', { cache: 'no-store' });
         const data = await r.json();
         document.getElementById('status').textContent = data.length + ' event(s) — last update ' + new Date().toISOString();
-        const tb = document.getElementById('rows');
-        tb.innerHTML = '';
-        for (const ev of data) {
-          const tr = document.createElement('tr');
-          const k = ev.kind || '';
-          const cls = 'kind kind-' + k.replace(/[^a-z0-9_-]/gi, '_');
-          const detail = document.createElement('td');
-          const pre = document.createElement('pre');
-          pre.textContent = JSON.stringify(ev, null, 2);
-          tr.innerHTML = '<td>' + (ev.ts_iso || '') + '</td><td class="' + cls + '">' + k + '</td>';
-          tr.appendChild(detail);
-          detail.appendChild(pre);
-          tb.appendChild(tr);
-        }
+        renderTradeCards(data);
       } catch (e) {
         document.getElementById('status').textContent = 'Fetch error (events) — is the bot running?';
       }
@@ -364,20 +462,8 @@ _HTML = """<!DOCTYPE html>
         }
       }
     }
-    async function pollLogSummary() {
-      try {
-        const r = await fetch('/api/log_summary', { cache: 'no-store' });
-        const j = await r.json();
-        const el = document.getElementById('logSummaryPre');
-        if (!el) return;
-        const lines = j.top_events || [];
-        el.textContent = lines.length ? lines.join('\\n') : (j.error || 'no lines parsed');
-      } catch (e) { /* ignore */ }
-    }
     poll();
     setInterval(poll, 2000);
-    pollLogSummary();
-    setInterval(pollLogSummary, 5000);
   </script>
 </body>
 </html>"""
@@ -432,20 +518,13 @@ def _create_app() -> Any:
     def api_stats() -> Any:
         return jsonify(win_loss_snapshot())
 
-    @app.get("/api/log_summary")
-    def api_log_summary() -> Any:
-        p = _STRUCTURED_LOG_PATH_FOR_STATS or Path("logs/kalshi_bot.jsonl")
-        return jsonify(aggregate_structured_log_tail(p))
-
     return app
 
 
 def start_dashboard(settings: Settings) -> threading.Thread | None:
     """Start Flask in a daemon thread; optionally open the default browser."""
-    global _STRUCTURED_LOG_PATH_FOR_STATS
     if not settings.dashboard_enabled:
         return None
-    _STRUCTURED_LOG_PATH_FOR_STATS = settings.structured_log_path
 
     def _run() -> None:
         app.run(

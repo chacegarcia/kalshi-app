@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from kalshi_python_sync.models.get_market_orderbook_response import GetMarketOrderbookResponse
@@ -424,3 +425,135 @@ def summarize_market_row(m: Any) -> MarketSummary:
         status=getattr(m, "status", None),
         volume=getattr(m, "volume", None),
     )
+
+
+def seconds_until_resolution(m: Any) -> float | None:
+    """Seconds until the earliest of close / expected / latest expiration (vs UTC now). None if unknown."""
+    now = datetime.now(UTC)
+    best: float | None = None
+    for attr in ("close_time", "expected_expiration_time", "latest_expiration_time"):
+        t = getattr(m, attr, None)
+        if t is None:
+            continue
+        if isinstance(t, datetime):
+            dt = t if t.tzinfo else t.replace(tzinfo=UTC)
+            sec = (dt - now).total_seconds()
+            if best is None or sec < best:
+                best = sec
+    return best
+
+
+def get_market_entry_timing_and_event(
+    client: KalshiSdkClient, ticker: str
+) -> tuple[float | None, str | None]:
+    """REST: seconds until resolution (soonest deadline) and ``event_ticker`` for grouping."""
+    try:
+        row = get_market(client, ticker=ticker)
+        m = getattr(row, "market", None)
+        if m is None:
+            return None, None
+        ev = getattr(m, "event_ticker", None)
+        return seconds_until_resolution(m), str(ev) if ev else None
+    except Exception:
+        return None, None
+
+
+def _event_market_yes_score(m: Any) -> float:
+    """Rank markets within an event: prefer REST implied YES ask, then last, then volume."""
+    ya = getattr(m, "yes_ask_dollars", None)
+    if ya is not None:
+        try:
+            return float(str(ya))
+        except (TypeError, ValueError):
+            pass
+    lp = getattr(m, "last_price_dollars", None)
+    if lp is not None:
+        try:
+            return float(str(lp))
+        except (TypeError, ValueError):
+            pass
+    vol = getattr(m, "volume_fp", None)
+    if vol is None:
+        vol = getattr(m, "volume", None)
+    if vol is not None:
+        try:
+            return float(str(vol)) * 1e-9
+        except (TypeError, ValueError):
+            pass
+    return -1.0
+
+
+@with_rest_retry
+def fetch_event_markets_sorted_by_yes_score(
+    client: KalshiSdkClient,
+    event_ticker: str,
+    *,
+    mve_filter: str | None = "exclude",
+) -> list[tuple[str, float]] | None:
+    """All open markets in ``event_ticker``, sorted by REST implied YES score (high first). None on API failure."""
+    if not event_ticker:
+        return []
+    rows: list[tuple[str, float]] = []
+    cursor: str | None = None
+    try:
+        while True:
+            resp = client.markets.get_markets(
+                status="open",
+                event_ticker=event_ticker,
+                limit=1000,
+                cursor=cursor,
+                mve_filter=mve_filter,
+            )
+            markets = list(getattr(resp, "markets", []) or [])
+            for m in markets:
+                tk = getattr(m, "ticker", None)
+                if not tk:
+                    continue
+                rows.append((str(tk), _event_market_yes_score(m)))
+            cursor = getattr(resp, "cursor", None)
+            if not cursor or not markets:
+                break
+    except Exception:
+        return None
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows
+
+
+@with_rest_retry
+def fetch_event_top_yes_tickers(
+    client: KalshiSdkClient,
+    event_ticker: str,
+    top_n: int,
+    *,
+    mve_filter: str | None = "exclude",
+) -> list[str] | None:
+    """Open markets in ``event_ticker`` ranked by implied YES (REST fields). None on API failure; may be empty."""
+    if not event_ticker or top_n < 1:
+        return []
+    rows = fetch_event_markets_sorted_by_yes_score(client, event_ticker, mve_filter=mve_filter)
+    if rows is None:
+        return None
+    return [t for t, _ in rows[:top_n]]
+
+
+_MARKET_TITLE_CACHE: dict[str, str] = {}
+
+
+def market_title_for_ticker(client: KalshiSdkClient, ticker: str) -> str:
+    """Kalshi market ``title`` (what the contract is about) for logs and the HTML monitor.
+
+    Cached per ticker for the process. Returns ``\"\"`` if the lookup fails.
+    """
+    if ticker in _MARKET_TITLE_CACHE:
+        return _MARKET_TITLE_CACHE[ticker]
+    try:
+        row = get_market(client, ticker=ticker)
+        m = getattr(row, "market", None)
+        if m is None:
+            _MARKET_TITLE_CACHE[ticker] = ""
+            return ""
+        title = (summarize_market_row(m).title or "").strip()
+        _MARKET_TITLE_CACHE[ticker] = title
+        return title
+    except Exception:
+        return ""

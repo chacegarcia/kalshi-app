@@ -108,7 +108,7 @@ def cap_buy_yes_count_for_notional(
 
     Uses limit price in dollars as ``yes_price_cents/100`` (same notion as exposure in ``execute_intent``).
     """
-    if side != "yes" or action != "buy":
+    if action != "buy" or side not in ("yes", "no"):
         return count
     if max_notional_usd is None or max_notional_usd <= 0:
         return count

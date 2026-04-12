@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         description="Max total exposure (cents) when TRADE_BALANCE_SIZING_ENABLED=false or balance is unknown. With balance sizing + live balance, cap is balance×TRADE_TOTAL_RISK_PCT_OF_BALANCE instead.",
     )
     max_contracts_per_market: int = Field(
-        default=10,
+        default=2,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_MAX_CONTRACTS_PER_MARKET",
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
             "MAX_POSITION_CONTRACTS",
             "max_contracts_per_market",
         ),
-        description="Max YES shares (Kalshi contracts) per market when TRADE_BALANCE_SIZING_ENABLED=false or balance unknown. With balance sizing + balance, per-order cap is balance×TRADE_RISK_PCT_OF_BALANCE_PER_TRADE÷share_price.",
+        description="Max YES shares (Kalshi contracts) per market; values >2 are clamped to 2.",
     )
     max_daily_drawdown_usd: float = Field(
         default=25.0,
@@ -146,14 +146,18 @@ class Settings(BaseSettings):
         description="Require |mid−50%| ≥ this (0–1 scale). 0.02 ≈ skip mids in ~48–52¢ band; 0 = allow coin-flip mids (more signals).",
     )
     trade_entry_min_yes_ask_cents: int = Field(
-        default=0,
+        default=40,
         ge=0,
         le=98,
         validation_alias=AliasChoices(
             "TRADE_ENTRY_MIN_YES_ASK_CENTS",
+            "TRADE_ENTRY_MIN_YES_CHANCE_PCT",
             "trade_entry_min_yes_ask_cents",
         ),
-        description="Extra floor: do not buy YES below this many cents (0 = off). Stricter of this and TRADE_ENTRY_MAX_AMERICAN_ODDS_YES is used.",
+        description=(
+            "Minimum implied YES at entry: same number Kalshi shows as “chance” (%%) on the contract — 45 = 45%% ≈ 45¢ ask. "
+            "0 = disable this floor (flow/tape only). Stricter of this and TRADE_ENTRY_MAX_AMERICAN_ODDS_YES when that is set."
+        ),
     )
     trade_entry_max_american_odds_yes: float = Field(
         default=200.0,
@@ -163,10 +167,175 @@ class Settings(BaseSettings):
             "TRADE_ENTRY_MAX_AMERICAN_ODDS_YES",
             "trade_entry_max_american_odds_yes",
         ),
-        description="Skip buy YES when implied American long odds exceed this (+200 ≈ min ~34¢; +150≈40¢; +400≈20¢). 0 = disable this cap.",
+        description=(
+            "If >0: skip buy YES when implied American long odds exceed this (+200≈34¢ min ask). "
+            "0 = disable this gate. Use TRADE_ENTRY_MIN_YES_ASK_CENTS for an additional hard floor."
+        ),
+    )
+    trade_entry_skip_ticker_substrings: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_SKIP_TICKER_SUBSTRINGS",
+            "trade_entry_skip_ticker_substrings",
+        ),
+        description=(
+            "Comma-separated substrings; skip buy YES when the market ticker contains any token (case-insensitive). "
+            "Example: MASTERS,PGA — blocks whole event families without per-market tuning."
+        ),
+    )
+    trade_entry_cap_long_yes_substring: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_CAP_LONG_YES_SUBSTRING",
+            "trade_entry_cap_long_yes_substring",
+        ),
+        description=(
+            "Used with TRADE_ENTRY_CAP_LONG_YES_MAX: only applies to tickers containing this substring (case-insensitive). "
+            "Example: MASTERS — cap how many distinct long-YES names you hold in that family."
+        ),
+    )
+    trade_entry_cap_long_yes_max: int = Field(
+        default=0,
+        ge=0,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_CAP_LONG_YES_MAX",
+            "trade_entry_cap_long_yes_max",
+        ),
+        description=(
+            "If >0 with CAP substring set: skip new buy YES when you already hold long YES in this many distinct tickers "
+            "matching the substring (0 = off). Stops many tiny-probability legs from stacking exposure."
+        ),
+    )
+    trade_entry_theta_decay_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_THETA_DECAY_ENABLED",
+            "trade_entry_theta_decay_enabled",
+        ),
+        description=(
+            "If true: skip buy YES when time-to-resolution is short (options-style theta) and implied YES is in the "
+            "long-shot band below — see TRADE_ENTRY_THETA_*."
+        ),
+    )
+    trade_entry_theta_seconds_to_close_max: int = Field(
+        default=86_400,
+        ge=60,
+        le=31_536_000,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_THETA_SECONDS_TO_CLOSE_MAX",
+            "trade_entry_theta_seconds_to_close_max",
+        ),
+        description=(
+            "Theta gate: skip when seconds until close/expiration are ≤ this value AND implied YES ask is in the "
+            "theta band (default 24h)."
+        ),
+    )
+    trade_entry_theta_min_yes_ask_cents: int = Field(
+        default=1,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_THETA_MIN_YES_ASK_CENTS",
+            "trade_entry_theta_min_yes_ask_cents",
+        ),
+        description="Lower bound (¢) of the long-shot band combined with theta time gate.",
+    )
+    trade_entry_theta_max_yes_ask_cents: int = Field(
+        default=10,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_THETA_MAX_YES_ASK_CENTS",
+            "trade_entry_theta_max_yes_ask_cents",
+        ),
+        description="Upper bound (¢) of the long-shot band combined with theta time gate (e.g. 10 ≈ 10% implied).",
+    )
+    trade_entry_event_top_n: int = Field(
+        default=0,
+        ge=0,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_EVENT_TOP_N",
+            "trade_entry_event_top_n",
+        ),
+        description=(
+            "If >0 with EVENT_TOP_N_SUBSTRING: only allow buy YES when this ticker is among the top N markets in the "
+            "same event by implied YES (REST yes_ask / last trade). 0 = off."
+        ),
+    )
+    trade_entry_event_top_n_substring: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_EVENT_TOP_N_SUBSTRING",
+            "trade_entry_event_top_n_substring",
+        ),
+        description=(
+            "Substring filter for event top-N (case-insensitive). Example: MASTERS — only the top implied YES names "
+            "in that event, not every player market."
+        ),
+    )
+    trade_entry_market_intelligence_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MARKET_INTELLIGENCE_ENABLED",
+            "trade_entry_market_intelligence_enabled",
+        ),
+        description=(
+            "If true: detect binary (single open market in event) vs multi-choice (2+ open markets). "
+            "Multi-choice: only allow buys on the top-N outcomes by REST implied YES and only if orderbook implied YES "
+            "≥ TRADE_ENTRY_MULTI_CHOICE_MIN_YES_ASK_CENTS."
+        ),
+    )
+    trade_entry_multi_choice_top_n: int = Field(
+        default=3,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MULTI_CHOICE_TOP_N",
+            "trade_entry_multi_choice_top_n",
+        ),
+        description="Multi-choice events only: allow buy YES only for tickers ranked in the top N by implied YES (REST).",
+    )
+    trade_entry_multi_choice_min_yes_ask_cents: int = Field(
+        default=50,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MULTI_CHOICE_MIN_YES_ASK_CENTS",
+            "trade_entry_multi_choice_min_yes_ask_cents",
+        ),
+        description=(
+            "Multi-choice events only: minimum orderbook implied YES (¢) — same scale as Kalshi 'chance' (e.g. 50 = 50%). "
+            "Binary (single-market) events use TRADE_ENTRY_MIN_YES_ASK_CENTS only."
+        ),
+    )
+    trade_entry_prefer_higher_odds_side_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_PREFER_HIGHER_ODDS_SIDE_ENABLED",
+            "trade_entry_prefer_higher_odds_side_enabled",
+        ),
+        description=(
+            "If true: on each binary market, compare YES vs NO lift (bid/ask) and pick the better-scoring leg "
+            "(see TRADE_ENTRY_SIDE_CHOICE_SPREAD_PENALTY). LLM/tape/discover/bitcoin use the same rule."
+        ),
+    )
+    trade_entry_side_choice_spread_penalty: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=20.0,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_SIDE_CHOICE_SPREAD_PENALTY",
+            "trade_entry_side_choice_spread_penalty",
+        ),
+        description=(
+            "When PREFER_HIGHER_ODDS_SIDE is on: each leg’s score = implied_ask_cents − penalty × (ask−bid) spread in ¢. "
+            "Higher score wins (favors the favorite, discounts wide books). 0 = compare asks only (ignores spread)."
+        ),
     )
     strategy_order_count: int = Field(
-        default=1,
+        default=2,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_BUY_CONTRACTS_PER_ORDER",
@@ -174,7 +343,7 @@ class Settings(BaseSettings):
             "STRATEGY_ORDER_COUNT",
             "strategy_order_count",
         ),
-        description="Shares (YES contracts) per buy signal for the sample WebSocket strategy.",
+        description="Shares per buy signal (sample strategies / momentum); values >2 are clamped to 2.",
     )
     trade_min_order_notional_usd: float | None = Field(
         default=0.0,
@@ -683,6 +852,19 @@ class Settings(BaseSettings):
         ),
         description="After each llm-trade / discover-trade / tape-trade / bitcoin-trade pass, scan long YES positions and run take-profit (same rules as auto-sell).",
     )
+    trade_exit_hold_to_settlement_min_chance_cents: int = Field(
+        default=90,
+        ge=0,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_HOLD_TO_SETTLEMENT_MIN_CHANCE_CENTS",
+            "trade_exit_hold_to_settlement_min_chance_cents",
+        ),
+        description=(
+            "If >0: while long YES and implied YES chance (mid of best bid and lift YES ask, 1–99¢) ≥ this, "
+            "do not auto-sell—hold for final payout. 0 disables (always allow TP/stops per other rules)."
+        ),
+    )
 
     # Exit quality: implied-% floor, optional profit-margin vs entry, IOC-style sells (Kalshi API TIF)
     trade_exit_take_profit_min_yes_bid_pct: float = Field(
@@ -696,14 +878,54 @@ class Settings(BaseSettings):
         description="When implied-% exits are on (TRADE_EXIT_ONLY_PROFIT_MARGIN=false): min best YES bid (1–99) to count as take-profit.",
     )
     trade_exit_min_profit_cents_per_contract: float | None = Field(
-        default=2.0,
+        default=15.0,
         ge=0.0,
         validation_alias=AliasChoices(
             "TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT",
             "TRADE_EXIT_MIN_PROFIT_CENTS",
             "trade_exit_min_profit_cents_per_contract",
         ),
-        description="Min profit vs entry (¢ per share). Default 2¢ balances locking gains vs getting filled; set 1 for ‘any green’.",
+        description=(
+            "Floor: min profit vs entry (¢ per share). Combined with TRADE_EXIT_MIN_PROFIT_PCT_OF_ENTRY: "
+            "effective = max(this, entry×pct), then optional cap."
+        ),
+    )
+    trade_exit_min_profit_pct_of_entry: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_MIN_PROFIT_PCT_OF_ENTRY",
+            "trade_exit_min_profit_pct_of_entry",
+        ),
+        description=(
+            "If >0: require at least this fraction of entry (in ¢) as profit, e.g. 0.25 → 25% of entry. "
+            "Effective min profit = max(TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT, entry×this). 0 = floor only."
+        ),
+    )
+    trade_exit_min_profit_cents_cap: float | None = Field(
+        default=25.0,
+        ge=0.0,
+        le=99.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_MIN_PROFIT_CENTS_CAP",
+            "trade_exit_min_profit_cents_cap",
+        ),
+        description="Optional ceiling (¢) on required min profit after floor/pct (None = no cap). Default 25.",
+    )
+    trade_exit_lock_profit_cents: float | None = Field(
+        default=15.0,
+        ge=0.0,
+        le=99.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_LOCK_PROFIT_CENTS",
+            "trade_exit_lock_profit_cents",
+        ),
+        description=(
+            "Once session peak best bid reaches entry + this many ¢, the exit floor includes at least entry + this "
+            "(locks that profit if price falls back). Combined with trailing: max(fixed, trail, entry+lock). "
+            "Set 0 or omit via env empty to disable."
+        ),
     )
     trade_exit_entry_reference_yes_cents: int | None = Field(
         default=None,
@@ -727,7 +949,7 @@ class Settings(BaseSettings):
             "TRADE_EXIT_ONLY_PROFIT_MARGIN",
             "trade_exit_only_profit_margin",
         ),
-        description="If true, skip implied-% TP; exit when bid ≥ entry + TRADE_EXIT_MIN_PROFIT_CENTS_PER_CONTRACT (default 2¢).",
+        description="If true, skip implied-% TP; exit when bid ≥ entry + effective min profit (floor / pct / cap).",
     )
     trade_exit_stop_loss_enabled: bool = Field(
         default=True,
@@ -761,6 +983,68 @@ class Settings(BaseSettings):
             "If true, do not apply stop-loss when entry comes only from portfolio (total_traded/position) "
             "and rounds to ≤5¢ or ≥95¢—often API noise. Manual TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS is always used for stops. "
             "Take-profit rules still use the portfolio estimate."
+        ),
+    )
+    trade_exit_trailing_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_ENABLED",
+            "trade_exit_trailing_enabled",
+        ),
+        description=(
+            "Track best YES bid peak per ticker; after price trends up vs entry, exit on pullback from peak "
+            "and optionally raise the fixed stop floor (see TRADE_EXIT_TRAILING_*). Take-profit still runs first."
+        ),
+    )
+    trade_exit_trailing_pullback_cents: float = Field(
+        default=4.0,
+        ge=0.0,
+        le=50.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_PULLBACK_CENTS",
+            "trade_exit_trailing_pullback_cents",
+        ),
+        description="Sell when best bid drops this many ¢ below the session peak (after trailing arms).",
+    )
+    trade_exit_trailing_pullback_pct_of_peak: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_PULLBACK_PCT_OF_PEAK",
+            "trade_exit_trailing_pullback_pct_of_peak",
+        ),
+        description="If >0: pullback distance is max(cents, peak×this). 0 = use cents only.",
+    )
+    trade_exit_trailing_activate_above_entry_cents: int = Field(
+        default=1,
+        ge=0,
+        le=50,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_ACTIVATE_ABOVE_ENTRY_CENTS",
+            "trade_exit_trailing_activate_above_entry_cents",
+        ),
+        description="Require peak ≥ entry + this before trailing / raised stop applies (avoids arming on noise).",
+    )
+    trade_exit_trailing_combine_with_fixed_stop: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_COMBINE_WITH_FIXED_STOP",
+            "trade_exit_trailing_combine_with_fixed_stop",
+        ),
+        description="If true: exit stop uses max(fixed_stop_floor, peak−pullback) so the stop rises with favorable prints.",
+    )
+    trade_exit_trailing_stop_loss_floor_fraction: float | None = Field(
+        default=None,
+        gt=0.0,
+        lt=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_TRAILING_STOP_LOSS_FLOOR_FRACTION",
+            "trade_exit_trailing_stop_loss_floor_fraction",
+        ),
+        description=(
+            "When trailing is armed: fixed stop uses max(TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION, this) vs entry. "
+            "Raises the stop floor on winners (e.g. 0.58 vs 0.50). Omit to use only TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION."
         ),
     )
     trade_exit_sell_time_in_force: Literal["immediate_or_cancel", "fill_or_kill", "good_till_canceled"] = Field(
@@ -849,6 +1133,18 @@ class Settings(BaseSettings):
         s = str(v).strip()
         return s if s else None
 
+    @field_validator("max_contracts_per_market", "strategy_order_count", mode="before")
+    @classmethod
+    def _cap_order_shares_at_two(cls, v: object) -> object:
+        """Env may still say 10 from older configs; enforce max 2 shares per policy."""
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            return v
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return v
+        return min(2, max(1, n))
+
     @field_validator("trade_exit_sell_time_in_force", mode="before")
     @classmethod
     def _normalize_exit_time_in_force(cls, v: object) -> str:
@@ -898,6 +1194,8 @@ class Settings(BaseSettings):
         "trade_exit_estimate_entry_from_portfolio",
         "trade_exit_stop_loss_enabled",
         "trade_exit_stop_loss_skip_suspect_portfolio_estimate",
+        "trade_exit_trailing_enabled",
+        "trade_exit_trailing_combine_with_fixed_stop",
         "structured_log_clear_every_other_pass",
         mode="before",
     )
@@ -917,6 +1215,14 @@ class Settings(BaseSettings):
         if mn is not None and mx is not None and mn > 0 and mx > 0 and mn > mx:
             raise ValueError(
                 "TRADE_MIN_ORDER_NOTIONAL_USD must be <= TRADE_MAX_ORDER_NOTIONAL_USD when both are positive"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _theta_yes_ask_band(self) -> "Settings":
+        if self.trade_entry_theta_min_yes_ask_cents > self.trade_entry_theta_max_yes_ask_cents:
+            raise ValueError(
+                "TRADE_ENTRY_THETA_MIN_YES_ASK_CENTS must be <= TRADE_ENTRY_THETA_MAX_YES_ASK_CENTS"
             )
         return self
 
@@ -965,7 +1271,7 @@ class Settings(BaseSettings):
 
     @property
     def trade_entry_effective_min_yes_ask_cents(self) -> int:
-        """Strictest of ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` and American-odds cap (0 = no floor)."""
+        """Strictest of ``TRADE_ENTRY_MIN_YES_ASK_CENTS`` (Kalshi **chance** ≈ this %% on $1) and American-odds cap."""
         floors: list[int] = []
         if self.trade_entry_min_yes_ask_cents > 0:
             floors.append(self.trade_entry_min_yes_ask_cents)
@@ -973,6 +1279,14 @@ class Settings(BaseSettings):
         if am is not None:
             floors.append(am)
         return max(floors) if floors else 0
+
+    @property
+    def trade_entry_skip_substring_tokens(self) -> list[str]:
+        """Uppercase tokens from ``TRADE_ENTRY_SKIP_TICKER_SUBSTRINGS`` (comma-separated)."""
+        raw = (self.trade_entry_skip_ticker_substrings or "").strip()
+        if not raw:
+            return []
+        return [x.strip().upper() for x in raw.split(",") if x.strip()]
 
     def auto_sell_effective_min_yes_bid_cents(self, cli_override: int | None) -> int | None:
         """Min best YES bid (cents) to treat as take-profit-by-implied-%, or None if only profit-margin mode."""
@@ -992,6 +1306,24 @@ class Settings(BaseSettings):
         if self.trade_exit_only_profit_margin:
             return 1.0
         return None
+
+    def trade_exit_min_profit_cents_for_entry(self, entry_cents: int | None) -> float | None:
+        """Min profit (¢/share) vs entry: max(floor, entry×pct), then optional cap. Used for take-profit."""
+        fixed = self.trade_exit_effective_min_profit_cents_per_contract
+        pct = float(self.trade_exit_min_profit_pct_of_entry)
+        out: float | None = float(fixed) if fixed is not None else None
+        if entry_cents is not None and entry_cents >= 1 and pct > 0:
+            scaled = float(entry_cents) * pct
+            if out is not None:
+                out = max(out, scaled)
+            else:
+                out = scaled
+        if out is None:
+            return None
+        cap = self.trade_exit_min_profit_cents_cap
+        if cap is not None:
+            out = min(out, float(cap))
+        return max(0.0, out)
 
 
 @lru_cache

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from kalshi_bot.config import Settings
-from kalshi_bot.edge_math import implied_yes_ask_dollars
+from kalshi_bot.edge_math import implied_no_ask_dollars, implied_yes_ask_dollars
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger, get_logger, maybe_clear_structured_log_after_tickers
 from kalshi_bot.llm_screen import llm_discover_watchlist
@@ -17,9 +17,20 @@ from kalshi_bot.market_data import (
     yes_bid_and_no_bid_cents_for_trading,
 )
 from kalshi_bot.momentum import momentum_buy_intent_if_hot
-from kalshi_bot.portfolio import get_balance_cents
+from kalshi_bot.portfolio import PortfolioSnapshot, fetch_portfolio_snapshot, get_balance_cents
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.strategy import TradeIntent, signal_edge_buy_yes_from_ticker, signal_from_bar, skip_buy_yes_longshot
+from kalshi_bot.strategy import (
+    TradeIntent,
+    choose_entry_side_and_ask_cents,
+    entry_filter_timing_and_event,
+    should_skip_buy_due_to_long_yes_cap,
+    should_skip_buy_ticker_substrings,
+    signal_edge_buy_no_from_ticker,
+    signal_edge_buy_yes_from_ticker,
+    signal_from_bar,
+    signal_from_bar_buy_no,
+    skip_buy_yes_longshot,
+)
 from kalshi_bot.trading import build_sdk_client, trade_execute
 from kalshi_bot.bitcoin_runner import run_bitcoin_sidecar_if_due
 
@@ -33,6 +44,13 @@ class DiscoverRuleRunStats:
     skip_orderbook: int = 0
     skip_no_bids: int = 0
     skip_yes_ask_longshot: int = 0
+    skip_ticker_substring: int = 0
+    skip_long_yes_cap: int = 0
+    skip_theta_decay: int = 0
+    skip_event_not_top_yes: int = 0
+    skip_multi_choice_not_top_n: int = 0
+    skip_multi_choice_below_min: int = 0
+    skip_multi_choice_not_in_event: int = 0
     no_rule_signal: int = 0
     momentum_signal: int = 0
     momentum_candle_error: int = 0
@@ -52,6 +70,13 @@ class DiscoverRuleRunStats:
             f"  skip (orderbook error):             {self.skip_orderbook}",
             f"  skip (no YES/NO bids):              {self.skip_no_bids}",
             f"  skip (YES ask < min / longshot):    {self.skip_yes_ask_longshot}",
+            f"  skip (ticker substring block):      {self.skip_ticker_substring}",
+            f"  skip (long-YES family cap):         {self.skip_long_yes_cap}",
+            f"  skip (theta / near-exp longshot):   {self.skip_theta_decay}",
+            f"  skip (not in event top-N YES):      {self.skip_event_not_top_yes}",
+            f"  skip (multi-choice not top-N):      {self.skip_multi_choice_not_top_n}",
+            f"  skip (multi-choice < min chance):   {self.skip_multi_choice_below_min}",
+            f"  skip (multi-choice ticker missing):  {self.skip_multi_choice_not_in_event}",
             f"  momentum (chart YES) signals:       {self.momentum_signal}",
             f"  momentum candle fetch errors:       {self.momentum_candle_error}",
             f"  no signal from .env rules:          {self.no_rule_signal}",
@@ -99,6 +124,16 @@ def run_discover_rule_pipeline(
     counter = bitcoin_scan_counter if bitcoin_scan_counter is not None else [0]
     btc_rot = bitcoin_rotation_counter if bitcoin_rotation_counter is not None else [0]
 
+    snap_for_cap: PortfolioSnapshot | None = None
+    if settings.trade_entry_cap_long_yes_max > 0 and (settings.trade_entry_cap_long_yes_substring or "").strip():
+        try:
+            snap_for_cap = fetch_portfolio_snapshot(client, ticker=None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("discover_portfolio_snapshot_fail", error=str(exc))
+            snap_for_cap = None
+
+    event_data_cache: dict[str, list[tuple[str, float]] | None] = {}
+
     for i, m in enumerate(markets):
         counter[0] += 1
         try:
@@ -139,18 +174,64 @@ def run_discover_rule_pipeline(
             yes_bid_d = yb_c / 100.0
             yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
             yes_ask_c = int(max(1, min(99, round(yes_ask_d * 100.0))))
-            if skip_buy_yes_longshot(settings, yes_ask_c):
+            no_bid_d = nb_c / 100.0
+            no_ask_d = implied_no_ask_dollars(yb_c / 100.0)
+            entry_side, chosen_ask_c = choose_entry_side_and_ask_cents(
+                settings, yes_ask_cents=yes_ask_c, yes_bid_cents=yb_c, no_bid_cents=nb_c
+            )
+            if should_skip_buy_ticker_substrings(settings, ticker):
+                stats.skip_ticker_substring += 1
+                log.info("discover_skip_ticker_substring", ticker=ticker)
+                continue
+            if snap_for_cap is not None and should_skip_buy_due_to_long_yes_cap(
+                settings, ticker=ticker, snap=snap_for_cap
+            ):
+                stats.skip_long_yes_cap += 1
+                log.info(
+                    "discover_skip_long_yes_cap",
+                    ticker=ticker,
+                    cap=settings.trade_entry_cap_long_yes_max,
+                    substring=(settings.trade_entry_cap_long_yes_substring or "").strip(),
+                )
+                continue
+            if skip_buy_yes_longshot(settings, chosen_ask_c):
                 stats.skip_yes_ask_longshot += 1
                 log.info(
                     "discover_skip_longshot_yes",
                     ticker=ticker,
                     yes_ask_cents=yes_ask_c,
+                    chosen_ask_cents=chosen_ask_c,
+                    entry_side=entry_side,
                     min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
                 )
                 continue
 
+            skip_te, te_reason = entry_filter_timing_and_event(
+                settings, client, ticker, chosen_ask_c, event_data_cache
+            )
+            if skip_te:
+                if te_reason == "theta_decay_longshot":
+                    stats.skip_theta_decay += 1
+                elif te_reason == "not_in_event_top_yes":
+                    stats.skip_event_not_top_yes += 1
+                elif te_reason == "multi_choice_not_top_n":
+                    stats.skip_multi_choice_not_top_n += 1
+                elif te_reason == "multi_choice_below_min_chance":
+                    stats.skip_multi_choice_below_min += 1
+                elif te_reason == "multi_choice_ticker_not_in_event":
+                    stats.skip_multi_choice_not_in_event += 1
+                log.info(
+                    "discover_skip_entry_filter",
+                    ticker=ticker,
+                    reason=te_reason,
+                    yes_ask_cents=yes_ask_c,
+                    chosen_ask_cents=chosen_ask_c,
+                    entry_side=entry_side,
+                )
+                continue
+
             intent: TradeIntent | None = None
-            if settings.trade_momentum_enabled:
+            if entry_side == "yes" and settings.trade_momentum_enabled:
                 try:
                     closes = fetch_yes_close_prices(
                         client,
@@ -175,25 +256,47 @@ def run_discover_rule_pipeline(
                         log.info("discover_momentum_signal", ticker=ticker, note=_mwhy)
 
             if intent is None and settings.trade_use_edge_strategy and settings.trade_fair_yes_prob is not None:
-                intent = signal_edge_buy_yes_from_ticker(
-                    ticker=ticker,
-                    yes_bid_dollars=yes_bid_d,
-                    yes_ask_dollars=yes_ask_d,
-                    settings=settings,
-                )
+                if entry_side == "yes":
+                    intent = signal_edge_buy_yes_from_ticker(
+                        ticker=ticker,
+                        yes_bid_dollars=yes_bid_d,
+                        yes_ask_dollars=yes_ask_d,
+                        settings=settings,
+                    )
+                else:
+                    intent = signal_edge_buy_no_from_ticker(
+                        ticker=ticker,
+                        no_bid_dollars=no_bid_d,
+                        no_ask_dollars=no_ask_d,
+                        settings=settings,
+                    )
             elif intent is None:
-                intent = signal_from_bar(
-                    ticker=ticker,
-                    yes_bid_dollars=yes_bid_d,
-                    yes_ask_dollars=yes_ask_d,
-                    max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
-                    min_spread_dollars=settings.strategy_min_spread_dollars,
-                    probability_gap=settings.strategy_probability_gap,
-                    order_count=settings.strategy_order_count,
-                    limit_price_cents=settings.strategy_limit_price_cents,
-                    max_spread_dollars=settings.trade_max_entry_spread_dollars,
-                    entry_min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
-                )
+                if entry_side == "yes":
+                    intent = signal_from_bar(
+                        ticker=ticker,
+                        yes_bid_dollars=yes_bid_d,
+                        yes_ask_dollars=yes_ask_d,
+                        max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                        min_spread_dollars=settings.strategy_min_spread_dollars,
+                        probability_gap=settings.strategy_probability_gap,
+                        order_count=settings.strategy_order_count,
+                        limit_price_cents=settings.strategy_limit_price_cents,
+                        max_spread_dollars=settings.trade_max_entry_spread_dollars,
+                        entry_min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
+                    )
+                else:
+                    intent = signal_from_bar_buy_no(
+                        ticker=ticker,
+                        no_bid_dollars=no_bid_d,
+                        no_ask_dollars=no_ask_d,
+                        max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                        min_spread_dollars=settings.strategy_min_spread_dollars,
+                        probability_gap=settings.strategy_probability_gap,
+                        order_count=settings.strategy_order_count,
+                        limit_price_cents=settings.strategy_limit_price_cents,
+                        max_spread_dollars=settings.trade_max_entry_spread_dollars,
+                        entry_min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
+                    )
 
             if intent is None:
                 stats.no_rule_signal += 1

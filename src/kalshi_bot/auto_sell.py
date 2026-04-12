@@ -6,15 +6,55 @@ orders unless you set ``good_till_canceled``. Educational wiring only.
 
 from __future__ import annotations
 
+import math
+import threading
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
+
+# High-water best YES bid per ticker for trailing exits (in-process only; resets when flat).
+_PEAK_LOCK = threading.Lock()
+_PEAK_YES_BID_CENTS: dict[str, int] = {}
+
+
+def _clear_peak_yes_bid(ticker: str) -> None:
+    with _PEAK_LOCK:
+        _PEAK_YES_BID_CENTS.pop(ticker, None)
+
+
+def _update_peak_yes_bid(ticker: str, best_bid_cents: int | None) -> int | None:
+    """Update session peak best YES bid; return current peak."""
+    if best_bid_cents is None:
+        with _PEAK_LOCK:
+            return _PEAK_YES_BID_CENTS.get(ticker)
+    with _PEAK_LOCK:
+        prev = _PEAK_YES_BID_CENTS.get(ticker, int(best_bid_cents))
+        peak = max(int(prev), int(best_bid_cents))
+        _PEAK_YES_BID_CENTS[ticker] = peak
+        return peak
+
+
+def implied_yes_chance_cents_from_orderbook(ob: Any, best_yes_bid_cents: int) -> int:
+    """Kalshi-style YES probability in ¢: mid(best YES bid, implied lift YES ask) when the book allows; else bid."""
+    _yb, nb = yes_bid_and_no_bid_cents_for_trading(ob)
+    if nb is None:
+        return max(1, min(99, int(best_yes_bid_cents)))
+    ya_d = implied_yes_ask_dollars(nb / 100.0)
+    ya_c = int(max(1, min(99, round(ya_d * 100.0))))
+    mid = int(round((float(best_yes_bid_cents) + float(ya_c)) / 2.0))
+    return max(1, min(99, mid))
 
 from kalshi_bot.client import KalshiSdkClient
 from kalshi_bot.config import Settings
+from kalshi_bot.edge_math import implied_yes_ask_dollars
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger
-from kalshi_bot.market_data import best_yes_bid_cents, get_orderbook
+from kalshi_bot.market_data import (
+    best_yes_bid_cents,
+    get_orderbook,
+    market_title_for_ticker,
+    yes_bid_and_no_bid_cents_for_trading,
+)
 from kalshi_bot.portfolio import (
     estimate_yes_entry_cents_from_position,
     fetch_portfolio_snapshot,
@@ -60,13 +100,13 @@ def collect_exit_scan_rows(
     tickers = sorted(t for t, s in snap.positions_by_ticker.items() if s > 0)
     rows: list[ExitScanRow] = []
     eff_floor = settings.auto_sell_effective_min_yes_bid_cents(cli_min_yes_bid_cents)
-    mpc = settings.trade_exit_effective_min_profit_cents_per_contract
     for ticker in tickers:
         signed = float(snap.positions_by_ticker.get(ticker, 0.0))
         entry_ref = _resolve_entry_reference(settings, client, ticker, log)
+        mpc = settings.trade_exit_min_profit_cents_for_entry(entry_ref.cents)
         min_profit_bid: int | None = None
         if mpc is not None and entry_ref.cents is not None:
-            min_profit_bid = int(entry_ref.cents + mpc)
+            min_profit_bid = int(math.ceil(float(entry_ref.cents) + mpc - 1e-9))
 
         ob = get_orderbook(client, ticker)
         best = best_yes_bid_cents(ob)
@@ -85,12 +125,32 @@ def collect_exit_scan_rows(
             )
             continue
 
+        hmin = settings.trade_exit_hold_to_settlement_min_chance_cents
+        if hmin > 0:
+            chance = implied_yes_chance_cents_from_orderbook(ob, best)
+            if chance >= hmin:
+                rows.append(
+                    ExitScanRow(
+                        ticker=ticker,
+                        long_yes_shares=signed,
+                        best_yes_bid_cents=best,
+                        entry_yes_cents=entry_ref.cents,
+                        effective_min_yes_bid_cents=eff_floor,
+                        min_bid_for_profit_rule_cents=min_profit_bid,
+                        would_take_profit=False,
+                        detail=f"hold_to_settlement_chance_{chance}_min_{hmin}",
+                    )
+                )
+                continue
+
+        peak = _update_peak_yes_bid(ticker, best)
         fire, reason = _should_fire_exit(
             best_bid_cents=best,
             settings=settings,
             cli_min_yes_bid_cents=cli_min_yes_bid_cents,
             entry_ref_cents=entry_ref.cents,
             entry_source=entry_ref.source,
+            peak_bid_cents=peak,
         )
         rows.append(
             ExitScanRow(
@@ -117,7 +177,7 @@ def format_exit_scan_summary(rows: list[ExitScanRow]) -> list[str]:
         ]
     lines = [
         "--- exit-scan (cashout check) ---",
-        "  Rules: stop-loss vs entry, TRADE_EXIT_* / TRADE_TAKE_PROFIT_* / TRADE_EXIT_ONLY_PROFIT_MARGIN (same as auto-sell).",
+        "  Rules (same as auto-sell): if implied YES chance (mid bid/ask) ≥ TRADE_EXIT_HOLD_TO_SETTLEMENT_MIN_CHANCE_CENTS, no exit (hold to settlement). Else: take-profit vs entry, else trailing/raised stop, else classic stop.",
         f"  {'ticker':<28} {'shares':>6} {'bid¢':>5} {'entry¢':>7} {'floor¢':>6} {'profit≥¢':>8}  would_exit  detail",
     ]
     ready = 0
@@ -155,6 +215,33 @@ def _resolve_entry_reference(
     return EntryReference(None, "none")
 
 
+def _entry_stop_floor_cents(entry_cents: int, fraction: float) -> int:
+    return max(1, min(99, int(round(entry_cents * fraction))))
+
+
+def _lock_floor_cents(
+    settings: Settings, entry_ref_cents: int | None, peak_bid_cents: int | None
+) -> int | None:
+    """Minimum bid (¢) that locks at least ``TRADE_EXIT_LOCK_PROFIT_CENTS`` profit once peak has reached it."""
+    lc = settings.trade_exit_lock_profit_cents
+    if lc is None or lc <= 0 or entry_ref_cents is None or peak_bid_cents is None:
+        return None
+    if not (1 <= entry_ref_cents <= 99):
+        return None
+    need = float(entry_ref_cents) + float(lc)
+    if float(peak_bid_cents) + 1e-9 < need:
+        return None
+    return max(1, min(99, int(round(entry_ref_cents + float(lc)))))
+
+
+def _trailing_pullback_amount_cents(settings: Settings, peak_cents: int) -> float:
+    c = float(settings.trade_exit_trailing_pullback_cents)
+    p = float(settings.trade_exit_trailing_pullback_pct_of_peak)
+    if p > 0:
+        return max(c, float(peak_cents) * p)
+    return c
+
+
 def _should_fire_exit(
     *,
     best_bid_cents: int,
@@ -162,28 +249,26 @@ def _should_fire_exit(
     cli_min_yes_bid_cents: int | None,
     entry_ref_cents: int | None,
     entry_source: Literal["manual", "portfolio", "none"] = "none",
+    peak_bid_cents: int | None = None,
 ) -> tuple[bool, str]:
-    """True if we should submit a sell (stop-loss vs entry, then take-profit rules).
+    """True if we should submit a sell.
 
-    Stop-loss math (long YES): ``stop_floor = round(entry_ref_cents * fraction)``, clamped 1–99.
-    Fire when ``best_bid_cents <= stop_floor``. So fraction=0.5 means “bid at or below half of *estimated*
-    entry in cents” (e.g. entry 40¢ → floor 20¢). This is not the same as “−50% return”; P/L vs entry
-    still depends on fill. Entry comes from manual ``TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS`` or
-    ``estimate_yes_entry_cents_from_position`` (API-derived; can be wrong—see portfolio helper).
+    **Priority:** take-profit (bid vs entry + min profit) → trailing / raised stop → classic stop-loss.
 
-    When ``TRADE_EXIT_STOP_LOSS_SKIP_SUSPECT_PORTFOLIO_ESTIMATE`` is true, portfolio-derived entries
-    at ≤5¢ or ≥95¢ are not used for stop-loss (avoids false exits from bad averages like ~99¢).
+    Trailing: session peak best YES bid per ticker; when peak clears entry + activation, exit if
+    bid ≤ max(raised fixed floor, peak − pullback). Raised floor uses optional
+    ``TRADE_EXIT_TRAILING_STOP_LOSS_FLOOR_FRACTION`` vs ``TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION``.
     """
     skipped_suspect_stop = False
     would_have_stop_floor: int | None = None
+    fixed_floor_base: int | None = None
+    frac_base = float(settings.trade_exit_stop_loss_entry_fraction)
+
     if (
         settings.trade_exit_stop_loss_enabled
         and entry_ref_cents is not None
         and 1 <= entry_ref_cents <= 99
     ):
-        frac = float(settings.trade_exit_stop_loss_entry_fraction)
-        stop_floor = max(1, min(99, int(round(entry_ref_cents * frac))))
-        would_have_stop_floor = stop_floor
         skip_suspect = (
             settings.trade_exit_stop_loss_skip_suspect_portfolio_estimate
             and entry_source == "portfolio"
@@ -191,21 +276,77 @@ def _should_fire_exit(
         )
         if skip_suspect:
             skipped_suspect_stop = True
-        elif best_bid_cents <= stop_floor:
-            return True, "stop_loss_entry_fraction"
+        else:
+            fixed_floor_base = _entry_stop_floor_cents(entry_ref_cents, frac_base)
+            would_have_stop_floor = fixed_floor_base
+
+    armed = (
+        settings.trade_exit_trailing_enabled
+        and peak_bid_cents is not None
+        and entry_ref_cents is not None
+        and peak_bid_cents >= entry_ref_cents + settings.trade_exit_trailing_activate_above_entry_cents
+    )
+    frac_for_trailing = frac_base
+    if armed and settings.trade_exit_trailing_stop_loss_floor_fraction is not None:
+        frac_for_trailing = max(frac_for_trailing, float(settings.trade_exit_trailing_stop_loss_floor_fraction))
 
     t_min = settings.auto_sell_effective_min_yes_bid_cents(cli_min_yes_bid_cents)
     pct_hit = t_min is not None and best_bid_cents >= t_min
 
+    mpc = settings.trade_exit_min_profit_cents_for_entry(entry_ref_cents)
     profit_hit = False
-    mpc = settings.trade_exit_effective_min_profit_cents_per_contract
     if mpc is not None and entry_ref_cents is not None:
-        need = entry_ref_cents + mpc
-        profit_hit = best_bid_cents >= need
+        need_bid = int(math.ceil(float(entry_ref_cents) + mpc - 1e-9))
+        profit_hit = best_bid_cents >= need_bid
 
+    # 1) Take-profit (first)
     if settings.trade_exit_only_profit_margin:
         if profit_hit:
             return True, "take_profit_profit_margin"
+    else:
+        if pct_hit and profit_hit:
+            return True, "take_profit_implied_pct_and_margin"
+        if pct_hit:
+            return True, "take_profit_implied_pct"
+        if profit_hit:
+            return True, "take_profit_profit_margin"
+
+    lock_floor = _lock_floor_cents(settings, entry_ref_cents, peak_bid_cents)
+
+    # 2) Trailing / combined stop + profit lock (peak ≥ entry+lock raises floor to entry+lock; then flux = trail)
+    if (
+        settings.trade_exit_trailing_enabled
+        and armed
+        and peak_bid_cents is not None
+        and entry_ref_cents is not None
+    ):
+        pull = _trailing_pullback_amount_cents(settings, peak_bid_cents)
+        trail_floor = max(1, min(99, int(math.ceil(float(peak_bid_cents) - pull - 1e-9))))
+        if settings.trade_exit_trailing_combine_with_fixed_stop and not skipped_suspect_stop:
+            fixed_for_max = _entry_stop_floor_cents(entry_ref_cents, frac_for_trailing)
+            eff_stop = max(fixed_for_max, trail_floor)
+        else:
+            eff_stop = trail_floor
+        if lock_floor is not None:
+            eff_stop = max(eff_stop, lock_floor)
+        if best_bid_cents <= eff_stop:
+            return True, "trailing_stop_pullback"
+
+    if lock_floor is not None and best_bid_cents <= lock_floor:
+        return True, "profit_lock_stop"
+
+    # 3) Classic fixed stop (entry × fraction; no trailing boost)
+    if (
+        settings.trade_exit_stop_loss_enabled
+        and entry_ref_cents is not None
+        and 1 <= entry_ref_cents <= 99
+        and not skipped_suspect_stop
+        and fixed_floor_base is not None
+        and best_bid_cents <= fixed_floor_base
+    ):
+        return True, "stop_loss_entry_fraction"
+
+    if settings.trade_exit_only_profit_margin:
         if (
             skipped_suspect_stop
             and would_have_stop_floor is not None
@@ -214,12 +355,6 @@ def _should_fire_exit(
             return False, "wait_stop_loss_skipped_suspect_portfolio_entry"
         return False, "wait_profit_only_mode"
 
-    if pct_hit and profit_hit:
-        return True, "take_profit_implied_pct_and_margin"
-    if pct_hit:
-        return True, "take_profit_implied_pct"
-    if profit_hit:
-        return True, "take_profit_profit_margin"
     if (
         skipped_suspect_stop
         and would_have_stop_floor is not None
@@ -242,6 +377,8 @@ def _format_auto_sell_profit_line(
     kind = ""
     if exit_reason.startswith("stop_loss"):
         kind = "stop-loss "
+    elif exit_reason.startswith("trailing_stop") or exit_reason.startswith("profit_lock"):
+        kind = "trailing-stop " if exit_reason.startswith("trailing_stop") else "profit-lock "
     elif exit_reason.startswith("take_profit"):
         kind = "take-profit "
     if entry_ref is not None:
@@ -277,16 +414,21 @@ def try_auto_sell_exit_for_ticker(
     snap = fetch_portfolio_snapshot(client, ticker=ticker)
     signed = snap.positions_by_ticker.get(ticker, 0.0)
     if signed <= 0:
+        _clear_peak_yes_bid(ticker)
         if log_waits:
             log.info("auto_sell_skip", reason="no_long_yes", ticker=ticker, signed=signed)
         return "no_long_yes", None, None
 
     entry_ref = _resolve_entry_reference(settings, client, ticker, log)
-    if settings.trade_exit_effective_min_profit_cents_per_contract is not None and entry_ref.cents is None:
+    if entry_ref.cents is None and (
+        settings.trade_exit_effective_min_profit_cents_per_contract is not None
+        or settings.trade_exit_min_profit_pct_of_entry > 0
+    ):
         log.warning(
             "auto_sell_no_entry_reference",
             ticker=ticker,
-            hint="set TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS or enable TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO",
+            hint="set TRADE_EXIT_ENTRY_REFERENCE_YES_CENTS or enable TRADE_EXIT_ESTIMATE_ENTRY_FROM_PORTFOLIO "
+            "(required for take-profit vs entry when using min profit or TRADE_EXIT_MIN_PROFIT_PCT_OF_ENTRY)",
         )
 
     ob = get_orderbook(client, ticker)
@@ -296,12 +438,29 @@ def try_auto_sell_exit_for_ticker(
             log.info("auto_sell_skip", reason="no_yes_bids", ticker=ticker)
         return "no_yes_bids", None, None
 
+    hmin = settings.trade_exit_hold_to_settlement_min_chance_cents
+    if hmin > 0:
+        chance = implied_yes_chance_cents_from_orderbook(ob, best)
+        if chance >= hmin:
+            if log_waits:
+                log.info(
+                    "auto_sell_wait",
+                    ticker=ticker,
+                    reason="hold_to_settlement",
+                    implied_yes_chance_cents=chance,
+                    hold_min_chance_cents=hmin,
+                    best_yes_bid_cents=best,
+                )
+            return "wait", None, None
+
+    peak = _update_peak_yes_bid(ticker, best)
     fire, reason = _should_fire_exit(
         best_bid_cents=best,
         settings=settings,
         cli_min_yes_bid_cents=cli_min_yes_bid_cents,
         entry_ref_cents=entry_ref.cents,
         entry_source=entry_ref.source,
+        peak_bid_cents=peak,
     )
     if not fire:
         if log_waits:
@@ -336,9 +495,18 @@ def try_auto_sell_exit_for_ticker(
         frac = float(settings.trade_exit_stop_loss_entry_fraction)
         fire_extra["stop_loss_floor_yes_bid_cents"] = max(1, min(99, int(round(entry_ref.cents * frac))))
         fire_extra["stop_loss_entry_fraction"] = frac
+    if reason == "trailing_stop_pullback" and peak is not None:
+        fire_extra["trailing_peak_yes_bid_cents"] = peak
+        fire_extra["trailing_pullback_cents"] = settings.trade_exit_trailing_pullback_cents
+    if reason == "profit_lock_stop" and entry_ref.cents is not None and settings.trade_exit_lock_profit_cents:
+        fire_extra["profit_lock_floor_yes_bid_cents"] = max(
+            1, min(99, int(round(entry_ref.cents + float(settings.trade_exit_lock_profit_cents))))
+        )
+    market_title = market_title_for_ticker(client, ticker)
     log.info(
         "auto_sell_fire",
         ticker=ticker,
+        market_title=market_title,
         count=count,
         limit_yes_price_cents=limit_cents,
         best_yes_bid_cents=best,
@@ -358,6 +526,7 @@ def try_auto_sell_exit_for_ticker(
     log.info(
         "auto_sell_profit_estimate",
         ticker=ticker,
+        market_title=market_title,
         count=count,
         shares=count,
         limit_yes_price_cents=limit_cents,
@@ -372,6 +541,7 @@ def try_auto_sell_exit_for_ticker(
         exit_reason=reason,
         event_payload={
             "ticker": ticker,
+            "market_title": market_title,
             "count": count,
             "shares": count,
             "limit_yes_price_cents": limit_cents,
@@ -430,6 +600,67 @@ def auto_sell_scan_all_long_yes(
             )
             lines.append(f"exit-scan: {label} sell — {summary}")
     return sold, lines
+
+
+def liquidate_all_long_yes_positions(
+    client: KalshiSdkClient,
+    settings: Settings,
+    *,
+    log: StructuredLogger,
+    execute: bool,
+) -> tuple[int, list[str]]:
+    """Sell every long YES at best bid minus aggression (``TRADE_EXIT_SELL_*``); ignores take-profit rules.
+
+    When ``execute`` is false, only prints intended orders. When true, submits via ``trade_execute`` (respects
+    ``DRY_RUN`` / ``LIVE_TRADING``).
+    """
+    risk = RiskManager(settings)
+    ledger = DryRunLedger()
+    snap = fetch_portfolio_snapshot(client, ticker=None)
+    tickers = sorted(t for t, s in snap.positions_by_ticker.items() if s > 0)
+    lines: list[str] = []
+    n = 0
+    for ticker in tickers:
+        signed = float(snap.positions_by_ticker.get(ticker, 0.0))
+        cnt = int(round(signed))
+        if cnt < 1:
+            lines.append(f"{ticker}: skip (position < 1 contract)")
+            continue
+        ob = get_orderbook(client, ticker)
+        best = best_yes_bid_cents(ob)
+        if best is None:
+            lines.append(f"{ticker}: skip (no YES bids)")
+            continue
+        limit_cents = max(1, best - settings.trade_exit_sell_aggression_cents)
+        tif = settings.trade_exit_sell_time_in_force
+        intent = make_limit_intent(
+            ticker=ticker,
+            side="yes",
+            action="sell",
+            count=cnt,
+            yes_price_cents=limit_cents,
+            time_in_force=tif,
+        )
+        title = (market_title_for_ticker(client, ticker) or "")[:80]
+        if not execute:
+            lines.append(f"{ticker}: would sell {cnt} YES @ {limit_cents}¢ — {title}")
+            continue
+        log.info(
+            "liquidate_all_long_yes",
+            ticker=ticker,
+            market_title=title,
+            count=cnt,
+            limit_yes_price_cents=limit_cents,
+            best_yes_bid_cents=best,
+            time_in_force=tif,
+        )
+        trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
+        n += 1
+        lines.append(f"{ticker}: submitted sell {cnt} YES @ {limit_cents}¢")
+        sp = settings.trade_submit_spacing_seconds
+        if sp > 0:
+            time.sleep(float(sp))
+    return n, lines
 
 
 def run_auto_sell_loop(

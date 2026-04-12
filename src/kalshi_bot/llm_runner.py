@@ -6,7 +6,13 @@ import random
 from dataclasses import dataclass
 
 from kalshi_bot.config import Settings
-from kalshi_bot.edge_math import implied_yes_ask_dollars, min_edge_threshold_for_mid, net_edge_buy_yes_long
+from kalshi_bot.edge_math import (
+    implied_no_ask_dollars,
+    implied_yes_ask_dollars,
+    min_edge_threshold_for_mid,
+    net_edge_buy_no_long,
+    net_edge_buy_yes_long,
+)
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger, get_logger, maybe_clear_structured_log_after_tickers
 from kalshi_bot.market_data import (
@@ -20,10 +26,16 @@ from kalshi_bot.market_data import (
     yes_bid_and_no_bid_cents_for_trading,
 )
 from kalshi_bot.momentum import momentum_buy_intent_if_hot
-from kalshi_bot.portfolio import get_balance_cents
+from kalshi_bot.portfolio import PortfolioSnapshot, fetch_portfolio_snapshot, get_balance_cents
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import effective_max_contracts
-from kalshi_bot.strategy import skip_buy_yes_longshot
+from kalshi_bot.strategy import (
+    choose_entry_side_and_ask_cents,
+    entry_filter_timing_and_event,
+    should_skip_buy_due_to_long_yes_cap,
+    should_skip_buy_ticker_substrings,
+    skip_buy_yes_longshot,
+)
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
 from kalshi_bot.log_insights import adaptive_edge_deltas_from_wl, aggregate_structured_log_tail
 from kalshi_bot.llm_screen import LLMOpportunityVerdict, llm_evaluate_opportunity
@@ -49,6 +61,13 @@ class LLMTradeRunStats:
     blocked_zero_contracts_balance: int = 0
     skip_zero_contracts_after_verdict: int = 0
     skip_yes_ask_longshot: int = 0
+    skip_ticker_substring: int = 0
+    skip_long_yes_cap: int = 0
+    skip_theta_decay: int = 0
+    skip_event_not_top_yes: int = 0
+    skip_multi_choice_not_top_n: int = 0
+    skip_multi_choice_below_min: int = 0
+    skip_multi_choice_not_in_event: int = 0
     blocked_trade_llm_auto_execute_false: int = 0
     submitted: int = 0
     # Filled each run so the summary explains why nothing submitted without reading logs
@@ -82,6 +101,13 @@ class LLMTradeRunStats:
                 f"  skip (balance→0 shares):      {self.blocked_zero_contracts_balance}",
                 f"  skip (verdict size 0):        {self.skip_zero_contracts_after_verdict}",
                 f"  skip (YES ask < min longshot): {self.skip_yes_ask_longshot}",
+                f"  skip (ticker substring block):  {self.skip_ticker_substring}",
+                f"  skip (long-YES family cap):     {self.skip_long_yes_cap}",
+                f"  skip (theta / near-exp longshot): {self.skip_theta_decay}",
+                f"  skip (not in event top-N YES):  {self.skip_event_not_top_yes}",
+                f"  skip (multi-choice not top-N):    {self.skip_multi_choice_not_top_n}",
+                f"  skip (multi-choice < min chance): {self.skip_multi_choice_below_min}",
+                f"  skip (multi-choice ticker missing): {self.skip_multi_choice_not_in_event}",
                 f"  momentum bypass (chart YES):  {self.momentum_llm_bypass}",
                 f"  momentum candle fetch errors: {self.momentum_candle_error}",
                 f"  skipped (--execute false):    {self.skipped_cli_no_execute}",
@@ -140,18 +166,81 @@ def _passes_bot_edge(
     return True
 
 
+def _passes_bot_edge_no(
+    settings: Settings,
+    *,
+    fair_no: float,
+    no_bid_dollars: float,
+    no_ask_dollars: float,
+    contracts: int,
+    min_net_edge: float | None = None,
+    middle_extra_edge: float | None = None,
+) -> bool:
+    """Fee-aware edge gate for buy NO (same thresholds as YES)."""
+    base_min = settings.trade_min_net_edge_after_fees if min_net_edge is None else min_net_edge
+    mid_boost = settings.trade_edge_middle_extra_edge if middle_extra_edge is None else middle_extra_edge
+    edge = net_edge_buy_no_long(fair_no=fair_no, no_ask_dollars=no_ask_dollars, contracts=contracts)
+    mid = (no_bid_dollars + no_ask_dollars) / 2.0
+    need = min_edge_threshold_for_mid(
+        mid,
+        base_min_edge=base_min,
+        middle_extra=mid_boost,
+    )
+    if edge < need:
+        return False
+    if no_ask_dollars > settings.strategy_max_yes_ask_dollars:
+        return False
+    spread = max(0.0, no_ask_dollars - no_bid_dollars)
+    if spread < settings.strategy_min_spread_dollars:
+        return False
+    if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
+        return False
+    return True
+
+
 def _passes_bot_math_for_llm(
     settings: Settings,
     *,
     fair_yes: float,
     yes_bid_dollars: float,
     yes_ask_dollars: float,
+    no_bid_dollars: float,
+    no_ask_dollars: float,
+    entry_side: str,
     contracts: int,
     llm_decline_overridden: bool,
     adaptive_min_add: float = 0.0,
     adaptive_mid_add: float = 0.0,
 ) -> bool:
     """Strict fee-edge check, or when LLM declined but fair is near ask, only book-quality checks."""
+    if entry_side == "no":
+        spread = max(0.0, no_ask_dollars - no_bid_dollars)
+        if no_ask_dollars > settings.strategy_max_yes_ask_dollars:
+            return False
+        if spread < settings.strategy_min_spread_dollars:
+            return False
+        if settings.trade_max_entry_spread_dollars is not None and spread > settings.trade_max_entry_spread_dollars:
+            return False
+        fair_no = 1.0 - fair_yes
+        if (
+            llm_decline_overridden
+            and settings.trade_llm_accept_when_fair_covers_ask
+            and fair_no >= no_ask_dollars - settings.trade_llm_fair_ask_slippage
+        ):
+            return True
+        mn, me = _llm_effective_edge_thresholds(
+            settings, adaptive_min_add=adaptive_min_add, adaptive_mid_add=adaptive_mid_add
+        )
+        return _passes_bot_edge_no(
+            settings,
+            fair_no=fair_no,
+            no_bid_dollars=no_bid_dollars,
+            no_ask_dollars=no_ask_dollars,
+            contracts=contracts,
+            min_net_edge=mn,
+            middle_extra_edge=me,
+        )
+
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
     if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
         return False
@@ -322,6 +411,16 @@ def run_llm_opportunity_pipeline(
             flush=True,
         )
 
+    snap_for_cap: PortfolioSnapshot | None = None
+    if settings.trade_entry_cap_long_yes_max > 0 and (settings.trade_entry_cap_long_yes_substring or "").strip():
+        try:
+            snap_for_cap = fetch_portfolio_snapshot(client, ticker=None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("llm_trade_portfolio_snapshot_fail", error=str(exc))
+            snap_for_cap = None
+
+    event_data_cache: dict[str, list[tuple[str, float]] | None] = {}
+
     for i, (ticker, title) in enumerate(rows):
         try:
             te = tape_entries[i] if tape_entries is not None else None
@@ -368,19 +467,67 @@ def run_llm_opportunity_pipeline(
             yes_bid_d = yb_c / 100.0
             yes_ask_d = implied_yes_ask_dollars(nb_c / 100.0)
             yes_ask_c = int(max(1, min(99, round(yes_ask_d * 100.0))))
+            no_bid_d = nb_c / 100.0
+            no_ask_d = implied_no_ask_dollars(yb_c / 100.0)
+            no_ask_c = int(max(1, min(99, round(no_ask_d * 100.0))))
+            entry_side, chosen_ask_c = choose_entry_side_and_ask_cents(
+                settings, yes_ask_cents=yes_ask_c, yes_bid_cents=yb_c, no_bid_cents=nb_c
+            )
 
-            if skip_buy_yes_longshot(settings, yes_ask_c):
+            if should_skip_buy_ticker_substrings(settings, ticker):
+                stats.skip_ticker_substring += 1
+                log.info("llm_trade_skip_ticker_substring", ticker=ticker)
+                continue
+            if snap_for_cap is not None and should_skip_buy_due_to_long_yes_cap(
+                settings, ticker=ticker, snap=snap_for_cap
+            ):
+                stats.skip_long_yes_cap += 1
+                log.info(
+                    "llm_trade_skip_long_yes_cap",
+                    ticker=ticker,
+                    cap=settings.trade_entry_cap_long_yes_max,
+                    substring=(settings.trade_entry_cap_long_yes_substring or "").strip(),
+                )
+                continue
+
+            if skip_buy_yes_longshot(settings, chosen_ask_c):
                 stats.skip_yes_ask_longshot += 1
                 log.info(
                     "llm_trade_skip_longshot_yes",
                     ticker=ticker,
                     yes_ask_cents=yes_ask_c,
+                    chosen_ask_cents=chosen_ask_c,
+                    entry_side=entry_side,
                     min_yes_ask_cents=settings.trade_entry_effective_min_yes_ask_cents,
                 )
                 continue
 
+            skip_te, te_reason = entry_filter_timing_and_event(
+                settings, client, ticker, chosen_ask_c, event_data_cache
+            )
+            if skip_te:
+                if te_reason == "theta_decay_longshot":
+                    stats.skip_theta_decay += 1
+                elif te_reason == "not_in_event_top_yes":
+                    stats.skip_event_not_top_yes += 1
+                elif te_reason == "multi_choice_not_top_n":
+                    stats.skip_multi_choice_not_top_n += 1
+                elif te_reason == "multi_choice_below_min_chance":
+                    stats.skip_multi_choice_below_min += 1
+                elif te_reason == "multi_choice_ticker_not_in_event":
+                    stats.skip_multi_choice_not_in_event += 1
+                log.info(
+                    "llm_trade_skip_entry_filter",
+                    ticker=ticker,
+                    reason=te_reason,
+                    yes_ask_cents=yes_ask_c,
+                    chosen_ask_cents=chosen_ask_c,
+                    entry_side=entry_side,
+                )
+                continue
+
             max_allowed = effective_max_contracts(
-                settings, balance_cents=bal, yes_price_cents=yes_ask_c
+                settings, balance_cents=bal, yes_price_cents=chosen_ask_c
             )
             if max_allowed < 1:
                 stats.blocked_zero_contracts_balance += 1
@@ -389,10 +536,12 @@ def run_llm_opportunity_pipeline(
                     ticker=ticker,
                     balance_cents=bal,
                     yes_ask_cents=yes_ask_c,
+                    chosen_ask_cents=chosen_ask_c,
+                    entry_side=entry_side,
                 )
                 continue
 
-            if settings.trade_momentum_enabled and settings.trade_momentum_llm_bypass:
+            if entry_side == "yes" and settings.trade_momentum_enabled and settings.trade_momentum_llm_bypass:
                 try:
                     closes = fetch_yes_close_prices(
                         client,
@@ -468,6 +617,11 @@ def run_llm_opportunity_pipeline(
                 tape_rank=te.rank if te else None,
                 tape_public_trade_count=te.public_trade_count if te else None,
                 tape_universe_size=len(tape_entries) if te else None,
+                no_bid_cents=nb_c,
+                no_ask_cents=no_ask_c,
+                no_bid_dollars=no_bid_d,
+                no_ask_dollars=no_ask_d,
+                entry_side=entry_side,
             )
             if verdict is None:
                 stats.llm_no_verdict += 1
@@ -488,19 +642,23 @@ def run_llm_opportunity_pipeline(
             )
 
             llm_decline_overridden = False
-            if not verdict.approve or not verdict.buy_yes:
-                if (
-                    settings.trade_llm_accept_when_fair_covers_ask
-                    and verdict.fair_yes >= yes_ask_d - settings.trade_llm_fair_ask_slippage
-                ):
-                    llm_decline_overridden = True
+            if not verdict.approve or (entry_side == "yes" and not verdict.buy_yes):
+                slip = settings.trade_llm_fair_ask_slippage
+                if settings.trade_llm_accept_when_fair_covers_ask:
+                    if entry_side == "yes" and verdict.fair_yes >= yes_ask_d - slip:
+                        llm_decline_overridden = True
+                    elif entry_side == "no" and (1.0 - verdict.fair_yes) >= no_ask_d - slip:
+                        llm_decline_overridden = True
+                if llm_decline_overridden:
                     stats.llm_fair_ask_override += 1
                     log.info(
                         "llm_trade_decline_overridden",
                         ticker=ticker,
                         fair_yes=verdict.fair_yes,
+                        entry_side=entry_side,
                         yes_ask_dollars=yes_ask_d,
-                        slippage=settings.trade_llm_fair_ask_slippage,
+                        no_ask_dollars=no_ask_d,
+                        slippage=slip,
                         reason=verdict.reason[:300],
                     )
                 else:
@@ -510,6 +668,7 @@ def run_llm_opportunity_pipeline(
                         ticker=ticker,
                         approve=verdict.approve,
                         buy_yes=verdict.buy_yes,
+                        entry_side=entry_side,
                     )
                     continue
 
@@ -520,25 +679,40 @@ def run_llm_opportunity_pipeline(
                 continue
             if wl_stress:
                 count = min(count, 1)
-            limit_c = max(1, min(99, min(verdict.limit_yes_price_cents, yes_ask_c)))
+            if entry_side == "yes":
+                limit_c = max(1, min(99, min(verdict.limit_yes_price_cents, yes_ask_c)))
+            else:
+                limit_c = max(1, min(99, no_ask_c))
+            eff_floor = settings.trade_entry_effective_min_yes_ask_cents
+            if eff_floor > 0:
+                limit_c = max(limit_c, eff_floor)
+                limit_c = min(limit_c, yes_ask_c if entry_side == "yes" else no_ask_c)
 
             if not _passes_bot_math_for_llm(
                 settings,
                 fair_yes=verdict.fair_yes,
                 yes_bid_dollars=yes_bid_d,
                 yes_ask_dollars=yes_ask_d,
+                no_bid_dollars=no_bid_d,
+                no_ask_dollars=no_ask_d,
+                entry_side=entry_side,
                 contracts=count,
                 llm_decline_overridden=llm_decline_overridden,
                 adaptive_min_add=ad_min,
                 adaptive_mid_add=ad_mid,
             ):
                 stats.bot_math_rejected += 1
-                log.info("llm_trade_rejected_by_bot_math", ticker=ticker, fair_yes=verdict.fair_yes)
+                log.info(
+                    "llm_trade_rejected_by_bot_math",
+                    ticker=ticker,
+                    fair_yes=verdict.fair_yes,
+                    entry_side=entry_side,
+                )
                 continue
 
             intent = make_limit_intent(
                 ticker=ticker,
-                side="yes",
+                side=entry_side,
                 action="buy",
                 count=count,
                 yes_price_cents=limit_c,

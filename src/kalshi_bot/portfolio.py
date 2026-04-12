@@ -88,6 +88,14 @@ def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = No
     )
 
 
+def count_long_yes_positions_matching_substring(snap: PortfolioSnapshot, substring: str) -> int:
+    """Count distinct market tickers with positive YES position where ``ticker`` contains ``substring`` (case-insensitive)."""
+    if not (substring or "").strip():
+        return 0
+    u = substring.strip().upper()
+    return sum(1 for t, s in snap.positions_by_ticker.items() if s > 0 and u in t.upper())
+
+
 @with_rest_retry
 def get_market_position_row(client: KalshiSdkClient, ticker: str) -> object | None:
     """Return the raw ``market_positions`` row for ``ticker``, or None."""

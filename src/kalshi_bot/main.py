@@ -21,6 +21,7 @@ from kalshi_bot.auto_sell import (
     auto_sell_scan_all_long_yes,
     collect_exit_scan_rows,
     format_exit_scan_summary,
+    liquidate_all_long_yes_positions,
     run_auto_sell_loop,
 )
 from kalshi_bot.backtest import load_price_records_jsonl, parameter_sweep, run_rule_backtest, walk_forward_eval
@@ -134,7 +135,8 @@ def cmd_llm_trade(
                 run_stats = err
             assert run_stats is not None
             print(f"Orders submitted this run (0 = none or scan-only): {n}")
-            for line in run_stats.lines():
+            summary_lines = run_stats.lines()
+            for line in summary_lines:
                 print(line, flush=True)
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -201,7 +203,8 @@ def cmd_discover_trade(
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             print(f"Orders submitted this run (0 = none): {n}")
-            for line in run_stats.lines():
+            summary_lines = run_stats.lines()
+            for line in summary_lines:
                 print(line, flush=True)
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -272,7 +275,8 @@ def cmd_tape_trade(
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             print(f"Orders submitted this run (0 = none): {n}")
-            for line in run_stats.lines():
+            summary_lines = run_stats.lines()
+            for line in summary_lines:
                 print(line, flush=True)
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -342,7 +346,8 @@ def cmd_bitcoin_trade(
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             print(f"Orders submitted this run (0 = none): {n}")
-            for line in run_stats.lines():
+            summary_lines = run_stats.lines()
+            for line in summary_lines:
                 print(line, flush=True)
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -500,6 +505,27 @@ def cmd_exit_scan(
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         print("\nexit-scan loop stopped.", file=sys.stderr)
+
+
+def cmd_sell_all(settings: Settings, *, execute: bool) -> None:
+    """Flatten all long YES: IOC-style limits at best bid (ignores take-profit / stop rules)."""
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    client = build_sdk_client(settings)
+    n, lines = liquidate_all_long_yes_positions(client, settings, log=log, execute=execute)
+    print("--- sell-all (liquidate long YES) ---", flush=True)
+    for line in lines:
+        print(line, flush=True)
+    if execute:
+        print(f"Orders submitted (accepted by bot path): {n}", flush=True)
+        if settings.dry_run:
+            print("  (DRY_RUN=true — simulated; set DRY_RUN=false + LIVE_TRADING=true for real sells.)", flush=True)
+    else:
+        print(
+            f"Planned exits: {len(lines)}  (re-run with --execute to run through trade_execute; live needs LIVE_TRADING + not DRY_RUN)",
+            flush=True,
+        )
 
 
 def cmd_auto_sell(
@@ -866,6 +892,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("cancel-all", help="Cancel all resting orders")
 
+    sa = sub.add_parser(
+        "sell-all",
+        help="Sell every long YES at best bid (IOC-style); ignores take-profit rules — use with care",
+    )
+    sa.add_argument(
+        "--execute",
+        action="store_true",
+        help="Submit sells (otherwise print planned liquidations only)",
+    )
+
     ase = sub.add_parser(
         "auto-sell",
         help="Poll best YES bid; when bid >= floor, limit-sell long YES at that bid (set min in CLI or .env)",
@@ -1023,6 +1059,8 @@ def main(argv: list[str] | None = None) -> None:
             )
         elif cmd == "cancel-all":
             cmd_cancel_all(settings)
+        elif cmd == "sell-all":
+            cmd_sell_all(settings, execute=bool(getattr(args, "execute", False)))
         elif cmd == "run":
             cmd_run_bot(settings)
         elif cmd == "backtest":

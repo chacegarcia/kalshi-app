@@ -12,6 +12,7 @@ from kalshi_python_sync.models.order import Order
 from kalshi_bot.client import KalshiSdkClient, with_rest_retry
 from kalshi_bot.config import Settings
 from kalshi_bot.logger import StructuredLogger
+from kalshi_bot.market_data import market_title_for_ticker
 from kalshi_bot.monitor import record_event
 from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
@@ -27,8 +28,8 @@ from kalshi_bot.strategy import TradeIntent, projected_abs_position_after
 
 
 def _spacing_after_submitted_buy_yes(settings: Settings, intent: TradeIntent) -> None:
-    """Pause after a buy YES is accepted (dry-run or live) to spread out submissions."""
-    if intent.side != "yes" or intent.action != "buy":
+    """Pause after a buy (YES or NO) is accepted (dry-run or live) to spread out submissions."""
+    if intent.action != "buy":
         return
     sp = settings.trade_submit_spacing_seconds
     if sp > 0:
@@ -149,12 +150,13 @@ def execute_intent(
     ledger: DryRunLedger | None = None,
 ) -> None:
     """Risk-check then either simulate or place a real order."""
+    market_title = market_title_for_ticker(client, intent.ticker)
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
 
     min_n = settings.trade_min_order_notional_usd
     max_n = settings.trade_max_order_notional_usd
-    if intent.side == "yes" and intent.action == "buy":
+    if intent.action == "buy" and intent.side in ("yes", "no"):
         min_n, max_n = next_buy_yes_notional_min_max(settings, balance_cents=snap.balance_cents)
         if parse_notional_sweep_usd(settings.trade_notional_sweep_usd):
             log.info(
@@ -184,7 +186,7 @@ def execute_intent(
     if intent.action == "buy" and intent.count > max_c:
         intent = replace(intent, count=max_c)
 
-    if intent.side == "yes" and intent.action == "buy":
+    if intent.action == "buy" and intent.side in ("yes", "no"):
         floored = adjust_buy_yes_count_for_notional_floor(
             intent.count,
             yes_price_cents=intent.yes_price_cents,
@@ -197,24 +199,42 @@ def execute_intent(
                 "order_blocked",
                 reason="min_order_notional_unreachable",
                 ticker=intent.ticker,
+                market_title=market_title,
                 min_usd=min_n,
                 max_usd=max_n,
             )
-            record_event("blocked", reason="min_order_notional_unreachable", intent=intent)
+            record_event(
+                "blocked",
+                reason="min_order_notional_unreachable",
+                intent=intent,
+                market_title=market_title,
+            )
             return
         if floored != intent.count:
             intent = replace(intent, count=floored)
 
     if intent.count < 1:
-        log.info("order_blocked", reason="zero_contracts_after_balance_sizing", ticker=intent.ticker)
-        record_event("blocked", reason="zero_contracts_after_balance_sizing", intent=intent)
+        log.info(
+            "order_blocked",
+            reason="zero_contracts_after_balance_sizing",
+            ticker=intent.ticker,
+            market_title=market_title,
+        )
+        record_event(
+            "blocked",
+            reason="zero_contracts_after_balance_sizing",
+            intent=intent,
+            market_title=market_title,
+        )
         return
 
     signed = snap.positions_by_ticker.get(intent.ticker, 0.0)
     projected_abs = projected_abs_position_after(signed, intent)
     resting = snap.resting_orders_by_ticker.get(intent.ticker, 0)
     add_exp = (
-        float(intent.count * intent.yes_price_cents) if (intent.side == "yes" and intent.action == "buy") else 0.0
+        float(intent.count * intent.yes_price_cents)
+        if (intent.action == "buy" and intent.side in ("yes", "no"))
+        else 0.0
     )
 
     decision = risk.check_new_order(
@@ -229,39 +249,61 @@ def execute_intent(
         max_exposure_cents_override=max_exp,
     )
     if not decision.allowed:
-        log.info("order_blocked", reason=decision.reason, intent=intent)
-        record_event("blocked", reason=decision.reason, intent=intent)
+        log.info("order_blocked", reason=decision.reason, intent=intent, market_title=market_title)
+        record_event("blocked", reason=decision.reason, intent=intent, market_title=market_title)
         return
 
     if settings.dry_run:
         ldg = ledger or DryRunLedger()
         sim = ldg.record_intent(intent)
         risk.record_order_submitted(intent.count)
-        log.info("dry_run_order", simulated_client_order_id=sim.client_order_id, intent=intent)
+        log.info(
+            "dry_run_order",
+            simulated_client_order_id=sim.client_order_id,
+            intent=intent,
+            market_title=market_title,
+        )
         record_event(
             "dry_run",
             simulated_client_order_id=sim.client_order_id,
             ticker=intent.ticker,
             count=intent.count,
             yes_price_cents=intent.yes_price_cents,
+            market_title=market_title,
         )
         _spacing_after_submitted_buy_yes(settings, intent)
         return
 
     if not settings.can_send_real_orders:
-        log.warning("order_refused", reason="LIVE_TRADING_false_or_misconfigured", intent=intent)
-        record_event("refused", reason="LIVE_TRADING_false_or_misconfigured", intent=intent)
+        log.warning(
+            "order_refused",
+            reason="LIVE_TRADING_false_or_misconfigured",
+            intent=intent,
+            market_title=market_title,
+        )
+        record_event(
+            "refused",
+            reason="LIVE_TRADING_false_or_misconfigured",
+            intent=intent,
+            market_title=market_title,
+        )
         return
 
     if settings.kalshi_env == "prod":
         _warn_live_banner(settings)
 
-    log.info("live_order_submit", intent=intent, env=settings.kalshi_env)
-    record_event("live_submit", env=settings.kalshi_env, intent=intent)
+    log.info("live_order_submit", intent=intent, env=settings.kalshi_env, market_title=market_title)
+    record_event("live_submit", env=settings.kalshi_env, intent=intent, market_title=market_title)
     resp = place_limit_order_live(client, intent)
     risk.record_order_submitted(intent.count)
     oid = getattr(resp, "order", None)
     order_id = getattr(oid, "order_id", None) if oid is not None else getattr(resp, "order_id", None)
     log.info("live_order_ack", response_type=type(resp).__name__)
-    record_event("live_ack", response_type=type(resp).__name__, order_id=order_id)
+    record_event(
+        "live_ack",
+        response_type=type(resp).__name__,
+        order_id=order_id,
+        ticker=intent.ticker,
+        market_title=market_title,
+    )
     _spacing_after_submitted_buy_yes(settings, intent)

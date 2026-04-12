@@ -61,6 +61,18 @@ def net_edge_buy_yes_long(
     return fair_yes - yes_ask_dollars - per
 
 
+def net_edge_buy_no_long(
+    *,
+    fair_no: float,
+    no_ask_dollars: float,
+    contracts: int = 1,
+) -> float:
+    """fair_no − NO ask − taker fee per NO share (same fee helper; price is NO limit in dollars on \$1)."""
+    fn = kalshi_general_taker_fee_usd(contracts=contracts, price_dollars=no_ask_dollars)
+    per = fn / max(1, contracts)
+    return fair_no - no_ask_dollars - per
+
+
 def middle_penalty_multiplier(mid: float, *, width: float = 0.15) -> float:
     """Extra edge (dollars) suggested near 0.50 — fees worst at mid; width = distance from 0.5 to start penalty."""
     d = abs(mid - 0.5)
