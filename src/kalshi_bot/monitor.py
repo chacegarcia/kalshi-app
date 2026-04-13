@@ -18,15 +18,19 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from kalshi_python_sync.exceptions import UnauthorizedException
+
 from kalshi_bot.client import KalshiSdkClient
 from kalshi_bot.config import Settings, project_root
 from kalshi_bot.portfolio import fetch_portfolio_snapshot, list_resting_orders_detail
 
+_KALSHI_AUTH_HINT = (
+    "Kalshi API unauthorized (401). Check KALSHI_API_KEY_ID and private key in .env "
+    "(correct key for this environment)."
+)
+
 _LOG = logging.getLogger(__name__)
 _LOCK = Lock()
-_SELL_LOOP_STOP = threading.Event()
-_SELL_LOOP_THREAD: threading.Thread | None = None
-_SELL_LOOP_LOCK = Lock()
 _EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
 # Kinds accepted by POST /api/ingest_event (cross-process feed); heartbeat is never forwarded.
 _INGESTABLE_EVENT_KINDS = frozenset(
@@ -133,28 +137,6 @@ def notify_auto_sell_outcome(
         exit_reason=exit_reason,
         event_payload=event_payload,
     )
-
-
-def _dashboard_sell_loop_worker() -> None:
-    """Background exit-scan loop for the dashboard (same rules as ``kalshi-bot sell-bot``)."""
-    from kalshi_bot.auto_sell import auto_sell_scan_all_long_yes
-    from kalshi_bot.config import get_settings
-    from kalshi_bot.logger import get_logger
-    from kalshi_bot.trading import build_sdk_client
-
-    settings = get_settings()
-    interval = max(5.0, float(settings.sell_bot_interval_seconds))
-    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
-    client = build_sdk_client(settings)
-    while not _SELL_LOOP_STOP.is_set():
-        try:
-            n, _lines = auto_sell_scan_all_long_yes(client, settings, cli_min_yes_bid_cents=None, log=log)
-            if n:
-                _LOG.info("dashboard_sell_loop_submitted", orders=n)
-        except Exception as exc:  # noqa: BLE001
-            _LOG.exception("dashboard_sell_loop_iteration_failed", error=str(exc))
-        if _SELL_LOOP_STOP.wait(timeout=interval):
-            break
 
 
 def notify_portfolio_series_to_dashboard(settings: Settings) -> None:
@@ -487,37 +469,6 @@ _HTML = """<!DOCTYPE html>
     .mini-pos__actions button.dd { border-color: rgba(110,181,255,0.35); }
     .mini-pos__actions button.sell { border-color: rgba(245,166,35,0.4); }
     .mini-pos__actions button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .sell-loop-top { margin-bottom: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #2a3544; }
-    .sell-loop-top h3 { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 0.45rem; font-weight: 600; }
-    .sell-loop-bar__hint { margin: 0.5rem 0 0 !important; font-size: 0.72rem !important; line-height: 1.4 !important; }
-    .sell-loop-pill {
-      display: flex; align-items: center; justify-content: space-between; gap: 0.65rem;
-      width: 100%; padding: 0.45rem 0.65rem 0.45rem 0.85rem; border-radius: 999px;
-      border: 1px solid #2e3d52; background: #1a2332; color: var(--text);
-      cursor: pointer; font: inherit; text-align: left;
-      transition: border-color 0.15s ease, background 0.15s ease;
-    }
-    .sell-loop-pill__text { display: flex; flex-direction: column; gap: 0.12rem; min-width: 0; flex: 1; }
-    .sell-loop-pill:hover { border-color: #3a4d62; background: #1e2838; }
-    .sell-loop-pill.is-on {
-      border-color: rgba(62,207,142,0.45);
-      background: linear-gradient(145deg, rgba(62,207,142,0.14) 0%, #1a2332 70%);
-    }
-    .sell-loop-pill__title { font-size: 0.78rem; font-weight: 700; letter-spacing: 0.02em; }
-    .sell-loop-pill__sub { font-size: 0.68rem; color: var(--muted); font-weight: 500; margin-top: 0.12rem; }
-    .sell-loop-pill__track {
-      flex-shrink: 0; width: 2.75rem; height: 1.45rem; border-radius: 999px;
-      background: #2a3544; position: relative; transition: background 0.15s ease;
-    }
-    .sell-loop-pill.is-on .sell-loop-pill__track { background: rgba(62,207,142,0.35); }
-    .sell-loop-pill__thumb {
-      position: absolute; top: 0.15rem; left: 0.15rem; width: 1.15rem; height: 1.15rem; border-radius: 50%;
-      background: #8b9aab; transition: transform 0.18s ease, background 0.15s ease;
-    }
-    .sell-loop-pill.is-on .sell-loop-pill__thumb {
-      transform: translateX(1.25rem);
-      background: #3ecf8e;
-    }
     #posStatus { font-size: 0.68rem; color: var(--muted); margin: 0 0 0.4rem; min-height: 1.1em; line-height: 1.35; }
     h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
     p.sub { color: var(--muted); font-size: 0.875rem; margin: 0 0 1rem; }
@@ -607,16 +558,6 @@ _HTML = """<!DOCTYPE html>
       <strong>Controller</strong>
     </div>
     <div class="sidebar__body">
-      <div class="sell-loop-top">
-        <h3>Auto-sell loop</h3>
-        <button type="button" id="sellLoopToggle" class="sell-loop-pill" role="switch" aria-checked="false" aria-label="Toggle batch exit loop">
-          <span class="sell-loop-pill__text">
-            <span class="sell-loop-pill__title" id="sellLoopTitle">Off</span>
-            <span class="sell-loop-pill__sub" id="sellLoopSub">Idle · localhost only</span>
-          </span>
-          <span class="sell-loop-pill__track" aria-hidden="true"><span class="sell-loop-pill__thumb"></span></span>
-        </button>
-      </div>
       <p class="sidebar__hint">Live controls apply to <strong>this</strong> process only (run with <code>--web</code>). Restart the bot to pick up <code>.env</code> edits.</p>
       <label>Buy size multiplier</label>
       <div class="seg" id="multSeg" role="group" aria-label="Order size multiplier">
@@ -950,23 +891,6 @@ _HTML = """<!DOCTYPE html>
       } catch (e) { /* ignore */ }
       refreshPositions();
       refreshRestingOrders();
-      refreshSellLoopStatus();
-    }
-    async function refreshSellLoopStatus() {
-      try {
-        const r = await fetch('/api/sell_loop/status', { cache: 'no-store' });
-        const d = await r.json();
-        const running = !!d.running;
-        const btn = document.getElementById('sellLoopToggle');
-        const titleEl = document.getElementById('sellLoopTitle');
-        const subEl = document.getElementById('sellLoopSub');
-        if (btn) {
-          btn.classList.toggle('is-on', running);
-          btn.setAttribute('aria-checked', running ? 'true' : 'false');
-        }
-        if (titleEl) titleEl.textContent = running ? 'On' : 'Off';
-        if (subEl) subEl.textContent = running ? 'Running — batch exit scan' : 'Idle · localhost only';
-      } catch (e) { /* ignore */ }
     }
     function renderRestingOrders(data) {
       const wrap = document.getElementById('restingOrders');
@@ -1243,25 +1167,10 @@ _HTML = """<!DOCTYPE html>
         if (seriesChart && typeof seriesChart.resetZoom === 'function') seriesChart.resetZoom();
       });
     }
-    var sellLoopToggle = document.getElementById('sellLoopToggle');
-    if (sellLoopToggle) {
-      sellLoopToggle.addEventListener('click', async function() {
-        const on = sellLoopToggle.getAttribute('aria-checked') === 'true';
-        try {
-          await fetch(on ? '/api/sell_loop/stop' : '/api/sell_loop/start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: '{}',
-          });
-        } catch (e) { /* ignore */ }
-        refreshSellLoopStatus();
-      });
-    }
     poll();
     refreshControl();
     refreshPositions();
     refreshRestingOrders();
-    refreshSellLoopStatus();
     setInterval(poll, POLL_MS);
     setInterval(refreshControl, 8000);
   </script>
@@ -1343,8 +1252,11 @@ def _create_app() -> Any:
                 exposure_sum_cents=float(snap.total_exposure_cents),
             )
             return jsonify({"ok": True})
+        except UnauthorizedException as exc:
+            _LOG.warning("ingest_portfolio_series_failed: %s", exc)
+            return jsonify({"ok": False, "error": _KALSHI_AUTH_HINT}), 502
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("ingest_portfolio_series_failed", error=str(exc))
+            _LOG.warning("ingest_portfolio_series_failed: %s", exc)
             return jsonify({"ok": False, "error": str(exc)}), 500
 
     @app.get("/api/events")
@@ -1369,8 +1281,11 @@ def _create_app() -> Any:
             client = _bsc(s)
             orders = list_resting_orders_detail(client)
             return jsonify({"orders": orders})
+        except UnauthorizedException as exc:
+            _LOG.warning("api_resting_orders_failed: %s", exc)
+            return jsonify({"orders": [], "error": _KALSHI_AUTH_HINT})
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("api_resting_orders_failed", error=str(exc))
+            _LOG.warning("api_resting_orders_failed: %s", exc)
             return jsonify({"orders": [], "error": str(exc)})
 
     @app.get("/api/stats")
@@ -1395,37 +1310,6 @@ def _create_app() -> Any:
 
     def _request_localhost() -> bool:
         return request.environ.get("REMOTE_ADDR", "") in ("127.0.0.1", "::1")
-
-    @app.post("/api/sell_loop/start")
-    def sell_loop_start() -> Any:
-        """Start batch exit loop in this process (localhost only)."""
-        if not _request_localhost():
-            return jsonify({"ok": False, "error": "forbidden"}), 403
-        global _SELL_LOOP_THREAD
-        with _SELL_LOOP_LOCK:
-            if _SELL_LOOP_THREAD is not None and _SELL_LOOP_THREAD.is_alive():
-                return jsonify({"ok": True, "running": True, "already": True})
-            _SELL_LOOP_STOP.clear()
-            t = threading.Thread(target=_dashboard_sell_loop_worker, name="dashboard-sell-loop", daemon=True)
-            t.start()
-            _SELL_LOOP_THREAD = t
-        return jsonify({"ok": True, "running": True})
-
-    @app.post("/api/sell_loop/stop")
-    def sell_loop_stop() -> Any:
-        if not _request_localhost():
-            return jsonify({"ok": False, "error": "forbidden"}), 403
-        global _SELL_LOOP_THREAD
-        _SELL_LOOP_STOP.set()
-        th = _SELL_LOOP_THREAD
-        if th is not None and th.is_alive():
-            th.join(timeout=10.0)
-        return jsonify({"ok": True, "running": False})
-
-    @app.get("/api/sell_loop/status")
-    def sell_loop_status() -> Any:
-        alive = _SELL_LOOP_THREAD is not None and _SELL_LOOP_THREAD.is_alive()
-        return jsonify({"running": bool(alive)})
 
     @app.get("/api/control")
     def api_control_get() -> Any:
@@ -1471,7 +1355,7 @@ def _create_app() -> Any:
         except (TypeError, ValueError):
             m = 1
         v = set_order_size_multiplier(m)
-        _LOG.info("dashboard_control_multiplier", order_size_multiplier=v)
+        _LOG.info("dashboard_control_multiplier order_size_multiplier=%s", v)
         return jsonify({"ok": True, "order_size_multiplier": v})
 
     @app.get("/api/positions")
@@ -1530,8 +1414,18 @@ def _create_app() -> Any:
                     "order_size_multiplier": odm,
                 }
             )
+        except UnauthorizedException as exc:
+            _LOG.warning("api_positions_failed: %s", exc)
+            return jsonify(
+                {
+                    "positions": [],
+                    "double_down_enabled": False,
+                    "order_size_multiplier": 1,
+                    "error": _KALSHI_AUTH_HINT,
+                }
+            )
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("api_positions_failed", error=str(exc))
+            _LOG.warning("api_positions_failed: %s", exc)
             return jsonify(
                 {
                     "positions": [],
@@ -1592,7 +1486,12 @@ def _create_app() -> Any:
                 )
                 trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
                 detail = f"sell {cnt} YES @ {limit_cents}¢ ({'dry-run' if settings.dry_run else 'live'})"
-                _LOG.info("dashboard_position_sell", ticker=ticker, count=cnt, limit_yes_price_cents=limit_cents)
+                _LOG.info(
+                    "dashboard_position_sell ticker=%s count=%s limit_yes_price_cents=%s",
+                    ticker,
+                    cnt,
+                    limit_cents,
+                )
                 return jsonify({"ok": True, "action": "sell", "detail": detail})
 
             if not settings.trade_double_down_enabled:
@@ -1660,14 +1559,14 @@ def _create_app() -> Any:
             trade_execute(client=client, settings=settings, risk=risk, log=log, intent=intent, ledger=ledger)
             detail = f"buy {count} YES @ {lift}¢ double-down ({'dry-run' if settings.dry_run else 'live'})"
             _LOG.info(
-                "dashboard_position_double_down",
-                ticker=ticker,
-                count=count,
-                yes_price_cents=lift,
+                "dashboard_position_double_down ticker=%s count=%s yes_price_cents=%s",
+                ticker,
+                count,
+                lift,
             )
             return jsonify({"ok": True, "action": "double_down", "detail": detail})
         except Exception as exc:  # noqa: BLE001
-            _LOG.exception("api_positions_action_failed", ticker=ticker, action=action)
+            _LOG.exception("api_positions_action_failed ticker=%s action=%s", ticker, action)
             return jsonify({"ok": False, "error": str(exc)}), 500
 
     return app
