@@ -371,10 +371,11 @@ public sealed class BotRepository(IDbContextFactory<BotDbContext> factory, ILogg
             try
             {
                 await using var ctx = await factory.CreateDbContextAsync();
+                var truncated = error.Length > 500 ? error[..500] : error;
                 await ctx.SuggestionHistory
                     .Where(s => s.SuggestionId == suggestionId)
                     .ExecuteUpdateAsync(s => s
-                        .SetProperty(x => x.ExecuteError, error[..Math.Min(error.Length, 500)]));
+                        .SetProperty(x => x.ExecuteError, truncated));
             }
             catch (Exception ex)
             {
