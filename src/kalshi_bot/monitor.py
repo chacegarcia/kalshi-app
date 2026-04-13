@@ -139,6 +139,43 @@ def notify_auto_sell_outcome(
     )
 
 
+def notify_pass_summary_to_dashboard(
+    settings: Settings,
+    *,
+    command: str,
+    iteration: int,
+    orders_submitted: int,
+    stats: dict[str, Any],
+) -> None:
+    """POST last pass stats to a dashboard running in another process (no ``--web`` on the trader)."""
+    if not getattr(settings, "dashboard_ingest_pass_summary", True):
+        return
+    url = f"http://127.0.0.1:{int(settings.dashboard_port)}/api/ingest_pass_summary"
+    body = json.dumps(
+        {
+            "command": command,
+            "iteration": iteration,
+            "orders_submitted": orders_submitted,
+            "stats": stats,
+        },
+        default=str,
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            if resp.status == 200:
+                return
+    except urllib.error.HTTPError:
+        pass
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+
+
 def notify_portfolio_series_to_dashboard(settings: Settings) -> None:
     """POST to the local dashboard so it appends one portfolio chart point (no --web trade process, or split process)."""
     if not getattr(settings, "dashboard_ingest_portfolio_series", True):
@@ -607,15 +644,18 @@ _HTML = """<!DOCTYPE html>
   </div>
   <div class="chart-wrap">
     <h2>Open orders</h2>
-    <p class="sub" style="margin:0 0 0.5rem;">Resting limit orders from Kalshi (refreshed every second).</p>
+    <p class="sub" style="margin:0 0 0.5rem;">Resting limit orders from Kalshi (refreshed after each trading pass and on a slow fallback timer).</p>
     <div class="resting-orders" id="restingOrders">Loading…</div>
   </div>
   </main>
   </div>
   <script>
     let seriesChart = null;
-    const POLL_MS = 1000;
-    let lastPassUnix = 0;
+    /** In-memory feeds (stats, events, chart series): poll often. Kalshi-backed positions + open orders: only after each pass or fallback. */
+    const POLL_MS = 2000;
+    const HEAVY_KALSHI_FALLBACK_MS = 45000;
+    let lastSeenPassUnix = 0;
+    let lastHeavyKalshiMs = 0;
     function dollarsFromCents(c) { return (Number(c) || 0) / 100; }
     function renderTradeCards(events) {
       const feed = document.getElementById('tradeFeed');
@@ -793,6 +833,15 @@ _HTML = """<!DOCTYPE html>
       }
     }
     async function poll() {
+      var passUnix = 0;
+      try {
+        const pr = await fetch('/api/pass_summary', { cache: 'no-store' });
+        const ps = await pr.json();
+        passUnix = Number(ps.updated_unix) || 0;
+      } catch (e) { /* ignore */ }
+      var passChanged = passUnix > 0 && passUnix !== lastSeenPassUnix;
+      if (passChanged) lastSeenPassUnix = passUnix;
+
       try {
         const rs = await fetch('/api/stats', { cache: 'no-store' });
         const st = await rs.json();
@@ -850,47 +899,14 @@ _HTML = """<!DOCTYPE html>
           st.textContent = 'Series fetch error — chart may be stale';
         }
       }
-      try {
-        const pr = await fetch('/api/pass_summary', { cache: 'no-store' });
-        const ps = await pr.json();
-        const u = Number(ps.updated_unix) || 0;
-        if (u && u !== lastPassUnix) {
-          lastPassUnix = u;
-          const sr2 = await fetch('/api/series', { cache: 'no-store' });
-          const pts2 = await sr2.json();
-          if (pts2.length > 0) {
-            buildOrUpdateChart(pts2);
-            const last = pts2[pts2.length - 1];
-            const cashEl = document.getElementById('balCash');
-            const expEl = document.getElementById('balExp');
-            const totalEl = document.getElementById('balTotal');
-            const tsEl = document.getElementById('balTs');
-            const banner = document.getElementById('balanceBanner');
-            const pvRaw = last.positions_value_cents != null && last.positions_value_cents !== '' ? last.positions_value_cents : last.exposure_cents;
-            const exp = dollarsFromCents(pvRaw);
-            expEl.textContent = '$' + exp.toFixed(2);
-            if (last.balance_known === false) {
-              cashEl.textContent = 'n/a';
-              if (totalEl) totalEl.textContent = 'n/a';
-            } else {
-              const cash = dollarsFromCents(last.balance_cents);
-              cashEl.textContent = '$' + cash.toFixed(2);
-              if (totalEl) {
-                if (last.total_account_cents != null) {
-                  totalEl.textContent = '$' + dollarsFromCents(last.total_account_cents).toFixed(2);
-                } else {
-                  totalEl.textContent = 'n/a';
-                }
-              }
-            }
-            if (last.ts_iso) tsEl.textContent = 'as of ' + last.ts_iso;
-            else tsEl.textContent = '';
-            banner.style.display = 'flex';
-          }
-        }
-      } catch (e) { /* ignore */ }
-      refreshPositions();
-      refreshRestingOrders();
+
+      var now = Date.now();
+      var needHeavy = passChanged || lastHeavyKalshiMs === 0 || (now - lastHeavyKalshiMs >= HEAVY_KALSHI_FALLBACK_MS);
+      if (needHeavy) {
+        lastHeavyKalshiMs = now;
+        await refreshPositions();
+        await refreshRestingOrders();
+      }
     }
     function renderRestingOrders(data) {
       const wrap = document.getElementById('restingOrders');
@@ -1258,6 +1274,35 @@ def _create_app() -> Any:
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("ingest_portfolio_series_failed: %s", exc)
             return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.post("/api/ingest_pass_summary")
+    def ingest_pass_summary() -> Any:
+        """Receive pass stats from a trader running without ``--web`` (localhost only). Bumps ``updated_unix`` for the UI."""
+        addr = request.environ.get("REMOTE_ADDR", "")
+        if addr not in ("127.0.0.1", "::1"):
+            return jsonify({"ok": False, "error": "forbidden"}), 403
+        data = request.get_json(force=True, silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "bad_json"}), 400
+        cmd = str(data.get("command") or "")
+        try:
+            it = int(data.get("iteration") or 0)
+        except (TypeError, ValueError):
+            it = 0
+        try:
+            osub = int(data.get("orders_submitted") or 0)
+        except (TypeError, ValueError):
+            osub = 0
+        stats = data.get("stats")
+        if not isinstance(stats, dict):
+            stats = {}
+        record_trade_pass_summary(
+            command=cmd,
+            iteration=it,
+            orders_submitted=osub,
+            stats=stats,
+        )
+        return jsonify({"ok": True})
 
     @app.get("/api/events")
     def api_events() -> Any:

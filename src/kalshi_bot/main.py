@@ -52,6 +52,7 @@ from kalshi_bot.tape_runner import run_tape_rule_pipeline
 from kalshi_bot.bitcoin_runner import run_bitcoin_trade_pass
 from kalshi_bot.monitor import (
     heartbeat,
+    notify_pass_summary_to_dashboard,
     notify_portfolio_series_to_dashboard,
     record_portfolio_series_point,
     record_trade_pass_summary,
@@ -68,23 +69,34 @@ def _client_for_balance(settings: Settings, dash_client: KalshiSdkClient | None)
 
 
 def _record_trade_pass_for_dashboard(
+    settings: Settings,
     *,
     command: str,
     iteration: int,
     orders_submitted: int,
     run_stats: Any,
+    dash_client: KalshiSdkClient | None,
 ) -> None:
-    """Update in-process state served by GET /api/pass_summary (no HTML)."""
+    """Update pass summary in-process (``--web``) or POST to a separate dashboard process."""
     try:
         stats = asdict(run_stats) if is_dataclass(run_stats) else {"repr": repr(run_stats)}
     except Exception:
         stats = {"error": "serialize_failed"}
-    record_trade_pass_summary(
-        command=command,
-        iteration=iteration,
-        orders_submitted=orders_submitted,
-        stats=stats,
-    )
+    if dash_client is not None:
+        record_trade_pass_summary(
+            command=command,
+            iteration=iteration,
+            orders_submitted=orders_submitted,
+            stats=stats,
+        )
+    else:
+        notify_pass_summary_to_dashboard(
+            settings,
+            command=command,
+            iteration=iteration,
+            orders_submitted=orders_submitted,
+            stats=stats,
+        )
 
 
 def _maybe_position_watch_before_auto_sell(settings: Settings, client: KalshiSdkClient, log: StructuredLogger) -> None:
@@ -195,10 +207,12 @@ def cmd_llm_trade(
             for line in summary_lines:
                 print(line, flush=True)
             _record_trade_pass_for_dashboard(
+                settings,
                 command="llm-trade",
                 iteration=iteration,
                 orders_submitted=n,
                 run_stats=run_stats,
+                dash_client=dash_client,
             )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -279,10 +293,12 @@ def cmd_discover_trade(
             for line in summary_lines:
                 print(line, flush=True)
             _record_trade_pass_for_dashboard(
+                settings,
                 command="discover-trade",
                 iteration=iteration,
                 orders_submitted=n,
                 run_stats=run_stats,
+                dash_client=dash_client,
             )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -367,10 +383,12 @@ def cmd_tape_trade(
             for line in summary_lines:
                 print(line, flush=True)
             _record_trade_pass_for_dashboard(
+                settings,
                 command="tape-trade",
                 iteration=iteration,
                 orders_submitted=n,
                 run_stats=run_stats,
+                dash_client=dash_client,
             )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)
@@ -454,10 +472,12 @@ def cmd_bitcoin_trade(
             for line in summary_lines:
                 print(line, flush=True)
             _record_trade_pass_for_dashboard(
+                settings,
                 command="bitcoin-trade",
                 iteration=iteration,
                 orders_submitted=n,
                 run_stats=run_stats,
+                dash_client=dash_client,
             )
             bal_client = _client_for_balance(settings, dash_client)
             print_portfolio_balance_line(bal_client)

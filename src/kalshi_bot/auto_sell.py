@@ -55,6 +55,7 @@ from kalshi_bot.logger import StructuredLogger
 from kalshi_bot.market_data import (
     best_yes_bid_cents,
     fetch_public_trades_for_ticker,
+    get_market_entry_timing_and_event,
     get_orderbook,
     lift_yes_ask_cents_from_orderbook,
     market_category_for_ticker,
@@ -283,6 +284,50 @@ def _resolve_entry_reference(
     return EntryReference(None, "none")
 
 
+def _same_event_hedge_loser_tickers(
+    client: KalshiSdkClient,
+    settings: Settings,
+    long_tickers: list[str],
+    log: StructuredLogger,
+) -> frozenset[str]:
+    """Tickers that are the worst mark (bid − entry) among ≥2 long YES in the same ``event_ticker``."""
+    if not settings.trade_exit_hedge_loser_stop_boost_enabled or len(long_tickers) < 2:
+        return frozenset()
+    by_event: dict[str, list[str]] = {}
+    for t in long_tickers:
+        _ttl, ev = get_market_entry_timing_and_event(client, t)
+        if not ev:
+            continue
+        by_event.setdefault(str(ev), []).append(t)
+    losers: set[str] = set()
+    for ev, group in by_event.items():
+        if len(group) < 2:
+            continue
+        scored: list[tuple[str, float]] = []
+        for t in group:
+            er = _resolve_entry_reference(settings, client, t, log)
+            if er.cents is None:
+                continue
+            ob = get_orderbook(client, t)
+            b = best_yes_bid_cents(ob)
+            if b is None:
+                continue
+            scored.append((t, float(b) - float(er.cents)))
+        if len(scored) < 2:
+            continue
+        scored.sort(key=lambda x: (x[1], x[0]))
+        worst = scored[0][0]
+        losers.add(worst)
+        log.info(
+            "hedge_loser_identified",
+            event_ticker=ev,
+            worst_ticker=worst,
+            mark_vs_entry_cents=scored[0][1],
+            group=[x[0] for x in scored],
+        )
+    return frozenset(losers)
+
+
 def _entry_stop_floor_cents(entry_cents: int, fraction: float) -> int:
     return max(1, min(99, int(round(entry_cents * fraction))))
 
@@ -445,6 +490,7 @@ def _should_fire_exit(
     peak_bid_cents: int | None = None,
     implied_yes_chance_cents: int | None = None,
     min_profit_cents_effective: int | None = None,
+    stop_loss_entry_fraction_override: float | None = None,
 ) -> tuple[bool, str]:
     """True if we should submit a sell.
 
@@ -460,7 +506,11 @@ def _should_fire_exit(
     skipped_suspect_stop = False
     would_have_stop_floor: int | None = None
     fixed_floor_base: int | None = None
-    frac_base = float(settings.trade_exit_stop_loss_entry_fraction)
+    frac_base = (
+        float(stop_loss_entry_fraction_override)
+        if stop_loss_entry_fraction_override is not None
+        else float(settings.trade_exit_stop_loss_entry_fraction)
+    )
 
     if (
         settings.trade_exit_stop_loss_enabled
@@ -637,11 +687,15 @@ def try_auto_sell_exit_for_ticker(
     cli_min_yes_bid_cents: int | None,
     log: StructuredLogger,
     log_waits: bool = False,
+    hedge_loser_stop_boost: bool = False,
 ) -> tuple[str, str | None, str | None]:
     """One auto-sell attempt for ``ticker`` (stop-loss or take-profit).
 
     Returns ``(tag, summary_line, exit_reason)``. ``summary_line`` and ``exit_reason`` are set when tag
     is ``sold`` (proceeds / P/L text and trigger reason, e.g. ``stop_loss_entry_fraction``).
+
+    ``hedge_loser_stop_boost``: when True and settings allow, use a higher stop floor for the worst leg
+    in a same-event multi-outcome hedge (see ``TRADE_EXIT_HEDGE_LOSER_*``).
     """
     snap = fetch_portfolio_snapshot(client, ticker=ticker)
     signed = snap.positions_by_ticker.get(ticker, 0.0)
@@ -689,6 +743,22 @@ def try_auto_sell_exit_for_ticker(
     min_eff = _tape_relaxed_min_profit_cents_effective(
         client, settings, ticker, entry_ref.cents, log
     )
+    stop_loss_frac_override: float | None = None
+    if (
+        hedge_loser_stop_boost
+        and settings.trade_exit_hedge_loser_stop_boost_enabled
+        and settings.trade_exit_stop_loss_enabled
+    ):
+        base = float(settings.trade_exit_stop_loss_entry_fraction)
+        add = float(settings.trade_exit_hedge_loser_stop_loss_fraction_add)
+        stop_loss_frac_override = min(0.95, base + add)
+        log.debug(
+            "hedge_loser_stop_boost_applied",
+            ticker=ticker,
+            base_fraction=base,
+            add_fraction=add,
+            effective_stop_loss_entry_fraction=stop_loss_frac_override,
+        )
     fire, reason = _should_fire_exit(
         best_bid_cents=best,
         settings=settings,
@@ -698,6 +768,7 @@ def try_auto_sell_exit_for_ticker(
         peak_bid_cents=peak,
         implied_yes_chance_cents=chance,
         min_profit_cents_effective=min_eff,
+        stop_loss_entry_fraction_override=stop_loss_frac_override,
     )
     if not fire and near_max:
         fire, reason = True, "take_profit_near_max_payout"
@@ -746,9 +817,15 @@ def try_auto_sell_exit_for_ticker(
     )
     fire_extra: dict[str, object] = {}
     if reason == "stop_loss_entry_fraction" and entry_ref.cents is not None:
-        frac = float(settings.trade_exit_stop_loss_entry_fraction)
-        fire_extra["stop_loss_floor_yes_bid_cents"] = max(1, min(99, int(round(entry_ref.cents * frac))))
-        fire_extra["stop_loss_entry_fraction"] = frac
+        eff_sl_frac = (
+            float(stop_loss_frac_override)
+            if stop_loss_frac_override is not None
+            else float(settings.trade_exit_stop_loss_entry_fraction)
+        )
+        fire_extra["stop_loss_floor_yes_bid_cents"] = max(
+            1, min(99, int(round(entry_ref.cents * eff_sl_frac)))
+        )
+        fire_extra["stop_loss_entry_fraction"] = eff_sl_frac
     if reason == "trailing_stop_pullback" and peak is not None:
         fire_extra["trailing_peak_yes_bid_cents"] = peak
         fire_extra["trailing_pullback_cents"] = settings.trade_exit_trailing_pullback_cents
@@ -847,6 +924,7 @@ def auto_sell_scan_all_long_yes(
     ledger = DryRunLedger()
     snap = fetch_portfolio_snapshot(client, ticker=None)
     tickers = sorted(t for t, s in snap.positions_by_ticker.items() if s > 0)
+    hedge_losers = _same_event_hedge_loser_tickers(client, settings, tickers, log)
     sold = 0
     lines: list[str] = []
     for ticker in tickers:
@@ -859,6 +937,7 @@ def auto_sell_scan_all_long_yes(
             cli_min_yes_bid_cents=cli_min_yes_bid_cents,
             log=log,
             log_waits=False,
+            hedge_loser_stop_boost=ticker in hedge_losers,
         )
         if tag == "sold":
             sold += 1

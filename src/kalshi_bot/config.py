@@ -1164,6 +1164,32 @@ class Settings(BaseSettings):
             "Take-profit rules still use the portfolio estimate."
         ),
     )
+    trade_exit_hedge_loser_stop_boost_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_HEDGE_LOSER_STOP_BOOST_ENABLED",
+            "trade_exit_hedge_loser_stop_boost_enabled",
+        ),
+        description=(
+            "If true: when you hold long YES on two or more markets in the same Kalshi event (mutually exclusive "
+            "outcomes), the leg with the worst mark (best bid minus entry) uses a higher stop floor "
+            "(TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION + TRADE_EXIT_HEDGE_LOSER_STOP_LOSS_FRACTION_ADD, capped). "
+            "A higher fraction means a higher minimum bid before the stop fires—cuts the loser sooner."
+        ),
+    )
+    trade_exit_hedge_loser_stop_loss_fraction_add: float = Field(
+        default=0.12,
+        ge=0.0,
+        le=0.45,
+        validation_alias=AliasChoices(
+            "TRADE_EXIT_HEDGE_LOSER_STOP_LOSS_FRACTION_ADD",
+            "trade_exit_hedge_loser_stop_loss_fraction_add",
+        ),
+        description=(
+            "Added to TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION for the worst same-event hedge leg only "
+            "(when TRADE_EXIT_HEDGE_LOSER_STOP_BOOST_ENABLED). Capped so effective fraction stays below 1."
+        ),
+    )
     trade_exit_trailing_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices(
@@ -1466,6 +1492,14 @@ class Settings(BaseSettings):
             "API keys in .env for the snapshot fetch."
         ),
     )
+    dashboard_ingest_pass_summary: bool = Field(
+        default=True,
+        validation_alias=_env("DASHBOARD_INGEST_PASS_SUMMARY", "dashboard_ingest_pass_summary"),
+        description=(
+            "If true, when llm/discover/tape/bitcoin-trade runs without --web, POST pass stats to the local dashboard "
+            "so the UI can refresh Kalshi-heavy panels when each loop iteration finishes (not only on a slow timer)."
+        ),
+    )
 
     log_level: str = Field(default="INFO", validation_alias=_env("LOG_LEVEL", "log_level"))
     structured_log_path: Path = Field(
@@ -1561,6 +1595,7 @@ class Settings(BaseSettings):
         "dashboard_ingest_auto_sell",
         "dashboard_ingest_trade_events",
         "dashboard_ingest_portfolio_series",
+        "dashboard_ingest_pass_summary",
         "trade_use_edge_strategy",
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
@@ -1583,6 +1618,7 @@ class Settings(BaseSettings):
         "trade_exit_estimate_entry_from_portfolio",
         "trade_exit_stop_loss_enabled",
         "trade_exit_stop_loss_skip_suspect_portfolio_estimate",
+        "trade_exit_hedge_loser_stop_boost_enabled",
         "trade_exit_trailing_enabled",
         "trade_exit_trailing_combine_with_fixed_stop",
         "trade_exit_trailing_bid_fraction_caps_peak_trail",
