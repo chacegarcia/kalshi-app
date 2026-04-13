@@ -95,19 +95,35 @@ def maybe_clear_structured_log_after_tickers(
     every_n: int,
     processed_count: int,
     log: StructuredLogger | None = None,
+    preserve_executed_bets: bool = False,
 ) -> None:
-    """Truncate the JSONL file every ``every_n`` processed tickers (multi-ticker scans). ``every_n`` 0 = disabled."""
+    """Truncate or compact the JSONL every ``every_n`` processed tickers. ``every_n`` 0 = disabled."""
     if every_n <= 0 or processed_count <= 0 or processed_count % every_n != 0:
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("", encoding="utf-8")
-    if log is not None:
-        log.info(
-            "structured_log_cleared",
-            reason="every_n_tickers",
-            every_n_tickers=every_n,
-            processed_tickers=processed_count,
-        )
+    if preserve_executed_bets:
+        from kalshi_bot.bet_history import invalidate_outcome_summary_cache, rewrite_structured_log_keep_bet_events
+
+        kept, dropped = rewrite_structured_log_keep_bet_events(log_path)
+        invalidate_outcome_summary_cache()
+        if log is not None:
+            log.info(
+                "structured_log_compacted",
+                reason="every_n_tickers",
+                every_n_tickers=every_n,
+                processed_tickers=processed_count,
+                lines_kept=kept,
+                lines_dropped=dropped,
+            )
+    else:
+        log_path.write_text("", encoding="utf-8")
+        if log is not None:
+            log.info(
+                "structured_log_cleared",
+                reason="every_n_tickers",
+                every_n_tickers=every_n,
+                processed_tickers=processed_count,
+            )
 
 
 def maybe_clear_structured_log_every_other_pass(
@@ -116,18 +132,33 @@ def maybe_clear_structured_log_every_other_pass(
     pass_number: int,
     enabled: bool,
     log: StructuredLogger | None = None,
+    preserve_executed_bets: bool = False,
 ) -> None:
-    """Truncate JSONL after every **other** completed pipeline pass (passes 2, 4, 6…).
+    """Truncate or compact JSONL after every **other** completed pipeline pass (passes 2, 4, 6…).
 
     ``pass_number`` is 1-based (first run = 1). When disabled or pass is odd, no-op.
     """
     if not enabled or pass_number < 2 or pass_number % 2 != 0:
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("", encoding="utf-8")
-    if log is not None:
-        log.info(
-            "structured_log_cleared",
-            reason="every_other_pass",
-            pass_number=pass_number,
-        )
+    if preserve_executed_bets:
+        from kalshi_bot.bet_history import invalidate_outcome_summary_cache, rewrite_structured_log_keep_bet_events
+
+        kept, dropped = rewrite_structured_log_keep_bet_events(log_path)
+        invalidate_outcome_summary_cache()
+        if log is not None:
+            log.info(
+                "structured_log_compacted",
+                reason="every_other_pass",
+                pass_number=pass_number,
+                lines_kept=kept,
+                lines_dropped=dropped,
+            )
+    else:
+        log_path.write_text("", encoding="utf-8")
+        if log is not None:
+            log.info(
+                "structured_log_cleared",
+                reason="every_other_pass",
+                pass_number=pass_number,
+            )

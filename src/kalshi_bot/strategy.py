@@ -186,18 +186,23 @@ def entry_filter_timing_and_event(
     """Binary vs multi-choice intelligence, theta-decay gate, optional legacy event top-N substring."""
     sec_until: float | None = None
     ev_t: str | None = None
-    need = False
+    need_timing = False
     if settings.trade_entry_market_intelligence_enabled:
-        need = True
+        need_timing = True
     if settings.trade_entry_theta_decay_enabled:
         lo = settings.trade_entry_theta_min_yes_ask_cents
         hi = settings.trade_entry_theta_max_yes_ask_cents
         if lo <= yes_ask_cents <= hi:
-            need = True
+            need_timing = True
     sub_ev = (settings.trade_entry_event_top_n_substring or "").strip().upper()
     if settings.trade_entry_event_top_n > 0 and sub_ev and sub_ev in ticker.upper():
-        need = True
-    if need:
+        need_timing = True
+    # Max resolution horizon (TRADE_ENTRY_MAX_SECONDS_UNTIL_RESOLUTION) needs real seconds-to-close; it is *not*
+    # implied by TRADE_ENTRY_THETA_* (theta only applies to the long-shot 1–10¢ band).
+    resolution_cap_on = float(getattr(settings, "trade_entry_max_seconds_until_resolution", 0.0) or 0.0) > 0.0
+    if resolution_cap_on:
+        need_timing = True
+    if need_timing:
         sec_until, ev_t = get_market_entry_timing_and_event(client, ticker)
     else:
         sec_until, ev_t = None, None

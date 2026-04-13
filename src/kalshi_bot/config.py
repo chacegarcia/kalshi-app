@@ -243,8 +243,9 @@ class Settings(BaseSettings):
             "trade_entry_theta_seconds_to_close_max",
         ),
         description=(
-            "Theta gate: skip when seconds until close/expiration are ≤ this value AND implied YES ask is in the "
-            "theta band (default 1h)."
+            "Theta **long-shot band only** (TRADE_ENTRY_THETA_MIN/MAX_YES_ASK_CENTS): skip that entry when "
+            "time-to-resolution ≤ this many seconds. Does **not** limit how far out you trade otherwise — set "
+            "TRADE_ENTRY_MAX_SECONDS_UNTIL_RESOLUTION to reject markets that resolve too late (e.g. days away)."
         ),
     )
     trade_entry_theta_min_yes_ask_cents: int = Field(
@@ -373,7 +374,11 @@ class Settings(BaseSettings):
             "STRATEGY_ORDER_COUNT",
             "strategy_order_count",
         ),
-        description="Default shares per buy for rule-based runners (discover/tape/bitcoin); env clamped 1–99. llm-trade uses model `shares` up to max_contracts_per_market.",
+        description=(
+            "Default shares per buy for rule-based runners (discover/tape/bitcoin); env clamped 1–99. "
+            "Session order-size multiplier (1–10, dashboard) scales this in execute_intent: final count = this × multiplier. "
+            "llm-trade uses model `shares` up to max_contracts_per_market (pre-mult cap)."
+        ),
     )
     trade_min_order_notional_usd: float | None = Field(
         default=0.0,
@@ -578,6 +583,188 @@ class Settings(BaseSettings):
             "trade_llm_shuffle_open_markets",
         ),
         description="If true, randomize order of open-market rows each run so the same API ordering does not always star the same tickers.",
+    )
+    trade_llm_crypto_fallback_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_CRYPTO_FALLBACK_ENABLED",
+            "trade_llm_crypto_fallback_enabled",
+        ),
+        description=(
+            "When the primary open-universe pass submits no orders, run a second pass over all open markets "
+            "matching TRADE_CRYPTO_KALSHI_PREFIXES (or legacy TRADE_BITCOIN_TICKER_PREFIX / default KXBTC), "
+            "excluding tickers already scanned in the first pass."
+        ),
+    )
+    trade_llm_crypto_fallback_max_markets: int = Field(
+        default=2000,
+        ge=1,
+        le=2000,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_CRYPTO_FALLBACK_MAX_MARKETS",
+            "trade_llm_crypto_fallback_max_markets",
+        ),
+        description="Max distinct crypto-prefix markets to consider in the llm-trade fallback pass (union of prefixes, volume-sorted).",
+    )
+    trade_llm_crypto_fallback_max_pages: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_CRYPTO_FALLBACK_MAX_PAGES",
+            "trade_llm_crypto_fallback_max_pages",
+        ),
+        description="Per-prefix page cap while fetching open markets for llm-trade crypto fallback (same semantics as bitcoin discovery).",
+    )
+    trade_llm_merge_crypto_watch_signals: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_MERGE_CRYPTO_WATCH_SIGNALS",
+            "trade_llm_merge_crypto_watch_signals",
+        ),
+        description=(
+            "When true, ``llm-trade`` prepends tickers from the crypto-watch JSON file (written by ``kalshi-bot crypto-watch``) "
+            "so the active trader prioritizes the same fee-edge candidates."
+        ),
+    )
+    trade_llm_merge_ws_ticker_scan_signals: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_MERGE_WS_TICKER_SCAN_SIGNALS",
+            "trade_llm_merge_ws_ticker_scan_signals",
+        ),
+        description=(
+            "When true, ``llm-trade`` also merges tickers from ``ws-ticker-scan`` JSON (``.kalshi_ws_ticker_scan.json``); "
+            "same merge cap as ``trade_llm_crypto_watch_merge_max``, deduped with crypto-watch by ticker (higher net_edge wins)."
+        ),
+    )
+    trade_llm_crypto_watch_merge_max: int = Field(
+        default=40,
+        ge=0,
+        le=500,
+        validation_alias=AliasChoices(
+            "TRADE_LLM_CRYPTO_WATCH_MERGE_MAX",
+            "trade_llm_crypto_watch_merge_max",
+        ),
+        description="Max tickers to prepend from the crypto-watch file into each llm-trade open-universe pass (0 = disable merge).",
+    )
+    crypto_watch_state_path: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CRYPTO_WATCH_STATE_PATH",
+            "crypto_watch_state_path",
+        ),
+        description="Path to crypto-watch JSON (default: project root ``.kalshi_crypto_watch.json``). Shared with ``llm-trade`` merge.",
+    )
+    crypto_watch_max_markets_scan: int = Field(
+        default=500,
+        ge=1,
+        le=2000,
+        validation_alias=AliasChoices(
+            "CRYPTO_WATCH_MAX_MARKETS_SCAN",
+            "crypto_watch_max_markets_scan",
+        ),
+        description="Max distinct crypto-prefix markets to evaluate per crypto-watch iteration.",
+    )
+    crypto_watch_max_pages: int = Field(
+        default=80,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices(
+            "CRYPTO_WATCH_MAX_PAGES",
+            "crypto_watch_max_pages",
+        ),
+        description="Per-prefix API page cap for crypto-watch discovery.",
+    )
+    crypto_watch_min_net_edge_after_fees: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CRYPTO_WATCH_MIN_NET_EDGE_AFTER_FEES",
+            "crypto_watch_min_net_edge_after_fees",
+        ),
+        description="Minimum fee-aware edge (YES, mid-as-fair) for crypto-watch pings; None = use TRADE_MIN_NET_EDGE_AFTER_FEES.",
+    )
+    dashboard_ingest_crypto_watch: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "DASHBOARD_INGEST_CRYPTO_WATCH",
+            "dashboard_ingest_crypto_watch",
+        ),
+        description="If true, crypto-watch POSTs its JSON snapshot to the local dashboard ``/api/ingest_crypto_watch``.",
+    )
+    trade_ws_scan_state_path: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_STATE_PATH",
+            "trade_ws_scan_state_path",
+        ),
+        description="Path for ``ws-ticker-scan`` JSON (default: project ``.kalshi_ws_ticker_scan.json``).",
+    )
+    trade_ws_scan_ticker_prefixes: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_TICKER_PREFIXES",
+            "trade_ws_scan_ticker_prefixes",
+        ),
+        description="Comma-separated Kalshi ticker prefixes to score on the WS ticker stream; empty = same as ``TRADE_CRYPTO_KALSHI_PREFIXES`` discovery list.",
+    )
+    trade_ws_scan_min_seconds_between_same_ticker: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=3600.0,
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_MIN_SECONDS_BETWEEN_SAME_TICKER",
+            "trade_ws_scan_min_seconds_between_same_ticker",
+        ),
+        description="Debounce: min seconds between re-evaluating the same market ticker on the WebSocket ticker channel.",
+    )
+    trade_ws_scan_flush_seconds: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_FLUSH_SECONDS",
+            "trade_ws_scan_flush_seconds",
+        ),
+        description="Minimum seconds between writing the WS scan JSON file to disk (and dashboard POST).",
+    )
+    trade_ws_scan_max_opportunities_in_file: int = Field(
+        default=200,
+        ge=1,
+        le=5000,
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_MAX_OPPORTUNITIES_IN_FILE",
+            "trade_ws_scan_max_opportunities_in_file",
+        ),
+        description="Cap rows kept in the WS ticker-scan state file (best net_edge per ticker already enforced).",
+    )
+    trade_ws_scan_respect_min_volume: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_RESPECT_MIN_VOLUME",
+            "trade_ws_scan_respect_min_volume",
+        ),
+        description="If true, apply ``TRADE_MIN_MARKET_VOLUME`` using ticker message volume when present (WS volume may lag REST).",
+    )
+    trade_ws_scan_emit_dashboard_ping: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_EMIT_DASHBOARD_PING",
+            "trade_ws_scan_emit_dashboard_ping",
+        ),
+        description="If true, emit ``crypto_watch_ping``-style monitor events when WS scan flushes with ≥1 opportunity.",
+    )
+    trade_ws_scan_use_rest_orderbook: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_WS_SCAN_USE_REST_ORDERBOOK",
+            "trade_ws_scan_use_rest_orderbook",
+        ),
+        description=(
+            "When true, ``ws-ticker-scan`` re-evaluates each debounced ticker with REST orderbook + the same "
+            "``evaluate_crypto_yes_opportunity`` math as ``crypto-watch`` (implied YES ask from NO bid). "
+            "When false, uses only WS ``yes_bid_dollars``/``yes_ask_dollars`` (mid−ask is usually negative; expect few signals)."
+        ),
     )
     trade_min_market_volume: int | None = Field(
         default=None,
@@ -1516,6 +1703,67 @@ class Settings(BaseSettings):
         validation_alias=_env("STRUCTURED_LOG_CLEAR_EVERY_OTHER_PASS", "structured_log_clear_every_other_pass"),
         description="llm/discover/tape/bitcoin-trade with --loop: truncate JSONL after every 2nd completed pass (2, 4, 6…).",
     )
+    structured_log_preserve_executed_on_flush: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "STRUCTURED_LOG_PRESERVE_EXECUTED_ON_FLUSH",
+            "structured_log_preserve_executed_on_flush",
+        ),
+        description=(
+            "When a structured-log flush runs (every-N tickers or every other pass), rewrite JSONL to keep only "
+            "executed-bet lines (orders + auto-sell closes) instead of deleting the whole file."
+        ),
+    )
+    trade_bet_history_edge_penalty_per_loss: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_BET_HISTORY_EDGE_PENALTY_PER_LOSS",
+            "trade_bet_history_edge_penalty_per_loss",
+        ),
+        description="Add this much to required min net edge per realized loss on the same ticker (from JSONL). 0 = off.",
+    )
+    trade_bet_history_max_edge_penalty: float = Field(
+        default=0.06,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            "TRADE_BET_HISTORY_MAX_EDGE_PENALTY",
+            "trade_bet_history_max_edge_penalty",
+        ),
+        description="Cap on total extra min-edge from bet-history penalties per ticker.",
+    )
+    trade_bet_history_skip_ticker_min_losses: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices(
+            "TRADE_BET_HISTORY_SKIP_TICKER_MIN_LOSSES",
+            "trade_bet_history_skip_ticker_min_losses",
+        ),
+        description="If >0, skip new entries on tickers with at least this many logged realized losses. 0 = never skip.",
+    )
+    trade_bet_history_scan_max_bytes: int = Field(
+        default=12_000_000,
+        ge=100_000,
+        le=200_000_000,
+        validation_alias=AliasChoices(
+            "TRADE_BET_HISTORY_SCAN_MAX_BYTES",
+            "trade_bet_history_scan_max_bytes",
+        ),
+        description="Tail of STRUCTURED_LOG_PATH to scan for per-ticker win/loss stats.",
+    )
+    trade_bet_history_scan_max_lines: int = Field(
+        default=120_000,
+        ge=1_000,
+        le=2_000_000,
+        validation_alias=AliasChoices(
+            "TRADE_BET_HISTORY_SCAN_MAX_LINES",
+            "trade_bet_history_scan_max_lines",
+        ),
+        description="Max JSONL lines (from tail) to scan for bet-history outcomes.",
+    )
 
     @field_validator("kalshi_rest_base_url", "kalshi_ws_url", mode="before")
     @classmethod
@@ -1627,6 +1875,8 @@ class Settings(BaseSettings):
         "trade_double_down_enabled",
         "trade_spike_fade_enabled",
         "structured_log_clear_every_other_pass",
+        "structured_log_preserve_executed_on_flush",
+        "trade_ws_scan_use_rest_orderbook",
         mode="before",
     )
     @classmethod

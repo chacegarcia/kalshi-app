@@ -578,20 +578,104 @@ def summarize_market_row(m: Any) -> MarketSummary:
     )
 
 
+def _coerce_market_datetime(val: Any) -> datetime | None:
+    """Kalshi REST may return ``datetime`` or ISO strings for ``close_time`` / ``open_time`` / etc."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=UTC)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
 def seconds_until_resolution(m: Any) -> float | None:
     """Seconds until the earliest of close / expected / latest expiration (vs UTC now). None if unknown."""
+    _dt, sec = _primary_countdown_deadline_and_seconds(m)
+    return sec
+
+
+def _primary_countdown_deadline_and_seconds(m: Any) -> tuple[datetime | None, float | None]:
+    """Kalshi may expose several times; we mirror :func:`seconds_until_resolution` by taking the minimum remaining."""
     now = datetime.now(UTC)
-    best: float | None = None
+    best_sec: float | None = None
+    best_dt: datetime | None = None
     for attr in ("close_time", "expected_expiration_time", "latest_expiration_time"):
         t = getattr(m, attr, None)
-        if t is None:
+        dt = _coerce_market_datetime(t)
+        if dt is None:
             continue
-        if isinstance(t, datetime):
-            dt = t if t.tzinfo else t.replace(tzinfo=UTC)
-            sec = (dt - now).total_seconds()
-            if best is None or sec < best:
-                best = sec
-    return best
+        sec = (dt - now).total_seconds()
+        if best_sec is None or sec < best_sec:
+            best_sec = sec
+            best_dt = dt
+    return best_dt, best_sec
+
+
+def seconds_until_open(m: Any) -> float | None:
+    """Seconds until ``open_time`` (negative if trading already opened). None if unknown."""
+    ot = getattr(m, "open_time", None)
+    dt = _coerce_market_datetime(ot)
+    if dt is None:
+        return None
+    return (dt - datetime.now(UTC)).total_seconds()
+
+
+def market_lifecycle_timer_payload(m: Any) -> dict[str, Any]:
+    """Fields for the HTML monitor: open vs resolve countdown, absolute deadline unix for client ticking."""
+    status = str(getattr(m, "status", "") or "")
+    out: dict[str, Any] = {
+        "timer_kind": "unknown",
+        "market_status": status,
+        "deadline_unix": None,
+        "seconds_until_open": None,
+        "seconds_until_resolution": None,
+    }
+    if status in ("finalized", "determined", "amended"):
+        out["timer_kind"] = "ended"
+        return out
+
+    su_o = seconds_until_open(m)
+    res_dt, su_r = _primary_countdown_deadline_and_seconds(m)
+    out["seconds_until_resolution"] = su_r
+
+    ot = getattr(m, "open_time", None)
+    if isinstance(ot, datetime):
+        odt = ot if ot.tzinfo else ot.replace(tzinfo=UTC)
+        if su_o is not None and su_o > 0:
+            out["timer_kind"] = "open"
+            out["deadline_unix"] = odt.timestamp()
+            out["seconds_until_open"] = su_o
+            return out
+
+    out["timer_kind"] = "resolve"
+    if res_dt is not None:
+        out["deadline_unix"] = res_dt.timestamp()
+    return out
+
+
+def market_title_and_timer_for_ticker(client: KalshiSdkClient, ticker: str) -> tuple[str, dict[str, Any]]:
+    """Single ``get_market`` for dashboard title + lifecycle timer (falls back to cached title-only)."""
+    try:
+        row = get_market(client, ticker=ticker)
+        m = getattr(row, "market", None)
+        if m is None:
+            return market_title_for_ticker(client, ticker), {}
+        title = (summarize_market_row(m).title or "").strip()
+        if not title:
+            title = market_title_for_ticker(client, ticker)
+        return title, market_lifecycle_timer_payload(m)
+    except Exception:
+        return market_title_for_ticker(client, ticker), {}
 
 
 def get_market_entry_timing_and_event(

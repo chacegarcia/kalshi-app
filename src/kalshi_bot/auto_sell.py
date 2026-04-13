@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -72,6 +73,7 @@ from kalshi_bot.monitor import notify_auto_sell_outcome
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import should_skip_buy_ticker_substrings, skip_buy_yes_longshot
 from kalshi_bot.trading import build_sdk_client, make_limit_intent, trade_execute
+from kalshi_bot.fees import kalshi_general_taker_fee_usd
 from kalshi_bot.trading_model import gross_pnl_cents_from_price_move
 
 
@@ -855,6 +857,32 @@ def try_auto_sell_exit_for_ticker(
         gross_cents = gross_pnl_cents_from_price_move(
             shares=count, exit_price_cents=limit_cents, entry_price_cents=entry_ref.cents
         )
+    fee_in_usd = (
+        kalshi_general_taker_fee_usd(contracts=count, price_dollars=entry_ref.cents / 100.0)
+        if entry_ref.cents is not None
+        else 0.0
+    )
+    fee_out_usd = kalshi_general_taker_fee_usd(contracts=count, price_dollars=limit_cents / 100.0)
+    round_trip_fee_cents = (fee_in_usd + fee_out_usd) * 100.0
+    net_cents: float | None = None
+    if gross_cents is not None:
+        net_cents = float(gross_cents) - round_trip_fee_cents
+    if net_cents is not None:
+        if net_cents > 0.5:
+            pnl_outcome = "win"
+        elif net_cents < -0.5:
+            pnl_outcome = "loss"
+        else:
+            pnl_outcome = "breakeven"
+    elif gross_cents is not None:
+        if gross_cents > 0:
+            pnl_outcome = "win"
+        elif gross_cents < 0:
+            pnl_outcome = "loss"
+        else:
+            pnl_outcome = "breakeven"
+    else:
+        pnl_outcome = "unknown"
     log.info(
         "auto_sell_profit_estimate",
         ticker=ticker,
@@ -865,8 +893,11 @@ def try_auto_sell_exit_for_ticker(
         entry_yes_cents=entry_ref.cents,
         proceeds_cents=proceeds_cents,
         estimated_gross_profit_cents=gross_cents,
+        estimated_round_trip_fee_cents=round(round_trip_fee_cents, 2),
+        estimated_net_profit_cents=(round(net_cents, 2) if net_cents is not None else None),
+        pnl_outcome=pnl_outcome,
         exit_reason=reason,
-        note="vs portfolio entry estimate; excludes fees; IOC may partially fill",
+        note="vs portfolio entry estimate; taker fees approximated; IOC may partially fill",
     )
     notify_auto_sell_outcome(
         settings,
@@ -883,8 +914,10 @@ def try_auto_sell_exit_for_ticker(
             "entry_yes_cents": entry_ref.cents,
             "proceeds_cents": proceeds_cents,
             "estimated_gross_profit_cents": gross_cents,
+            "estimated_net_profit_cents": (round(net_cents, 2) if net_cents is not None else None),
+            "pnl_outcome": pnl_outcome,
             "exit_reason": reason,
-            "note": "vs portfolio entry estimate; excludes fees; IOC may partially fill",
+            "note": "vs portfolio entry estimate; taker fees approximated; IOC may partially fill",
         },
     )
     _maybe_rebuy_yes_after_stop_loss(
@@ -915,8 +948,11 @@ def auto_sell_scan_all_long_yes(
     *,
     cli_min_yes_bid_cents: int | None,
     log: StructuredLogger,
+    ticker_filter: Callable[[str], bool] | None = None,
 ) -> tuple[int, list[str]]:
     """For each market with a long YES position, run one take-profit check (same rules as ``auto-sell``).
+
+    If ``ticker_filter`` is set, only those tickers for which it returns True are considered (e.g. crypto-only).
 
     Returns ``(sell_count, human_lines)`` for terminal summary.
     """
@@ -924,6 +960,8 @@ def auto_sell_scan_all_long_yes(
     ledger = DryRunLedger()
     snap = fetch_portfolio_snapshot(client, ticker=None)
     tickers = sorted(t for t, s in snap.positions_by_ticker.items() if s > 0)
+    if ticker_filter is not None:
+        tickers = [t for t in tickers if ticker_filter(t)]
     hedge_losers = _same_event_hedge_loser_tickers(client, settings, tickers, log)
     sold = 0
     lines: list[str] = []

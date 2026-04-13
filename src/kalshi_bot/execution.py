@@ -18,6 +18,7 @@ from kalshi_bot.portfolio import fetch_portfolio_snapshot
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.sizing import (
     adjust_buy_yes_count_for_notional_floor,
+    bump_per_order_notional_cap_for_min_contracts,
     cap_buy_yes_count_for_notional,
     effective_max_contracts,
     effective_max_exposure_cents,
@@ -152,13 +153,15 @@ def execute_intent(
 ) -> None:
     """Risk-check then either simulate or place a real order."""
     if intent.action == "buy" and intent.side in ("yes", "no"):
-        mult = get_order_size_multiplier()
-        if mult > 1:
-            new_c = max(1, int(intent.count) * mult)
+        mult = max(1, int(get_order_size_multiplier()))
+        base_c = max(1, int(intent.count))
+        new_c = max(1, base_c * mult)
+        if new_c != base_c:
             intent = replace(intent, count=new_c)
             log.info(
                 "order_size_multiplier_applied",
                 multiplier=mult,
+                count_before=base_c,
                 count_after=intent.count,
                 ticker=intent.ticker,
             )
@@ -191,8 +194,17 @@ def execute_intent(
     min_n = settings.trade_min_order_notional_usd
     max_n = settings.trade_max_order_notional_usd
     if intent.action == "buy" and intent.side in ("yes", "no"):
-        min_n, max_n = next_buy_yes_notional_min_max(settings, balance_cents=snap.balance_cents)
-        if parse_notional_sweep_usd(settings.trade_notional_sweep_usd):
+        dd_buy = bool(getattr(intent, "double_down", False))
+        min_n, max_n = next_buy_yes_notional_min_max(
+            settings,
+            balance_cents=snap.balance_cents,
+            apply_notional_sweep=not dd_buy,
+        )
+        if dd_buy:
+            max_n = bump_per_order_notional_cap_for_min_contracts(
+                max_n, yes_price_cents=intent.yes_price_cents, min_contracts=1
+            )
+        if parse_notional_sweep_usd(settings.trade_notional_sweep_usd) and not dd_buy:
             log.info(
                 "notional_sweep_step",
                 ticker=intent.ticker,

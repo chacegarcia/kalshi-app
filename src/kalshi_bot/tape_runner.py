@@ -348,6 +348,7 @@ def run_tape_rule_pipeline(
                 every_n=settings.structured_log_clear_every_n_tickers,
                 processed_count=i + 1,
                 log=log,
+                preserve_executed_bets=settings.structured_log_preserve_executed_on_flush,
             )
 
     return stats.submitted + stats.bitcoin_sidecar_orders_submitted, stats

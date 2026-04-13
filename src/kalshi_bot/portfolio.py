@@ -48,6 +48,39 @@ def _total_exposure_cents(market_positions: list[object]) -> float:
     return total
 
 
+def fetch_all_market_positions(
+    client: KalshiSdkClient,
+    *,
+    ticker: str | None = None,
+    count_filter: str = "position",
+    page_limit: int = 500,
+) -> list[object]:
+    """Paginate ``portfolio.get_positions`` until the API returns no ``cursor`` (all pages).
+
+    Kalshi paginates results (default page size 100). Without following ``cursor``, only the first page
+    of market positions is visible — dashboard and risk math would miss the rest.
+    """
+    all_rows: list[object] = []
+    cursor: str | None = None
+    while True:
+        pos_resp = client.portfolio.get_positions(
+            ticker=ticker,
+            count_filter=count_filter,
+            limit=page_limit,
+            cursor=cursor,
+        )
+        batch = list(getattr(pos_resp, "market_positions", []) or [])
+        all_rows.extend(batch)
+        cursor = getattr(pos_resp, "cursor", None)
+        if isinstance(cursor, str) and not cursor.strip():
+            cursor = None
+        if not cursor:
+            break
+        if not batch:
+            break
+    return all_rows
+
+
 @with_rest_retry
 def get_balance_cents(client: KalshiSdkClient) -> int | None:
     """Cash balance in cents (None if API omits it)."""
@@ -67,17 +100,15 @@ def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = No
         except (TypeError, ValueError):
             portfolio_value_cents = None
 
-    pos_resp = client.portfolio.get_positions(
-        ticker=ticker,
-        count_filter="position",
-        limit=500,
-    )
-    mpos = list(getattr(pos_resp, "market_positions", []) or [])
-    positions = _position_contracts(mpos)
-
-    pos_all = client.portfolio.get_positions(count_filter="position", limit=1000)
-    all_mpos = list(getattr(pos_all, "market_positions", []) or [])
+    # One fully paginated fetch for the whole portfolio, then optional ticker filter — avoids truncated
+    # position lists (previous code used a single page-sized limit with no cursor).
+    all_mpos = fetch_all_market_positions(client, ticker=None, count_filter="position")
     exposure = _total_exposure_cents(all_mpos)
+    if ticker is not None:
+        mpos = [p for p in all_mpos if getattr(p, "ticker", None) == ticker]
+    else:
+        mpos = all_mpos
+    positions = _position_contracts(mpos)
 
     orders_cursor: str | None = None
     resting_by: dict[str, int] = {}
@@ -137,12 +168,7 @@ def count_long_yes_positions_matching_substring(snap: PortfolioSnapshot, substri
 @with_rest_retry
 def get_market_position_row(client: KalshiSdkClient, ticker: str) -> object | None:
     """Return the raw ``market_positions`` row for ``ticker``, or None."""
-    pos_resp = client.portfolio.get_positions(
-        ticker=ticker,
-        count_filter="position",
-        limit=50,
-    )
-    for p in getattr(pos_resp, "market_positions", []) or []:
+    for p in fetch_all_market_positions(client, ticker=ticker, count_filter="position"):
         if getattr(p, "ticker", None) == ticker:
             return p
     return None

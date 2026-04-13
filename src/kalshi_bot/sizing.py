@@ -50,6 +50,7 @@ def next_buy_yes_notional_min_max(
     settings: Settings,
     *,
     balance_cents: int | None = None,
+    apply_notional_sweep: bool = True,
 ) -> tuple[float | None, float | None]:
     """Return (min, max) USD notional for this buy-YES order.
 
@@ -58,9 +59,14 @@ def next_buy_yes_notional_min_max(
 
     When ``TRADE_BALANCE_SIZING_ENABLED`` is true and ``balance_cents`` is set, the max cap follows the same per-trade
     budget as contract sizing (not ``TRADE_MAX_ORDER_NOTIONAL_USD``).
+
+    Set ``apply_notional_sweep=False`` for add-on buys (e.g. dashboard double-down) so the round-robin sweep does not
+    force a sub-$1 cap that cannot fit one contract at the lift price.
     """
     mn = settings.trade_min_order_notional_usd
     mx = effective_trade_max_order_notional_usd(settings, balance_cents)
+    if not apply_notional_sweep:
+        return mn, mx
     vals = parse_notional_sweep_usd(settings.trade_notional_sweep_usd)
     if not vals:
         return mn, mx
@@ -73,6 +79,27 @@ def next_buy_yes_notional_min_max(
     else:
         cap = t
     return (mn, cap)
+
+
+def bump_per_order_notional_cap_for_min_contracts(
+    max_notional_usd: float | None,
+    *,
+    yes_price_cents: int,
+    min_contracts: int = 1,
+) -> float | None:
+    """If a positive cap is below the $ at limit for ``min_contracts``, raise it to that $ (so at least one lot fits).
+
+    Used for double-down so balance/sweep caps cannot imply ``max contracts = 0`` when buying ≥1 share at ask.
+    """
+    if max_notional_usd is None or max_notional_usd <= 0:
+        return max_notional_usd
+    if min_contracts < 1:
+        return max_notional_usd
+    p = max(1, min(99, yes_price_cents)) / 100.0
+    need = p * float(min_contracts)
+    if float(max_notional_usd) + 1e-9 < need:
+        return need
+    return max_notional_usd
 
 
 def effective_max_contracts(

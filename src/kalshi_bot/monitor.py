@@ -41,8 +41,11 @@ _INGESTABLE_EVENT_KINDS = frozenset(
         "blocked",
         "refused",
         "auto_sell_profit_estimate",
+        "crypto_watch_ping",
     }
 )
+# Last payload from ``kalshi-bot crypto-watch`` (POST /api/ingest_crypto_watch) for GET /api/crypto_watch.
+_CRYPTO_WATCH_STATE: dict[str, Any] = {}
 # Last trade-pass summary (JSON-safe dict) for GET /api/pass_summary — no HTML panel.
 _LAST_PASS_SUMMARY: dict[str, Any] = {}
 # Time series for dashboard line chart (cash, positions MTM from portfolio_value, total = cash + positions)
@@ -305,11 +308,6 @@ def record_portfolio_series_point(
         _SERIES.append(row)
 
 
-def _stop_floor_cents(entry_cents: int, fraction: float) -> int:
-    """Same as auto-sell: best YES bid at/below this triggers fixed stop (when enabled)."""
-    return max(1, min(99, int(round(entry_cents * fraction))))
-
-
 def dashboard_position_exit_hints(
     settings: Settings,
     *,
@@ -318,6 +316,8 @@ def dashboard_position_exit_hints(
     best_bid_cents: int | None,
 ) -> dict[str, Any]:
     """P/L vs entry + next TP bid / stop floor for sidebar (mirrors main TRADE_EXIT_* rules, simplified)."""
+    from kalshi_bot.auto_sell import _entry_stop_floor_cents
+
     out: dict[str, Any] = {
         "pnl_sign": "unknown",
         "unrealized_delta_cents": None,
@@ -326,6 +326,8 @@ def dashboard_position_exit_hints(
         "cents_to_take_profit": None,
         "stop_loss_bid_cents": None,
         "cents_buffer_to_stop": None,
+        "cents_above_fixed_stop_floor": None,
+        "stop_loss_trailing_or_lock_may_apply": False,
         "stop_loss_status": "off",
     }
     if entry_cents is None or not (1 <= entry_cents <= 99):
@@ -379,9 +381,20 @@ def dashboard_position_exit_hints(
             out["stop_loss_status"] = "skipped_suspect"
         else:
             frac = float(settings.trade_exit_stop_loss_entry_fraction)
-            stop_bid = _stop_floor_cents(ent, frac)
+            stop_bid = _entry_stop_floor_cents(ent, frac)
             out["stop_loss_bid_cents"] = stop_bid
-            out["cents_buffer_to_stop"] = bid - stop_bid
+            # Distance bid − floor (¢). Sell when bid ≤ floor; this is headroom above the floor, NOT an extra
+            # cushion added to the stop price (mislabeling "buffer" suggested the stop fired at floor+buffer).
+            above = bid - stop_bid
+            out["cents_above_fixed_stop_floor"] = above
+            out["cents_buffer_to_stop"] = above
+            out["stop_loss_trailing_or_lock_may_apply"] = bool(
+                settings.trade_exit_trailing_enabled
+                or (
+                    settings.trade_exit_lock_profit_cents is not None
+                    and float(settings.trade_exit_lock_profit_cents) > 0
+                )
+            )
             out["stop_loss_status"] = "active"
 
     return out
@@ -454,11 +467,53 @@ _HTML = """<!DOCTYPE html>
     body { font-family: ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); margin:0; padding:0; display: flex; min-height: 100vh; align-items: stretch; overflow-x: hidden; }
     .main-wrap { flex: 1; padding: 1rem 1.25rem 2rem; min-width: 0; max-width: 100%; overflow-x: hidden; }
     .sidebar {
-      width: 320px; flex-shrink: 0; background: #151b26; border-right: 1px solid #2a3544;
-      display: flex; flex-direction: column; transition: margin-left 0.2s ease, width 0.2s ease;
+      width: 320px;
+      min-width: 0;
+      max-width: 320px;
+      flex-shrink: 0;
+      background: #151b26;
+      border-right: 1px solid #2a3544;
+      display: flex;
+      flex-direction: column;
+      transition: width 0.28s ease, max-width 0.28s ease, border-color 0.2s ease;
     }
-    .sidebar.collapsed { width: 0; margin-left: -320px; overflow: hidden; border: none; }
-    .sidebar__head { display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1rem; border-bottom: 1px solid #2a3544; }
+    /* Collapse to a slim rail (keeps ☰ visible). Avoid width:0 + negative margin — that “dives” off-screen. */
+    .sidebar.collapsed {
+      width: 2.75rem;
+      max-width: 2.75rem;
+      overflow: hidden;
+    }
+    .sidebar.collapsed .sidebar__body {
+      flex: 0 0 0;
+      visibility: hidden;
+      opacity: 0;
+      height: 0;
+      min-height: 0;
+      padding-top: 0;
+      padding-bottom: 0;
+      margin: 0;
+      overflow: hidden;
+      pointer-events: none;
+      transition: opacity 0.2s ease, height 0.25s ease, padding 0.25s ease, flex 0.25s ease, visibility 0s linear 0.22s;
+    }
+    .sidebar:not(.collapsed) .sidebar__body {
+      visibility: visible;
+      opacity: 1;
+      height: auto;
+      flex: 1;
+      pointer-events: auto;
+      transition: opacity 0.2s ease 0.08s, height 0.25s ease, padding 0.25s ease, flex 0.25s ease, visibility 0s linear 0s;
+    }
+    .sidebar.collapsed .sidebar__head {
+      flex-direction: column;
+      justify-content: flex-start;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.5rem 0.35rem;
+      border-bottom: none;
+    }
+    .sidebar.collapsed .sidebar__head strong { display: none; }
+    .sidebar__head { display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1rem; border-bottom: 1px solid #2a3544; flex-shrink: 0; }
     .sidebar__head button { background: #243044; border: none; color: var(--text); padding: 0.35rem 0.55rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
     .sidebar__head button:hover { background: #2d3d52; }
     .sidebar__body { padding: 0.75rem 1rem 1.25rem; overflow: auto; flex: 1; }
@@ -496,6 +551,8 @@ _HTML = """<!DOCTYPE html>
     .mini-pos__title { font-size: 0.72rem; color: var(--text); line-height: 1.3; margin-bottom: 0.3rem; word-break: break-word; }
     .mini-pos__shares { font-size: 0.74rem; font-weight: 600; font-variant-numeric: tabular-nums; color: #d0dae8; margin-bottom: 0.25rem; }
     .mini-pos__ticker { font-family: ui-monospace, monospace; font-size: 0.65rem; color: #8b9aab; margin-bottom: 0.25rem; }
+    .mini-pos__timer { font-size: 0.65rem; color: #8b9aab; line-height: 1.35; margin-bottom: 0.35rem; }
+    .resting-orders td.resting-timer { font-size: 0.68rem; color: #8b9aab; white-space: nowrap; max-width: 11rem; overflow: hidden; text-overflow: ellipsis; }
     .mini-pos__row { display: flex; justify-content: space-between; gap: 0.5rem; color: #a8b4c5; font-variant-numeric: tabular-nums; font-size: 0.72rem; }
     .mini-pos__actions { display: flex; gap: 0.35rem; margin-top: 0.4rem; }
     .mini-pos__actions button {
@@ -519,16 +576,35 @@ _HTML = """<!DOCTYPE html>
     .resting-orders th, .resting-orders td { padding: 0.35rem 0.5rem; text-align: left; border-bottom: 1px solid #2a3544; font-variant-numeric: tabular-nums; }
     .resting-orders th { color: var(--muted); font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; }
     .resting-orders code { font-size: 0.72rem; }
+    .pos-scoreboard {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.75rem;
+      margin: 0 0 0.65rem; padding: 0.4rem 0.55rem;
+      border-radius: 6px; border: 1px solid #2e3d52;
+      background: linear-gradient(180deg, #1e2838 0%, #18202c 100%);
+      font-size: 0.72rem; max-width: 100%;
+    }
+    .open-pos .pos-filter { margin: 0 0 0.5rem; }
+    .pos-scoreboard--muted { opacity: 0.55; }
+    .pos-scoreboard__strip {
+      display: inline-flex; align-items: baseline; gap: 0.35rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .pos-scoreboard__team { display: inline-flex; align-items: baseline; gap: 0.2rem; }
+    .pos-scoreboard__team strong { font-size: 0.95rem; font-weight: 700; line-height: 1; }
+    .pos-scoreboard__team--pos strong { color: #5ee4a8; }
+    .pos-scoreboard__team--neg strong { color: #ff9494; }
+    .pos-scoreboard__vs { color: var(--muted); font-weight: 600; font-size: 0.68rem; padding: 0 0.1rem; }
+    .pos-scoreboard__be { color: var(--muted); font-size: 0.68rem; }
+    .pos-scoreboard__be strong { color: #b8c5d6; font-size: 0.8rem; font-weight: 600; }
     .chart-wrap { background: var(--card); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.25rem; max-width: 100%; box-sizing: border-box; }
     .chart-wrap--chart-only { overflow: hidden; }
     .chart-wrap h2 { font-size: 0.9375rem; font-weight: 600; margin: 0 0 0.35rem; color: var(--muted); }
     .chart-panel { width: 100%; max-width: 100%; overflow: hidden; }
     .chart-scroll-outer {
-      width: 100%; max-width: 100%; overflow-x: auto; overflow-y: hidden; border-radius: 6px;
-      -webkit-overflow-scrolling: touch;
+      width: 100%; max-width: 100%; overflow: hidden; border-radius: 6px;
     }
     .chart-scroll-inner {
-      position: relative; height: 220px; min-width: 100%;
+      position: relative; height: 220px; width: 100%;
     }
     .chart-hint { font-size: 0.75rem; color: var(--muted); margin: 0 0 0.5rem; line-height: 1.45; }
     .chart-hint button {
@@ -556,6 +632,30 @@ _HTML = """<!DOCTYPE html>
     .trade-card--warn { border-left: 3px solid var(--warn); }
     .trade-card--err { border-left: 3px solid var(--err); }
     .trade-card__head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; margin-bottom: 0.4rem; }
+    .trade-card__timer--inline {
+      display: inline-block;
+      margin: 0;
+      padding: 0.12rem 0.45rem;
+      border-radius: 5px;
+      font-size: 0.65rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      vertical-align: middle;
+      line-height: 1.3;
+      background: rgba(110,181,255,0.16);
+      border: 1px solid rgba(110,181,255,0.38);
+      color: #c5e0ff;
+      max-width: 10rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .trade-card__timer--inline[data-timer-kind="ended"] {
+      background: rgba(139,154,171,0.12);
+      border-color: rgba(139,154,171,0.35);
+      color: #a8b4c5;
+      font-weight: 500;
+    }
     .trade-card__time { font-size: 0.75rem; color: var(--muted); font-variant-numeric: tabular-nums; }
     .trade-card__badge {
       font-family: ui-monospace, monospace; font-size: 0.7rem; font-weight: 600;
@@ -580,8 +680,35 @@ _HTML = """<!DOCTYPE html>
     .trade-card__detail pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
     @media (max-width: 900px) {
       body { flex-direction: column; }
-      .sidebar { width: 100%; border-right: none; border-bottom: 1px solid #2a3544; max-height: 50vh; }
-      .sidebar.collapsed { max-height: 0; margin-left: 0; width: 100%; padding: 0; border: none; }
+      .sidebar {
+        width: 100%;
+        max-width: none;
+        border-right: none;
+        border-bottom: 1px solid #2a3544;
+        max-height: 50vh;
+        transition: max-height 0.28s ease, min-height 0.28s ease;
+      }
+      /* Don’t collapse to height 0 — that hid the toggle. Show a short bar with the menu button only. */
+      .sidebar.collapsed {
+        width: 100%;
+        max-height: 3.25rem;
+        min-height: 3.25rem;
+        overflow: hidden;
+      }
+      .sidebar.collapsed .sidebar__body {
+        display: none;
+        height: auto;
+        visibility: hidden;
+        opacity: 0;
+      }
+      .sidebar.collapsed .sidebar__head {
+        flex-direction: row;
+        justify-content: flex-start;
+        align-items: center;
+        padding: 0.65rem 1rem;
+        border-bottom: 1px solid #2a3544;
+      }
+      .sidebar.collapsed .sidebar__head strong { display: none; }
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -595,7 +722,6 @@ _HTML = """<!DOCTYPE html>
       <strong>Controller</strong>
     </div>
     <div class="sidebar__body">
-      <p class="sidebar__hint">Live controls apply to <strong>this</strong> process only (run with <code>--web</code>). Restart the bot to pick up <code>.env</code> edits.</p>
       <label>Buy size multiplier</label>
       <div class="seg" id="multSeg" role="group" aria-label="Order size multiplier">
         <button type="button" data-m="1">1×</button>
@@ -603,12 +729,28 @@ _HTML = """<!DOCTYPE html>
         <button type="button" data-m="5">5×</button>
         <button type="button" data-m="10">10×</button>
       </div>
-      <p class="sidebar__stat">Active: <strong id="multActive">1×</strong> · base contracts from strategy × multiplier (caps still apply).</p>
+      <p class="sidebar__stat">Active: <strong id="multActive">1×</strong></p>
       <label>Settings snapshot</label>
       <pre id="settingsSnap" class="sidebar__pre">Loading…</pre>
       <div class="open-pos">
         <h3>Open positions</h3>
-        <p class="sidebar__hint" style="margin:0 0 0.35rem;">Green/red = bid vs estimated entry. TP/stop from <code>TRADE_EXIT_*</code> (same idea as auto-sell; trailing/hold not shown). Buttons: localhost only.</p>
+        <div class="pos-scoreboard" id="posPnLScoreboard" aria-label="Long YES positions by mark vs entry">
+          <div class="pos-scoreboard__strip">
+            <span class="pos-scoreboard__team pos-scoreboard__team--pos" title="Mark above entry">
+              <span>+</span><strong id="posScorePos">0</strong>
+            </span>
+            <span class="pos-scoreboard__vs">vs</span>
+            <span class="pos-scoreboard__team pos-scoreboard__team--neg" title="Mark below entry">
+              <span>−</span><strong id="posScoreNeg">0</strong>
+            </span>
+            <span class="pos-scoreboard__be" id="posScoreBeWrap"> · BE <strong id="posScoreBe">0</strong></span>
+          </div>
+        </div>
+        <div class="seg pos-filter" id="posFilterSeg" role="group" aria-label="Filter open positions">
+          <button type="button" class="active" data-filter="all" aria-pressed="true">All</button>
+          <button type="button" data-filter="positive" aria-pressed="false" title="Mark above entry">+</button>
+          <button type="button" data-filter="negative" aria-pressed="false" title="Mark below entry">−</button>
+        </div>
         <p id="posStatus"></p>
         <div id="openPositions">Loading…</div>
       </div>
@@ -617,18 +759,17 @@ _HTML = """<!DOCTYPE html>
   <div class="main-wrap">
   <main class="main" style="max-width:100%;min-width:0;overflow-x:hidden;">
   <h1>Kalshi bot — trading monitor</h1>
-  <p class="sub">YES positions as <strong>shares</strong> (Kalshi contracts) at an implied <strong>share price</strong> in ¢. Live feed of orders and blocks. Cash / positions / total use Kalshi&rsquo;s balance API (<strong>portfolio_value</strong> for mark-to-market positions — same notion as the app), not the sum of per-market <code>market_exposure</code> fields.</p>
   <div class="status" id="status">Loading…</div>
-  <div class="status" id="wlBanner">W–L <strong id="wlStat">0–0</strong> <span class="muted" id="wlTies"></span> <span class="muted">(auto-sell / exit-scan; P/L from entry estimate when available; separate CLI posts to this page)</span></div>
+  <div class="status" id="wlBanner">W–L <strong id="wlStat">0–0</strong> <span class="muted" id="wlTies"></span></div>
   <div class="balance-banner" id="balanceBanner" style="display:none;">
     <span><strong>Cash</strong> <span id="balCash">—</span></span>
-    <span title="portfolio_value from GET /portfolio/balance (MTM; matches Kalshi app)"><strong>Positions</strong> <span id="balExp">—</span></span>
-    <span title="portfolio_value + cash (when both known)"><strong>Total</strong> <span id="balTotal">—</span></span>
+    <span><strong>Positions</strong> <span id="balExp">—</span></span>
+    <span><strong>Total</strong> <span id="balTotal">—</span></span>
     <span class="muted" id="balTs"></span>
   </div>
   <div class="chart-wrap chart-wrap--chart-only">
     <h2>Cash, positions value (MTM) &amp; total account (USD)</h2>
-    <p class="chart-hint">Drag on the chart to pan along the time axis · mouse wheel (or trackpad pinch) to zoom · scroll horizontally when the series is long. <button type="button" id="chartResetZoom">Reset zoom</button></p>
+    <p class="chart-hint">X-axis is time: wheel or pinch zooms to a <strong>time window</strong>; drag pans along the timeline. <button type="button" id="chartResetZoom">Show full range</button></p>
     <div class="chart-panel">
       <div class="chart-scroll-outer" id="chartScrollOuter">
         <div class="chart-scroll-inner" id="chartScrollInner">
@@ -639,29 +780,118 @@ _HTML = """<!DOCTYPE html>
   </div>
   <div class="chart-wrap">
     <h2>Trades &amp; orders</h2>
-    <p class="sub" style="margin:0 0 0.75rem;">Exit P/L uses green / red hues. Buys (dry-run / live submit) use a blue accent. Expand <strong>Raw JSON</strong> for the full payload. If trading runs in a <strong>different terminal</strong> than the dashboard, set <code>DASHBOARD_INGEST_TRADE_EVENTS=true</code> (default) so orders POST to this page.</p>
     <div class="trade-feed" id="tradeFeed"></div>
   </div>
   <div class="chart-wrap">
     <h2>Open orders</h2>
-    <p class="sub" style="margin:0 0 0.5rem;">Resting limit orders from Kalshi (refreshed after each trading pass and on a slow fallback timer).</p>
     <div class="resting-orders" id="restingOrders">Loading…</div>
   </div>
   </main>
   </div>
   <script>
     let seriesChart = null;
-    /** In-memory feeds (stats, events, chart series): poll often. Kalshi-backed positions + open orders: only after each pass or fallback. */
+    /** In-memory feeds (stats, events, chart series): poll often. Kalshi positions + open orders: throttled (each positions fetch paginates the full portfolio). */
     const POLL_MS = 2000;
-    const HEAVY_KALSHI_FALLBACK_MS = 45000;
+    const HEAVY_KALSHI_FALLBACK_MS = 20000;
     let lastSeenPassUnix = 0;
     let lastHeavyKalshiMs = 0;
+    let positionsFilter = 'all';
+    let lastPositionsPayload = null;
     function dollarsFromCents(c) { return (Number(c) || 0) / 100; }
+    function formatDurationCountdown(totalSec) {
+      var sec = Math.max(0, Math.floor(Number(totalSec) || 0));
+      if (sec >= 86400) {
+        var d = Math.floor(sec / 86400);
+        var h = Math.floor((sec % 86400) / 3600);
+        return d + 'd ' + h + 'h';
+      }
+      if (sec >= 3600) {
+        var h2 = Math.floor(sec / 3600);
+        var m2 = Math.floor((sec % 3600) / 60);
+        return h2 + 'h ' + m2 + 'm';
+      }
+      if (sec >= 60) {
+        var m3 = Math.floor(sec / 60);
+        var s3 = sec % 60;
+        return m3 + 'm ' + s3 + 's';
+      }
+      return sec + 's';
+    }
+    function computeMarketTimerTextFromAttrs(el) {
+      var kind = el.getAttribute('data-timer-kind') || '';
+      var du = el.getAttribute('data-deadline-unix');
+      var inline = el.classList.contains('trade-card__timer--inline');
+      if (inline) {
+        if (kind === 'ended') return 'Settled';
+        if (!du) return '';
+        var secI = Math.floor(Number(du) - Date.now() / 1000);
+        if (kind === 'open') {
+          if (secI <= 0) return 'Open';
+          return formatDurationCountdown(secI) + ' to open';
+        }
+        if (secI <= 0) return 'Due';
+        return formatDurationCountdown(secI);
+      }
+      if (kind === 'ended') return 'Settled';
+      if (!du) return '';
+      var sec = Math.floor(Number(du) - Date.now() / 1000);
+      if (kind === 'open') {
+        if (sec <= 0) return 'Opening…';
+        return formatDurationCountdown(sec) + ' until open';
+      }
+      if (sec <= 0) return 'At/past window';
+      return formatDurationCountdown(sec) + ' until close/exp.';
+    }
+    function applyMarketTimerAttrs(el, mt) {
+      if (!mt || typeof mt !== 'object' || Object.keys(mt).length === 0) {
+        el.removeAttribute('data-deadline-unix');
+        el.removeAttribute('data-timer-kind');
+        el.classList.remove('js-market-timer');
+        el.textContent = '';
+        return;
+      }
+      el.classList.add('js-market-timer');
+      var kind = mt.timer_kind || '';
+      el.setAttribute('data-timer-kind', kind);
+      if (kind === 'ended') {
+        el.removeAttribute('data-deadline-unix');
+        el.textContent = 'Settled';
+        return;
+      }
+      if (mt.deadline_unix != null && mt.deadline_unix !== '') {
+        el.setAttribute('data-deadline-unix', String(mt.deadline_unix));
+      } else {
+        el.removeAttribute('data-deadline-unix');
+      }
+      el.textContent = computeMarketTimerTextFromAttrs(el);
+    }
+    setInterval(function() {
+      document.querySelectorAll('.js-market-timer').forEach(function(el) {
+        el.textContent = computeMarketTimerTextFromAttrs(el);
+      });
+    }, 1000);
+    async function refreshTradeCardTimers(tickers) {
+      var uniq = [];
+      for (var i = 0; i < tickers.length; i++) {
+        if (tickers[i] && uniq.indexOf(tickers[i]) === -1) uniq.push(tickers[i]);
+      }
+      if (!uniq.length) return;
+      try {
+        var r = await fetch('/api/market_timers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tickers: uniq }) });
+        var data = await r.json();
+        var timers = data.timers || {};
+        document.querySelectorAll('.trade-card__timer').forEach(function(el) {
+          var t = el.getAttribute('data-ticker');
+          applyMarketTimerAttrs(el, t ? timers[t] : null);
+        });
+      } catch (e) { /* ignore */ }
+    }
     function renderTradeCards(events) {
       const feed = document.getElementById('tradeFeed');
       if (!feed) return;
       feed.innerHTML = '';
-      const tradeKinds = /^(dry_run|live_submit|live_ack|blocked|refused|auto_sell_profit_estimate)$/;
+      const tradeKinds = /^(dry_run|live_submit|live_ack|blocked|refused|auto_sell_profit_estimate|crypto_watch_ping)$/;
+      const tradeTickers = [];
       for (const ev of events) {
         const k = ev.kind || '';
         if (!tradeKinds.test(k)) continue;
@@ -695,10 +925,14 @@ _HTML = """<!DOCTYPE html>
         if (catStr) {
           const catBadge = document.createElement('span');
           catBadge.className = 'trade-card__badge trade-card__badge--cat';
-          catBadge.title = 'Kalshi event category';
           catBadge.textContent = catStr;
           head.appendChild(catBadge);
         }
+        if (ticker && tradeTickers.indexOf(ticker) === -1) tradeTickers.push(ticker);
+        const tmr = document.createElement('span');
+        tmr.className = 'trade-card__timer trade-card__timer--inline js-market-timer';
+        tmr.setAttribute('data-ticker', ticker || '');
+        head.appendChild(tmr);
         card.appendChild(head);
 
         const market = document.createElement('div');
@@ -737,7 +971,7 @@ _HTML = """<!DOCTYPE html>
           const pl = document.createElement('div');
           pl.className = 'trade-card__pl ' + (g > 0 ? 'trade-card__pl--pos' : g < 0 ? 'trade-card__pl--neg' : 'trade-card__pl--zero');
           const sign = g > 0 ? '+' : '';
-          pl.textContent = 'Est. gross P/L ' + sign + (g / 100).toFixed(2) + ' USD (before fees)';
+          pl.textContent = sign + (g / 100).toFixed(2) + ' USD';
           card.appendChild(pl);
         }
 
@@ -756,81 +990,107 @@ _HTML = """<!DOCTYPE html>
         const empty = document.createElement('p');
         empty.className = 'sub';
         empty.style.margin = '0';
-        empty.textContent = 'No trade events yet — dry-run, live orders, or auto-sell will appear here.';
+        empty.textContent = 'No trade events yet.';
         feed.appendChild(empty);
+      } else {
+        refreshTradeCardTimers(tradeTickers);
       }
     }
     function buildOrUpdateChart(points) {
-      const labels = points.map(p => {
-        const t = new Date((p.unix || 0) * 1000);
-        return t.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const sorted = points.slice().sort(function(a, b) {
+        return (Number(a.unix) || 0) - (Number(b.unix) || 0);
       });
-      const bal = points.map(p => dollarsFromCents(p.balance_cents));
-      const exp = points.map(p => {
+      const toXY = function(yfn) {
+        return sorted.map(function(p) {
+          return { x: (Number(p.unix) || 0) * 1000, y: yfn(p) };
+        });
+      };
+      const bal = toXY(function(p) { return dollarsFromCents(p.balance_cents); });
+      const exp = toXY(function(p) {
         const pv = p.positions_value_cents != null && p.positions_value_cents !== '' ? p.positions_value_cents : p.exposure_cents;
         return dollarsFromCents(pv);
       });
-      const total = points.map(p => (p.total_account_cents != null ? dollarsFromCents(p.total_account_cents) : null));
+      const total = toXY(function(p) {
+        if (p.total_account_cents == null || p.total_account_cents === '') return null;
+        return dollarsFromCents(p.total_account_cents);
+      });
       const ctx = document.getElementById('seriesChart');
+      function formatTimeTick(raw) {
+        if (typeof raw !== 'number' || !isFinite(raw)) return '';
+        var d = new Date(raw);
+        return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      }
       if (!seriesChart) {
         seriesChart = new Chart(ctx, {
           type: 'line',
           data: {
-            labels,
             datasets: [
-              { label: 'Cash', data: bal, borderColor: '#3ecf8e', backgroundColor: 'rgba(62,207,142,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
-              { label: 'Positions value (MTM)', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false },
-              { label: 'Total (cash + positions)', data: total, borderColor: '#f5a623', backgroundColor: 'rgba(245,166,35,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false }
+              { label: 'Cash', data: bal, borderColor: '#3ecf8e', backgroundColor: 'rgba(62,207,142,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false, parsing: false },
+              { label: 'Positions value (MTM)', data: exp, borderColor: '#6eb5ff', backgroundColor: 'rgba(110,181,255,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: false, parsing: false },
+              { label: 'Total (cash + positions)', data: total, borderColor: '#f5a623', backgroundColor: 'rgba(245,166,35,0.08)', tension: 0.2, fill: false, pointRadius: 0, spanGaps: true, parsing: false }
             ]
           },
           options: {
             responsive: true,
             maintainAspectRatio: false,
             animation: false,
-            interaction: { mode: 'index', intersect: false },
+            interaction: { mode: 'nearest', intersect: false },
             scales: {
-              x: { ticks: { maxTicksLimit: 12, color: '#8b9aab' }, grid: { color: '#2a3544' } },
-              y: { ticks: { color: '#8b9aab' }, grid: { color: '#2a3544' } }
+              x: {
+                type: 'linear',
+                bounds: 'data',
+                ticks: {
+                  maxTicksLimit: 14,
+                  color: '#8b9aab',
+                  callback: function(value) { return formatTimeTick(value); }
+                },
+                grid: { color: '#2a3544' },
+                title: { display: true, text: 'Time (local)', color: '#8b9aab', font: { size: 11 } }
+              },
+              y: {
+                ticks: { color: '#8b9aab' },
+                grid: { color: '#2a3544' },
+                title: { display: true, text: 'USD', color: '#8b9aab', font: { size: 11 } }
+              }
             },
             plugins: {
               legend: { labels: { color: '#e7ecf3' } },
+              tooltip: {
+                callbacks: {
+                  title: function(items) {
+                    if (!items || !items.length) return '';
+                    var x = items[0].parsed.x;
+                    if (x == null || !isFinite(x)) return '';
+                    return new Date(x).toLocaleString();
+                  }
+                }
+              },
               zoom: {
                 limits: {
                   x: { min: 'original', max: 'original' },
-                  y: { min: 'original', max: 'original' },
+                  y: { min: 'original', max: 'original' }
                 },
                 pan: {
                   enabled: true,
                   mode: 'x',
-                  modifierKey: null,
+                  modifierKey: null
                 },
                 zoom: {
                   wheel: { enabled: true },
                   pinch: { enabled: true },
-                  mode: 'x',
-                },
-              },
-            },
+                  mode: 'x'
+                }
+              }
+            }
           }
         });
       } else {
-        seriesChart.data.labels = labels;
         seriesChart.data.datasets[0].data = bal;
         seriesChart.data.datasets[1].data = exp;
         seriesChart.data.datasets[2].data = total;
         seriesChart.update('none');
       }
-      const scrollInner = document.getElementById('chartScrollInner');
-      const scrollOuter = document.getElementById('chartScrollOuter');
-      if (scrollInner && scrollOuter && points.length) {
-        var pw = scrollOuter.clientWidth || 800;
-        var minW = Math.max(pw, Math.min(12000, points.length * 10 + 100));
-        scrollInner.style.minWidth = minW + 'px';
-        if (seriesChart) seriesChart.resize();
-      } else if (scrollInner) {
-        scrollInner.style.minWidth = '';
-        if (seriesChart) seriesChart.resize();
-      }
+      if (seriesChart) seriesChart.resize();
     }
     async function poll() {
       var passUnix = 0;
@@ -932,7 +1192,7 @@ _HTML = """<!DOCTYPE html>
       const tbl = document.createElement('table');
       const thead = document.createElement('thead');
       const hr = document.createElement('tr');
-      ['Ticker', 'Side', 'Action', 'Remain', 'Limit ¢', 'Order id'].forEach(function(h) {
+      ['Ticker', 'Side', 'Action', 'Remain', 'Limit ¢', 'Timer', 'Order id'].forEach(function(h) {
         const th = document.createElement('th');
         th.textContent = h;
         hr.appendChild(th);
@@ -953,6 +1213,9 @@ _HTML = """<!DOCTYPE html>
         td4.textContent = rem != null ? String(rem) : '—';
         const td5 = document.createElement('td');
         td5.textContent = o.yes_price != null ? String(o.yes_price) : '—';
+        const tdTimer = document.createElement('td');
+        tdTimer.className = 'resting-timer';
+        applyMarketTimerAttrs(tdTimer, o.market_timer);
         const td6 = document.createElement('td');
         td6.style.fontSize = '0.7rem';
         td6.textContent = String(o.order_id || '').slice(0, 18) + (String(o.order_id || '').length > 18 ? '…' : '');
@@ -961,6 +1224,7 @@ _HTML = """<!DOCTYPE html>
         tr.appendChild(td3);
         tr.appendChild(td4);
         tr.appendChild(td5);
+        tr.appendChild(tdTimer);
         tr.appendChild(td6);
         tb.appendChild(tr);
       }
@@ -979,26 +1243,83 @@ _HTML = """<!DOCTYPE html>
     document.getElementById('sidebarToggle').addEventListener('click', function() {
       document.getElementById('sidebar').classList.toggle('collapsed');
     });
+    function updatePositionPnLScoreboard(data) {
+      const board = document.getElementById('posPnLScoreboard');
+      const posEl = document.getElementById('posScorePos');
+      const negEl = document.getElementById('posScoreNeg');
+      const beEl = document.getElementById('posScoreBe');
+      const beWrap = document.getElementById('posScoreBeWrap');
+      if (!board || !posEl || !negEl || !beEl) return;
+      if (data && data.error) {
+        posEl.textContent = '—';
+        negEl.textContent = '—';
+        beEl.textContent = '—';
+        board.classList.add('pos-scoreboard--muted');
+        return;
+      }
+      board.classList.remove('pos-scoreboard--muted');
+      const pos = (data && data.positions) ? data.positions : [];
+      let np = 0, nn = 0, nb = 0;
+      for (let i = 0; i < pos.length; i++) {
+        const s = pos[i].pnl_sign || 'unknown';
+        if (s === 'positive') np++;
+        else if (s === 'negative') nn++;
+        else if (s === 'neutral') nb++;
+      }
+      posEl.textContent = String(np);
+      negEl.textContent = String(nn);
+      beEl.textContent = String(nb);
+      if (beWrap) beWrap.style.display = nb > 0 ? 'inline' : 'none';
+    }
+    function syncPosFilterButtons() {
+      const seg = document.getElementById('posFilterSeg');
+      if (!seg) return;
+      seg.querySelectorAll('button').forEach(function(b) {
+        var f = b.getAttribute('data-filter') || 'all';
+        var on = f === positionsFilter;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+    }
     function renderOpenPositions(data) {
+      lastPositionsPayload = data;
+      updatePositionPnLScoreboard(data);
       const wrap = document.getElementById('openPositions');
       const st = document.getElementById('posStatus');
       if (!wrap) return;
-      wrap.innerHTML = '';
-      if (data && data.error) {
-        if (st) st.textContent = String(data.error);
-      } else if (st) { st.textContent = ''; }
-      const pos = (data && data.positions) ? data.positions : [];
-      const ddGlob = data && data.double_down_enabled;
-      const mult = Math.max(1, Number(data && data.order_size_multiplier) || 1);
-      if (!pos.length) {
-        const p = document.createElement('p');
-        p.className = 'sidebar__hint';
-        p.style.margin = '0';
-        p.textContent = (data && data.error) ? '' : 'No long YES positions.';
-        wrap.appendChild(p);
-        return;
-      }
-      for (const row of pos) {
+      try {
+        wrap.innerHTML = '';
+        if (data && data.error) {
+          if (st) st.textContent = String(data.error);
+          return;
+        }
+        if (st) st.textContent = '';
+        const raw = (data && data.positions) ? data.positions : [];
+        var pos = raw;
+        if (positionsFilter === 'positive') {
+          pos = raw.filter(function(r) { return (r.pnl_sign || '') === 'positive'; });
+        } else if (positionsFilter === 'negative') {
+          pos = raw.filter(function(r) { return (r.pnl_sign || '') === 'negative'; });
+        }
+        const ddGlob = data && data.double_down_enabled;
+        const mult = Math.max(1, Number(data && data.order_size_multiplier) || 1);
+        if (!raw.length) {
+          const p = document.createElement('p');
+          p.className = 'sidebar__hint';
+          p.style.margin = '0';
+          p.textContent = 'No positions.';
+          wrap.appendChild(p);
+          return;
+        }
+        if (!pos.length) {
+          const p = document.createElement('p');
+          p.className = 'sidebar__hint';
+          p.style.margin = '0';
+          p.textContent = 'No matching positions.';
+          wrap.appendChild(p);
+          return;
+        }
+        for (const row of pos) {
         const card = document.createElement('div');
         card.className = 'mini-pos';
         const sign = row.pnl_sign || 'unknown';
@@ -1016,6 +1337,9 @@ _HTML = """<!DOCTYPE html>
         const tk = document.createElement('div');
         tk.className = 'mini-pos__ticker';
         tk.textContent = row.ticker || '';
+        const mtEl = document.createElement('div');
+        mtEl.className = 'mini-pos__timer';
+        applyMarketTimerAttrs(mtEl, row.market_timer);
         const r1 = document.createElement('div');
         r1.className = 'mini-pos__row';
         const e = row.entry_yes_cents != null ? row.entry_yes_cents + '¢' : '—';
@@ -1045,45 +1369,43 @@ _HTML = """<!DOCTYPE html>
             tpLine = 'TP levels (¢): ' + levels.join(', ');
           }
         } else {
-          tpLine = 'TP: add TRADE_EXIT rules (min profit / mult / implied %)';
+          tpLine = '';
         }
-        const tpSpan = document.createElement('div');
-        const tpLbl = document.createElement('span');
-        tpLbl.className = 'tp';
-        tpLbl.textContent = 'Take-profit · ';
-        tpSpan.appendChild(tpLbl);
-        tpSpan.appendChild(document.createTextNode(tpLine));
-        exitEl.appendChild(tpSpan);
+        if (tpLine) {
+          const tpSpan = document.createElement('div');
+          tpSpan.textContent = tpLine;
+          exitEl.appendChild(tpSpan);
+        }
         const stopBid = row.stop_loss_bid_cents;
         const slSt = row.stop_loss_status || 'off';
         if (slSt === 'active' && stopBid != null && stopBid !== '') {
-          const buf = row.cents_buffer_to_stop;
+          const rawAbove = row.cents_above_fixed_stop_floor != null && row.cents_above_fixed_stop_floor !== ''
+            ? row.cents_above_fixed_stop_floor
+            : row.cents_buffer_to_stop;
+          const above = rawAbove != null && rawAbove !== '' ? Number(rawAbove) : NaN;
+          const trailNote = row.stop_loss_trailing_or_lock_may_apply ? ' · trail/lock may exit first' : '';
           const slDiv = document.createElement('div');
-          const slLbl = document.createElement('span');
-          slLbl.className = 'sl';
-          slLbl.textContent = 'Stop-loss · ';
           let slRest = '';
-          if (buf != null && buf !== '' && Number(buf) < 0) {
-            slRest = 'bid ≤ ' + stopBid + '¢ triggers — bid at/below floor';
-          } else if (buf != null && buf !== '') {
-            slRest = 'fires if bid ≤ ' + stopBid + '¢ · buffer +' + buf + '¢';
+          if (!isNaN(above)) {
+            if (above < 0) {
+              slRest = 'SL ≤ ' + stopBid + '¢ · bid below fixed floor' + trailNote;
+            } else if (above === 0) {
+              slRest = 'SL ≤ ' + stopBid + '¢ · bid at floor' + trailNote;
+            } else {
+              slRest = 'SL ≤ ' + stopBid + '¢ · ' + above + '¢ until bid hits floor' + trailNote;
+            }
           } else {
-            slRest = 'fires if bid ≤ ' + stopBid + '¢';
+            slRest = 'SL ≤ ' + stopBid + '¢ (fixed entry×fraction)' + trailNote;
           }
-          slDiv.appendChild(slLbl);
-          slDiv.appendChild(document.createTextNode(slRest));
+          slDiv.textContent = slRest;
           exitEl.appendChild(slDiv);
         } else {
           const slDiv = document.createElement('div');
-          const slLbl = document.createElement('span');
-          slLbl.className = 'sl';
-          slLbl.textContent = 'Stop-loss · ';
           const msg = slSt === 'skipped_suspect'
-            ? 'not shown for suspect portfolio entry (≈1¢/99¢)'
-            : (slSt === 'off' ? 'disabled (TRADE_EXIT_STOP_LOSS_ENABLED=false)'
-              : (slSt === 'no_entry' ? 'set entry (manual or portfolio) for floor' : 'n/a'));
-          slDiv.appendChild(slLbl);
-          slDiv.appendChild(document.createTextNode(msg));
+            ? 'SL skipped (suspect entry)'
+            : (slSt === 'off' ? 'SL off'
+              : (slSt === 'no_entry' ? 'SL: no entry' : 'SL —'));
+          slDiv.textContent = msg;
           exitEl.appendChild(slDiv);
         }
         const actions = document.createElement('div');
@@ -1107,17 +1429,21 @@ _HTML = """<!DOCTYPE html>
         card.appendChild(title);
         card.appendChild(shEl);
         card.appendChild(tk);
+        card.appendChild(mtEl);
         card.appendChild(r1);
         if (row.entry_yes_cents != null && row.best_yes_bid_cents != null && ud != null && ud !== '') {
           const pl = document.createElement('div');
           pl.className = 'mini-pos__pl ' + (ud > 0 ? 'mini-pos__pl--pos' : ud < 0 ? 'mini-pos__pl--neg' : 'mini-pos__pl--zero');
           const sgn = ud > 0 ? '+' : '';
-          pl.textContent = 'Mark vs entry: ' + sgn + ud + '¢ (bid − entry)';
+          pl.textContent = sgn + ud + '¢';
           card.appendChild(pl);
         }
         card.appendChild(exitEl);
         card.appendChild(actions);
         wrap.appendChild(card);
+        }
+      } finally {
+        syncPosFilterButtons();
       }
     }
     async function refreshPositions() {
@@ -1183,6 +1509,12 @@ _HTML = """<!DOCTYPE html>
         if (seriesChart && typeof seriesChart.resetZoom === 'function') seriesChart.resetZoom();
       });
     }
+    document.querySelectorAll('#posFilterSeg button').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        positionsFilter = btn.getAttribute('data-filter') || 'all';
+        if (lastPositionsPayload) renderOpenPositions(lastPositionsPayload);
+      });
+    });
     poll();
     refreshControl();
     refreshPositions();
@@ -1304,6 +1636,26 @@ def _create_app() -> Any:
         )
         return jsonify({"ok": True})
 
+    @app.post("/api/ingest_crypto_watch")
+    def ingest_crypto_watch() -> Any:
+        """Receive full crypto-watch JSON from the secondary scanner (localhost only)."""
+        addr = request.environ.get("REMOTE_ADDR", "")
+        if addr not in ("127.0.0.1", "::1"):
+            return jsonify({"ok": False, "error": "forbidden"}), 403
+        data = request.get_json(force=True, silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "bad_json"}), 400
+        with _LOCK:
+            _CRYPTO_WATCH_STATE.clear()
+            _CRYPTO_WATCH_STATE.update(data)
+        return jsonify({"ok": True})
+
+    @app.get("/api/crypto_watch")
+    def api_crypto_watch() -> Any:
+        """Latest crypto-watch opportunities (same data as the on-disk ``.kalshi_crypto_watch.json`` when ingested)."""
+        with _LOCK:
+            return jsonify(dict(_CRYPTO_WATCH_STATE))
+
     @app.get("/api/events")
     def api_events() -> Any:
         with _LOCK:
@@ -1314,17 +1666,58 @@ def _create_app() -> Any:
         with _LOCK:
             return jsonify(list(_SERIES))
 
+    @app.post("/api/market_timers")
+    def api_market_timers() -> Any:
+        """Batch lifecycle timers for trade cards (open vs resolve countdown)."""
+        from kalshi_bot.config import get_settings as _gs
+        from kalshi_bot.market_data import get_market, market_lifecycle_timer_payload
+        from kalshi_bot.trading import build_sdk_client as _bsc
+
+        s = _gs()
+        client = _bsc(s)
+        data = request.get_json(force=True, silent=True) or {}
+        raw = data.get("tickers")
+        if not isinstance(raw, list):
+            raw = []
+        timers: dict[str, Any] = {}
+        seen: set[str] = set()
+        for t in raw[:100]:
+            ticker = str(t or "").strip()
+            if not ticker or ticker in seen:
+                continue
+            seen.add(ticker)
+            try:
+                row = get_market(client, ticker=ticker)
+                m = getattr(row, "market", None)
+                timers[ticker] = market_lifecycle_timer_payload(m) if m is not None else {}
+            except Exception:
+                timers[ticker] = {}
+        return jsonify({"timers": timers})
+
     @app.get("/api/resting_orders")
     def api_resting_orders() -> Any:
         """Resting limit orders from Kalshi (same account as dashboard API keys)."""
         from kalshi_bot.config import get_settings as _gs
 
         try:
+            from kalshi_bot.market_data import get_market, market_lifecycle_timer_payload
             from kalshi_bot.trading import build_sdk_client as _bsc
 
             s = _gs()
             client = _bsc(s)
             orders = list_resting_orders_detail(client)
+            tickers = sorted({str(o.get("ticker") or "").strip() for o in orders if o.get("ticker")})
+            timing_by: dict[str, dict[str, Any]] = {}
+            for t in tickers:
+                try:
+                    row = get_market(client, ticker=t)
+                    m = getattr(row, "market", None)
+                    timing_by[t] = market_lifecycle_timer_payload(m) if m is not None else {}
+                except Exception:
+                    timing_by[t] = {}
+            for o in orders:
+                tk = str(o.get("ticker") or "").strip()
+                o["market_timer"] = timing_by.get(tk, {})
             return jsonify({"orders": orders})
         except UnauthorizedException as exc:
             _LOG.warning("api_resting_orders_failed: %s", exc)
@@ -1413,7 +1806,7 @@ def _create_app() -> Any:
             best_yes_bid_cents,
             get_orderbook,
             lift_yes_ask_cents_from_orderbook,
-            market_title_for_ticker,
+            market_title_and_timer_for_ticker,
         )
         from kalshi_bot.runtime_controls import get_order_size_multiplier
         from kalshi_bot.trading import build_sdk_client
@@ -1440,6 +1833,7 @@ def _create_app() -> Any:
                     entry_source=entry_ref.source,
                     best_bid_cents=bid,
                 )
+                mtitle, mtimer = market_title_and_timer_for_ticker(client, ticker)
                 row_d: dict[str, Any] = {
                     "ticker": ticker,
                     "shares": signed,
@@ -1447,7 +1841,8 @@ def _create_app() -> Any:
                     "entry_source": entry_ref.source,
                     "best_yes_bid_cents": bid,
                     "lift_yes_ask_cents": lift,
-                    "market_title": market_title_for_ticker(client, ticker) or "",
+                    "market_title": mtitle or "",
+                    "market_timer": mtimer,
                     "double_down_room": room,
                 }
                 row_d.update(hints)
@@ -1543,7 +1938,10 @@ def _create_app() -> Any:
                 return jsonify({"ok": False, "error": "double_down_disabled"}), 400
             import math
 
-            from kalshi_bot.sizing import next_buy_yes_notional_min_max
+            from kalshi_bot.sizing import (
+                bump_per_order_notional_cap_for_min_contracts,
+                next_buy_yes_notional_min_max,
+            )
 
             ob = get_orderbook(client, ticker)
             lift = lift_yes_ask_cents_from_orderbook(ob)
@@ -1557,7 +1955,14 @@ def _create_app() -> Any:
             if max_pre_mult < 1:
                 return jsonify({"ok": False, "error": "at_max_position"}), 400
             lift_price = int(lift)
-            min_n, max_n = next_buy_yes_notional_min_max(settings, balance_cents=snap.balance_cents)
+            min_n, max_n = next_buy_yes_notional_min_max(
+                settings,
+                balance_cents=snap.balance_cents,
+                apply_notional_sweep=False,
+            )
+            max_n = bump_per_order_notional_cap_for_min_contracts(
+                max_n, yes_price_cents=lift_price, min_contracts=1
+            )
             p = max(0.01, min(0.99, lift_price / 100.0))
             min_final = 1
             if min_n is not None and float(min_n) > 0:

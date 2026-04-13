@@ -234,6 +234,7 @@ def cmd_llm_trade(
                 pass_number=iteration,
                 enabled=settings.structured_log_clear_every_other_pass,
                 log=log,
+                preserve_executed_bets=settings.structured_log_preserve_executed_on_flush,
             )
             if not loop:
                 break
@@ -320,6 +321,7 @@ def cmd_discover_trade(
                 pass_number=iteration,
                 enabled=settings.structured_log_clear_every_other_pass,
                 log=log,
+                preserve_executed_bets=settings.structured_log_preserve_executed_on_flush,
             )
             if not loop:
                 break
@@ -410,6 +412,7 @@ def cmd_tape_trade(
                 pass_number=iteration,
                 enabled=settings.structured_log_clear_every_other_pass,
                 log=log,
+                preserve_executed_bets=settings.structured_log_preserve_executed_on_flush,
             )
             if not loop:
                 break
@@ -499,6 +502,7 @@ def cmd_bitcoin_trade(
                 pass_number=iteration,
                 enabled=settings.structured_log_clear_every_other_pass,
                 log=log,
+                preserve_executed_bets=settings.structured_log_preserve_executed_on_flush,
             )
             if not loop:
                 break
@@ -683,6 +687,65 @@ def cmd_sell_bot(
         execute=execute,
         loop=True,
         interval_seconds=interval_seconds,
+    )
+
+
+def cmd_ws_ticker_scan(settings: Settings, *, web: bool) -> None:
+    """Global Kalshi ticker WebSocket → edge filter → ``.kalshi_ws_ticker_scan.json`` + optional dashboard."""
+    from kalshi_bot.ws_ticker_scan import run_ws_ticker_scan
+
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    if web:
+        start_dashboard(settings)
+        dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
+        try:
+            snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
+        except Exception:
+            pass
+    run_ws_ticker_scan(settings)
+
+
+def cmd_crypto_watch(
+    settings: Settings,
+    *,
+    interval_seconds: float,
+    execute: bool,
+    no_exits: bool,
+    web: bool,
+) -> None:
+    """Secondary loop: crypto fee-edge scan → shared JSON + dashboard ping; optional crypto-only TP/SL."""
+    from kalshi_bot.crypto_watch import run_crypto_watch_loop
+
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    dash_client = None
+    if web:
+        start_dashboard(settings)
+        dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
+        try:
+            snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
+        except Exception:
+            pass
+    log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
+    run_crypto_watch_loop(
+        settings,
+        interval_seconds=interval_seconds,
+        run_crypto_exits=not no_exits,
+        exit_execute=execute,
+        log=log,
     )
 
 
@@ -1200,6 +1263,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print cashout summary only (no sells) — same as exit-scan without --execute",
     )
 
+    cw = sub.add_parser(
+        "crypto-watch",
+        help="Secondary loop: scan TRADE_CRYPTO_* prefixes for fee-edge YES entries, write .kalshi_crypto_watch.json, "
+        "ping dashboard; optional take-profit/stop on crypto positions only.",
+    )
+    cw.add_argument(
+        "--interval",
+        type=float,
+        default=45.0,
+        metavar="SEC",
+        help="Seconds between scans (default: 45; min 5)",
+    )
+    cw.add_argument(
+        "--execute",
+        action="store_true",
+        help="With exits enabled: submit TP/SL sells for crypto positions when rules pass (same as auto-sell batch)",
+    )
+    cw.add_argument(
+        "--no-exits",
+        action="store_true",
+        help="Skip position exit scan; only run opportunity scan + signals",
+    )
+    cw.add_argument(
+        "--web",
+        action="store_true",
+        help="Start local dashboard so ingest_crypto_watch and crypto_watch_ping events show in the UI",
+    )
+
+    wss = sub.add_parser(
+        "ws-ticker-scan",
+        help="WebSocket `ticker` stream: deterministic fee-edge candidates (no REST scan), writes .kalshi_ws_ticker_scan.json "
+        "for llm-trade merge (TRADE_LLM_MERGE_WS_TICKER_SCAN_SIGNALS).",
+    )
+    wss.add_argument(
+        "--web",
+        action="store_true",
+        help="Start local dashboard so ingest_crypto_watch and monitor events show in the UI",
+    )
+
     pw = sub.add_parser(
         "positions-watch",
         help="Long YES only: per-ticker book, taker tape lean (YES vs NO), optional candle drift — read-only",
@@ -1294,6 +1396,10 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["DASHBOARD_ENABLED"] = "true"
     if cmd == "sell-bot" and getattr(args, "web", False):
         os.environ["DASHBOARD_ENABLED"] = "true"
+    if cmd == "crypto-watch" and getattr(args, "web", False):
+        os.environ["DASHBOARD_ENABLED"] = "true"
+    if cmd == "ws-ticker-scan" and getattr(args, "web", False):
+        os.environ["DASHBOARD_ENABLED"] = "true"
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -1373,6 +1479,16 @@ def main(argv: list[str] | None = None) -> None:
                 execute=not bool(getattr(args, "no_execute", False)),
                 web=bool(getattr(args, "web", False)),
             )
+        elif cmd == "crypto-watch":
+            cmd_crypto_watch(
+                settings,
+                interval_seconds=max(5.0, float(getattr(args, "interval", 45.0))),
+                execute=bool(getattr(args, "execute", False)),
+                no_exits=bool(getattr(args, "no_exits", False)),
+                web=bool(getattr(args, "web", False)),
+            )
+        elif cmd == "ws-ticker-scan":
+            cmd_ws_ticker_scan(settings, web=bool(getattr(args, "web", False)))
         elif cmd == "auto-sell":
             cmd_auto_sell(
                 settings,
