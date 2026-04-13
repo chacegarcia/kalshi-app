@@ -27,3 +27,6 @@ obj/
 *.runtimeconfig.dev.json
 publish/
 
+.DS_Store
+# Local WebSocket scan output (runtime)
+.kalshi_ws_ticker_scan.json
