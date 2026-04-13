@@ -126,3 +126,4 @@ If HTTPS to Kalshi fails with certificate verify errors, try:
 - [Python SDK](https://docs.kalshi.com/python-sdk/index)
 - [WebSockets](https://docs.kalshi.com/getting_started/quick_start_websockets)
 
+<!-- Merged from `main`: repository name on GitHub is **kalshi-app**. -->
