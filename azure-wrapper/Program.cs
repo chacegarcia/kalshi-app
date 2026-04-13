@@ -9,8 +9,10 @@ using Microsoft.AspNetCore.Authorization;
 using KalshiBotWrapper.Bot;
 using KalshiBotWrapper.Configuration;
 using KalshiBotWrapper.Dashboard;
+using KalshiBotWrapper.Data;
 using KalshiBotWrapper.Kalshi;
 using KalshiBotWrapper.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.ApplicationInsights.Extensibility;
 
 // ── Host / web application setup ─────────────────────────────────────────────
@@ -202,14 +204,45 @@ builder.Services.Configure<ForwardedHeadersOptions>(o =>
     o.KnownProxies.Clear();
 });
 
+// ── Azure SQL (optional — set SQL_CONNECTION_STRING to enable) ────────────────
+
+var sqlConnectionString = builder.Configuration["SQL_CONNECTION_STRING"]
+    ?? Environment.GetEnvironmentVariable("SQL_CONNECTION_STRING");
+var sqlEnabled = !string.IsNullOrWhiteSpace(sqlConnectionString);
+
+if (sqlEnabled)
+{
+    builder.Services.AddDbContextFactory<BotDbContext>(o =>
+        o.UseSqlServer(sqlConnectionString, sql =>
+        {
+            sql.EnableRetryOnFailure(maxRetryCount: 3, maxRetryDelay: TimeSpan.FromSeconds(5), errorNumbersToAdd: null);
+            sql.CommandTimeout(30);
+        }));
+    builder.Services.AddSingleton<BotRepository>();
+}
+
 // ── Services ──────────────────────────────────────────────────────────────────
 
-builder.Services.AddSingleton<DashboardStore>();
+builder.Services.AddSingleton<DashboardStore>(sp =>
+    sqlEnabled
+        ? new DashboardStore(sp.GetService<BotRepository>())
+        : new DashboardStore());
 builder.Services.AddHostedService<BotRunnerService>();
 
 // ── Build app ─────────────────────────────────────────────────────────────────
 
 var app = builder.Build();
+
+// ── SQL schema init (no-op when SQL_CONNECTION_STRING is not set) ─────────────
+
+if (sqlEnabled)
+{
+    var repo  = app.Services.GetRequiredService<BotRepository>();
+    await repo.EnsureSchemaAsync();
+    var saved = await repo.LoadControlsAsync();
+    if (saved is not null)
+        app.Services.GetRequiredService<DashboardStore>().SetControls(saved);
+}
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
@@ -286,8 +319,12 @@ app.MapGet("/api/me", (HttpContext ctx) =>
 app.MapGet("/api/events", (DashboardStore store) =>
     Results.Json(store.GetEvents()));
 
-app.MapGet("/api/series", (DashboardStore store) =>
-    Results.Json(store.GetSeries()));
+app.MapGet("/api/series", async (DashboardStore store, BotRepository? repo, CancellationToken ct) =>
+{
+    if (repo is not null)
+        return Results.Json(await repo.GetSeriesAsync(ct: ct));
+    return Results.Json(store.GetSeries());
+});
 
 app.MapGet("/api/opportunities", (DashboardStore store) =>
     Results.Json(store.GetOpportunities()));
@@ -324,6 +361,8 @@ app.MapPost("/api/controls", async (HttpRequest req, DashboardStore store) =>
 app.MapGet("/api/status", (DashboardStore store) =>
 {
     var (lastScan, nextScan, total, matched, skipReason) = store.GetScanTiming();
+    var (balanceCents, spentCents) = store.GetPortfolioSummary();
+    var executeEnabled = store.GetControls().ExecuteEnabled;
     var now = DateTimeOffset.UtcNow;
     var secondsUntilScan = nextScan > now ? (nextScan - now).TotalSeconds : 0;
     return Results.Json(new
@@ -335,6 +374,9 @@ app.MapGet("/api/status", (DashboardStore store) =>
         lastScanTotal    = total,
         lastScanMatched  = matched,
         skipReason,
+        balanceCents,
+        spentCents,
+        executeEnabled,
     });
 });
 
@@ -346,13 +388,15 @@ app.MapPost("/api/scan/force", (DashboardStore store) =>
 });
 
 // GET suggestion history with projected P&L
-app.MapGet("/api/suggestions", (DashboardStore store) =>
+app.MapGet("/api/suggestions", async (DashboardStore store, BotRepository? repo, CancellationToken ct) =>
 {
+    if (repo is not null)
+        return Results.Json(await repo.GetSuggestionsAsync(ct));
+
+    // In-memory fallback (no SQL configured)
     var suggestions = store.GetSuggestions();
-    // Cumulative projected P&L in cents (only resolved suggestions)
-    var sorted = suggestions.OrderBy(s => s.SuggestedAt).ToList();
     int cumulative = 0;
-    var rows = sorted.Select(s =>
+    var rows = suggestions.OrderBy(s => s.SuggestedAt).Select(s =>
     {
         if (s.Resolution != null) cumulative += s.OutcomeCents ?? 0;
         return new
@@ -375,6 +419,7 @@ app.MapGet("/api/suggestions", (DashboardStore store) =>
             outcomeCents     = s.OutcomeCents,
             cumulativeCents  = cumulative,
             url              = s.Url,
+            executeError     = s.ExecuteError,
         };
     }).ToList();
     return Results.Json(rows);
@@ -721,6 +766,14 @@ static class DashboardResources
     .btn-settings:hover { background: #4b5563; }
     .btn-force:disabled { background: #2a3544; color: var(--muted); cursor: not-allowed; }
     .btn-force.scanning { background: #0e7490; }
+    .execute-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex-shrink: 0;
+      box-shadow: 0 0 0 0 rgba(62,207,142,0.6); animation: pulse-dot 1.8s ease-in-out infinite; }
+    @keyframes pulse-dot {
+      0%,100% { box-shadow: 0 0 0 0 rgba(62,207,142,0.5); }
+      50%      { box-shadow: 0 0 0 5px rgba(62,207,142,0); }
+    }
+    #execute-indicator { display: none; align-items: center; gap: 0.4rem;
+      font-size: 0.75rem; font-weight: 600; color: var(--ok); white-space: nowrap; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3);
       border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite; }
@@ -794,6 +847,7 @@ static class DashboardResources
     .sug-lost { color: var(--err); }
     .sug-exec { color: var(--blue); }
     .sug-pend { color: var(--muted); }
+    .sug-error { color: var(--err); cursor: help; text-decoration: underline dotted; }
     .sug-rank1 { color: #f5a623; font-weight: 700; }
 
     .mkt-link { color: inherit; text-decoration: none; }
@@ -946,10 +1000,13 @@ static class DashboardResources
       <span class="value" id="scan-matched-bar">–</span>
     </div>
     <div class="scan-item">
-      <span class="label">Events</span>
-      <span class="value" id="event-count-bar">–</span>
+      <span class="label">Balance</span>
+      <span class="value" id="balance-bar">–</span>
     </div>
-
+    <div id="execute-indicator">
+      <span class="execute-dot"></span>
+      EXECUTE ON
+    </div>
     <button class="btn-force" id="btn-force" onclick="forceScan()">
       ▶ Force Scan
     </button>
@@ -1240,6 +1297,12 @@ static class DashboardResources
         if (s.lastScanAt) lastScanAt = new Date(s.lastScanAt);
         document.getElementById('scan-total-bar').textContent   = s.lastScanTotal   >= 0 ? s.lastScanTotal.toLocaleString()   : '–';
         document.getElementById('scan-matched-bar').textContent = s.lastScanMatched >= 0 ? s.lastScanMatched.toLocaleString() : '–';
+
+        const fmt = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        if (s.balanceCents != null) {
+          document.getElementById('balance-bar').textContent = fmt(s.balanceCents);
+        }
+        document.getElementById('execute-indicator').style.display = s.executeEnabled ? 'flex' : 'none';
 
         const bar  = document.getElementById('skip-reason-bar');
         const text = document.getElementById('skip-reason-text');
@@ -1870,9 +1933,11 @@ static class DashboardResources
         const rankCls = s.scanRank === 1 ? 'sug-rank1' : '';
         const rankLbl = s.scanRank === 1 ? '★ #1' : `#${s.scanRank}`;
 
-        const execCell = s.executed
-          ? `<span class="sug-exec">✓ Yes</span>`
-          : `<span class="sug-pend">—</span>`;
+        const execCell = s.executeError
+          ? `<span class="sug-error" title="${s.executeError.replace(/"/g,'&quot;')}">✕ Error</span>`
+          : s.executed
+            ? `<span class="sug-exec">✓ Yes</span>`
+            : `<span class="sug-pend">—</span>`;
 
         let resCell, outcomeCell, cumulCell;
         if (s.resolution === 'yes') {
@@ -1932,7 +1997,6 @@ static class DashboardResources
     function renderEvents(events) {
       const tb = document.getElementById('event-rows');
       tb.innerHTML = '';
-      document.getElementById('event-count-bar').textContent = events.length;
       for (const ev of events) {
         const tr  = document.createElement('tr');
         const k   = ev.kind || '';
@@ -1981,7 +2045,7 @@ static class DashboardResources
     loadControls();
     loadStatus().then(updateCountdown);
     poll();
-    setInterval(poll, 3000);
+    setInterval(poll, 30000);
   </script>
 </body>
 </html>

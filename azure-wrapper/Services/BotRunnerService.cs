@@ -274,6 +274,11 @@ public sealed class BotRunnerService : BackgroundService
             .ToDictionary(m => m.Ticker, m => (m.CloseTime!.Value, m.Title, m.KalshiUrl)));
         _store.SetOpportunities(opportunities);
         _store.RecordSuggestions(opportunities, controls);
+
+        // ── 5. Execute if enabled and under hourly / position limits ─────────
+        string skipReason = "";
+        int betsThisScan  = 0;
+
         _store.SetLastScanStats(allMarkets.Count, opportunities.Count, skipReason);
         _store.RecordEvent("scan", new
         {
@@ -306,10 +311,6 @@ public sealed class BotRunnerService : BackgroundService
                     opp.YesBidCents, opp.YesAskCents,
                     opp.Title.Length > 60 ? opp.Title[..60] : opp.Title);
         }
-
-        // ── 5. Execute if enabled and under hourly / position limits ─────────
-        string skipReason = "";
-        int betsThisScan  = 0;
 
         if (opportunities.Count == 0)
         {
@@ -357,13 +358,22 @@ public sealed class BotRunnerService : BackgroundService
                     intent.Ticker, intent.YesPriceCents, intent.Count,
                     controls.SpendPerBetCents / 100.0);
 
-                await OrderExecution.ExecuteIntentAsync(
-                    client, settings, risk, _log, _store, intent, ledger, ct);
-
-                betTimestamps.Enqueue(DateTimeOffset.UtcNow);
-                _totalBetsPlaced++;
-                _totalSpentCents += intent.YesPriceCents * contractCount;
-                betsThisScan++;
+                try
+                {
+                    await OrderExecution.ExecuteIntentAsync(
+                        client, settings, risk, _log, _store, intent, ledger, ct);
+                    _store.MarkSuggestionExecuted(intent.Ticker);
+                    betTimestamps.Enqueue(DateTimeOffset.UtcNow);
+                    _totalBetsPlaced++;
+                    _totalSpentCents += intent.YesPriceCents * contractCount;
+                    betsThisScan++;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "[execute_error] ticker={Ticker}", intent.Ticker);
+                    _store.MarkSuggestionError(intent.Ticker, ex.Message);
+                }
             }
         }
 

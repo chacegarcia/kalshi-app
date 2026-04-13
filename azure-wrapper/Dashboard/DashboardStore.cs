@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using KalshiBotWrapper.Data;
 
 namespace KalshiBotWrapper.Dashboard;
 
@@ -76,6 +77,7 @@ public sealed class SuggestionRecord
     public string Url { get; init; } = "";
     public bool Executed { get; set; }
     public DateTimeOffset? ExecutedAt { get; set; }
+    public string? ExecuteError { get; set; }   // non-null when execution threw an exception
     public string? Resolution { get; set; }     // "yes" | "no" | null = unresolved
     /// <summary>
     /// Projected outcome in cents: positive = profit (YES won), negative = loss (YES lost).
@@ -104,7 +106,7 @@ public sealed record OpportunityRow(
 /// Thread-safe in-memory store for events, series, opportunities and runtime controls.
 /// Replaces Python Flask monitor.py deques.
 /// </summary>
-public sealed class DashboardStore
+public sealed class DashboardStore(BotRepository? repo = null)
 {
     private const int MaxEvents      = 500;
     private const int MaxSeries      = 2000;
@@ -119,6 +121,16 @@ public sealed class DashboardStore
     private volatile BotControls _controls = new();
     private List<OpportunityRow> _opportunities = [];
     private Dictionary<string, (DateTimeOffset CloseTime, string Title, string Url)> _marketInfo = [];
+
+    // ── Portfolio snapshot ────────────────────────────────────────────────────
+
+    private int? _latestBalanceCents;
+    private int  _latestSpentCents;
+
+    public (int? BalanceCents, int SpentCents) GetPortfolioSummary()
+    {
+        lock (_lock) return (_latestBalanceCents, _latestSpentCents);
+    }
 
     // ── Scan timing ───────────────────────────────────────────────────────────
 
@@ -161,7 +173,11 @@ public sealed class DashboardStore
 
     public BotControls GetControls() => _controls;
 
-    public void SetControls(BotControls controls) => _controls = controls;
+    public void SetControls(BotControls controls)
+    {
+        _controls = controls;
+        repo?.SaveControlsBackground(controls);
+    }
 
     // ── Opportunities ─────────────────────────────────────────────────────────
 
@@ -212,7 +228,7 @@ public sealed class DashboardStore
                     var count = opp.YesAskCents > 0
                         ? Math.Max(1, controls.SpendPerBetCents / opp.YesAskCents)
                         : 1;
-                    _suggestions.Add(new SuggestionRecord
+                    var record = new SuggestionRecord
                     {
                         Ticker        = opp.Ticker,
                         EventTicker   = opp.EventTicker,
@@ -225,8 +241,10 @@ public sealed class DashboardStore
                         CloseTime     = opp.CloseTime,
                         ScanRank      = rank,
                         Url           = opp.Url,
-                    });
+                    };
+                    _suggestions.Add(record);
                     pendingTickers.Add(opp.Ticker);
+                    repo?.InsertSuggestionBackground(record);
                 }
                 rank++;
             }
@@ -238,26 +256,45 @@ public sealed class DashboardStore
     public void MarkSuggestionExecuted(string ticker)
     {
         var now = DateTimeOffset.UtcNow;
+        SuggestionRecord? matched;
         lock (_lock)
         {
-            var s = _suggestions.LastOrDefault(s => s.Ticker == ticker && !s.Executed);
-            if (s is not null) { s.Executed = true; s.ExecutedAt = now; }
+            matched = _suggestions.LastOrDefault(s => s.Ticker == ticker && !s.Executed);
+            if (matched is not null) { matched.Executed = true; matched.ExecutedAt = now; }
         }
+        if (matched is not null)
+            repo?.MarkExecutedBackground(matched.Id, now);
+    }
+
+    /// <summary>Marks the most recent pending suggestion for a ticker with an execution error.</summary>
+    public void MarkSuggestionError(string ticker, string error)
+    {
+        SuggestionRecord? matched;
+        lock (_lock)
+        {
+            matched = _suggestions.LastOrDefault(s => s.Ticker == ticker && !s.Executed);
+            if (matched is not null) matched.ExecuteError = error;
+        }
+        if (matched is not null)
+            repo?.MarkErrorBackground(matched.Id, error);
     }
 
     /// <summary>Records the outcome of a suggestion once the market resolves.</summary>
     public void ResolveSuggestion(string ticker, string resolution)
     {
+        int? outcomeCents = null;
         lock (_lock)
         {
             foreach (var s in _suggestions.Where(s => s.Ticker == ticker && s.Resolution == null))
             {
-                s.Resolution  = resolution;
+                s.Resolution   = resolution;
                 s.OutcomeCents = resolution == "yes"
                     ? (100 - s.YesAskCents) * s.ContractCount
                     : -s.YesAskCents        * s.ContractCount;
+                outcomeCents = s.OutcomeCents;
             }
         }
+        repo?.ResolveBackground(ticker, resolution, outcomeCents);
     }
 
     public IReadOnlyList<SuggestionRecord> GetSuggestions()
@@ -289,6 +326,8 @@ public sealed class DashboardStore
             _events.AddFirst(row);
             while (_events.Count > MaxEvents) _events.RemoveLast();
         }
+
+        repo?.WriteEventBackground(kind, payload);
     }
 
     // ── Series ────────────────────────────────────────────────────────────────
@@ -308,9 +347,13 @@ public sealed class DashboardStore
 
         lock (_lock)
         {
+            _latestBalanceCents = balanceCents;
+            _latestSpentCents   = spentCents;
             _series.AddLast(row);
             while (_series.Count > MaxSeries) _series.RemoveFirst();
         }
+
+        repo?.WriteSeriesPointBackground(balanceCents, contractCount, betsPlaced, spentCents);
     }
 
     public void Heartbeat(string note = "running")
