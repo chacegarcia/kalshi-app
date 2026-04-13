@@ -42,8 +42,8 @@ def momentum_buy_intent_if_hot(
     hot, why = yes_price_momentum_is_hot(close_prices, settings)
     if not hot:
         return None, why
-    if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
-        return None, f"ask {yes_ask_dollars:.3f} > max_yes_ask {settings.strategy_max_yes_ask_dollars}"
+    if yes_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
+        return None, f"ask {yes_ask_dollars:.3f} > max_yes_ask {settings.trade_entry_effective_max_yes_ask_dollars}"
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
     if spread < settings.strategy_min_spread_dollars:
         return None, "spread below min (momentum still needs a quotable book)"

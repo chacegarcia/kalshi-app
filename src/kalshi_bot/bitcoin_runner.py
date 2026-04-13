@@ -1,21 +1,22 @@
-"""Kalshi Bitcoin binary contracts: CoinGecko spot + REST order book / candles (same rules as tape-trade).
+"""Kalshi crypto binary contracts (BTC/ETH series): public spot reference + REST order book / candles.
 
-BTC markets roll frequently (e.g. ``KXBTC...`` hourly/daily/milestone). Use **prefix discovery** when
-``TRADE_BITCOIN_KALSHI_TICKER`` is empty, or pin one contract when you want a single market only.
+Uses the same entry rules as tape-trade. Discovery: ``TRADE_CRYPTO_KALSHI_PREFIXES`` (e.g. ``KXBTC,KXETH``) or
+legacy ``TRADE_BITCOIN_TICKER_PREFIX``, or default ``KXBTC``. Pin ``TRADE_BITCOIN_KALSHI_TICKER`` for one market.
+Spot reference: ``TRADE_CRYPTO_SPOT_PRICE_SOURCE`` (auto / coingecko / binance).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from kalshi_bot.btc_price import fetch_btc_usd_spot
+from kalshi_bot.btc_price import fetch_crypto_spot_usd_for_kalshi_ticker
 from kalshi_bot.client import KalshiSdkClient
 from kalshi_bot.config import Settings
 from kalshi_bot.edge_math import implied_no_ask_dollars, implied_yes_ask_dollars
 from kalshi_bot.execution import DryRunLedger
 from kalshi_bot.logger import StructuredLogger, get_logger
 from kalshi_bot.market_data import (
-    fetch_open_markets_by_ticker_prefix,
+    fetch_open_markets_by_ticker_prefixes,
     fetch_yes_close_prices,
     get_market,
     get_orderbook,
@@ -51,6 +52,7 @@ class BitcoinTradeRunStats:
     skip_ticker_substring: int = 0
     skip_long_yes_cap: int = 0
     skip_theta_decay: int = 0
+    skip_resolution_too_far: int = 0
     skip_event_not_top_yes: int = 0
     skip_multi_choice_not_top_n: int = 0
     skip_multi_choice_below_min: int = 0
@@ -74,6 +76,7 @@ class BitcoinTradeRunStats:
             f"  skip (ticker substring block):      {self.skip_ticker_substring}",
             f"  skip (long-YES family cap):         {self.skip_long_yes_cap}",
             f"  skip (theta / near-exp longshot):   {self.skip_theta_decay}",
+            f"  skip (resolution > max horizon):    {self.skip_resolution_too_far}",
             f"  skip (not in event top-N YES):      {self.skip_event_not_top_yes}",
             f"  skip (multi-choice not top-N):      {self.skip_multi_choice_not_top_n}",
             f"  skip (multi-choice < min chance):   {self.skip_multi_choice_below_min}",
@@ -89,23 +92,36 @@ class BitcoinTradeRunStats:
 
 
 def bitcoin_markets_configured(settings: Settings) -> bool:
-    """True if user pinned a ticker or set a non-empty ``TRADE_BITCOIN_TICKER_PREFIX``."""
+    """True if user pinned a ticker or set crypto prefix discovery (``TRADE_CRYPTO_*`` / ``TRADE_BITCOIN_*``)."""
     if (settings.trade_bitcoin_kalshi_ticker or "").strip():
+        return True
+    if (settings.trade_crypto_kalshi_prefixes or "").strip():
         return True
     return bool((settings.trade_bitcoin_ticker_prefix or "").strip())
 
 
+def crypto_kalshi_prefixes_for_discovery(settings: Settings) -> list[str]:
+    """Non-empty list of Kalshi ticker prefixes for rotating crypto discovery."""
+    raw = (settings.trade_crypto_kalshi_prefixes or "").strip()
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    legacy = (settings.trade_bitcoin_ticker_prefix or "").strip()
+    if legacy:
+        return [legacy]
+    return ["KXBTC"]
+
+
 def resolve_bitcoin_candidate_tickers(client: KalshiSdkClient, settings: Settings) -> list[str]:
-    """Pinned single ticker, or open markets whose tickers start with ``TRADE_BITCOIN_TICKER_PREFIX``."""
+    """Pinned single ticker, or open markets matching ``TRADE_CRYPTO_KALSHI_PREFIXES`` (union) or legacy single prefix."""
     pinned = (settings.trade_bitcoin_kalshi_ticker or "").strip()
     if pinned:
         return [pinned]
-    prefix = (settings.trade_bitcoin_ticker_prefix or "").strip()
-    if not prefix:
+    prefixes = crypto_kalshi_prefixes_for_discovery(settings)
+    if not prefixes:
         return []
-    rows = fetch_open_markets_by_ticker_prefix(
+    rows = fetch_open_markets_by_ticker_prefixes(
         client,
-        prefix=prefix,
+        prefixes=prefixes,
         max_results=settings.trade_bitcoin_max_universe,
         max_api_pages=settings.trade_bitcoin_discovery_max_pages,
     )
@@ -151,8 +167,8 @@ def run_bitcoin_sidecar_if_due(
     if not candidates:
         log.warning(
             "bitcoin_sidecar_no_open_markets",
-            prefix=settings.trade_bitcoin_ticker_prefix,
-            note="Set TRADE_BITCOIN_KALSHI_TICKER to pin one market, or check TRADE_BITCOIN_TICKER_PREFIX",
+            prefixes=crypto_kalshi_prefixes_for_discovery(settings),
+            note="Set TRADE_BITCOIN_KALSHI_TICKER to pin one market, or TRADE_CRYPTO_KALSHI_PREFIXES / TRADE_BITCOIN_TICKER_PREFIX",
         )
         return 0, 0
     chosen = pick_next_bitcoin_ticker(candidates, rot)
@@ -199,18 +215,26 @@ def evaluate_bitcoin_ticker_pass(
     except Exception:  # noqa: BLE001
         pass
 
-    btc_usd = fetch_btc_usd_spot()
-    if btc_usd is not None:
+    ref_spot, spot_label = fetch_crypto_spot_usd_for_kalshi_ticker(
+        ticker,
+        settings.trade_crypto_spot_price_source,
+    )
+    if ref_spot is not None:
         stats.btc_price_ok = 1
     else:
         stats.btc_price_fail = 1
 
-    spot_s = f"${btc_usd:,.2f}" if btc_usd is not None else "n/a"
-    print(f"bitcoin-trade: BTC spot ≈ {spot_s} USD | {ticker} — {title[:100]}", flush=True)
+    spot_s = f"${ref_spot:,.2f}" if ref_spot is not None else "n/a"
+    print(
+        f"bitcoin-trade: ref spot ≈ {spot_s} USD ({spot_label}) | {ticker} — {title[:100]}",
+        flush=True,
+    )
     log.info(
         "bitcoin_trade_start",
         kalshi_ticker=ticker,
-        btc_usd_spot=btc_usd,
+        btc_usd_spot=ref_spot,
+        crypto_spot_label=spot_label,
+        crypto_spot_source=settings.trade_crypto_spot_price_source,
         title=title[:200],
         execute=execute,
         trade_bitcoin_auto_execute=settings.trade_bitcoin_auto_execute,
@@ -287,6 +311,8 @@ def evaluate_bitcoin_ticker_pass(
     if skip_te:
         if te_reason == "theta_decay_longshot":
             stats.skip_theta_decay += 1
+        elif te_reason == "resolution_too_far":
+            stats.skip_resolution_too_far += 1
         elif te_reason == "not_in_event_top_yes":
             stats.skip_event_not_top_yes += 1
         elif te_reason == "multi_choice_not_top_n":
@@ -328,7 +354,13 @@ def evaluate_bitcoin_ticker_pass(
             )
             if intent is not None:
                 stats.momentum_signal += 1
-                log.info("bitcoin_momentum_signal", ticker=ticker, note=_mwhy, btc_usd_spot=btc_usd)
+                log.info(
+                    "bitcoin_momentum_signal",
+                    ticker=ticker,
+                    note=_mwhy,
+                    ref_spot_usd=ref_spot,
+                    crypto_spot_label=spot_label,
+                )
 
     if intent is None and settings.trade_use_edge_strategy and settings.trade_fair_yes_prob is not None:
         if entry_side == "yes":
@@ -351,7 +383,7 @@ def evaluate_bitcoin_ticker_pass(
                 ticker=ticker,
                 yes_bid_dollars=yes_bid_d,
                 yes_ask_dollars=yes_ask_d,
-                max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                max_yes_ask_dollars=settings.trade_entry_effective_max_yes_ask_dollars,
                 min_spread_dollars=settings.strategy_min_spread_dollars,
                 probability_gap=settings.strategy_probability_gap,
                 order_count=settings.strategy_order_count,
@@ -364,7 +396,7 @@ def evaluate_bitcoin_ticker_pass(
                 ticker=ticker,
                 no_bid_dollars=no_bid_d,
                 no_ask_dollars=no_ask_d,
-                max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                max_yes_ask_dollars=settings.trade_entry_effective_max_yes_ask_dollars,
                 min_spread_dollars=settings.strategy_min_spread_dollars,
                 probability_gap=settings.strategy_probability_gap,
                 order_count=settings.strategy_order_count,
@@ -411,7 +443,7 @@ def run_bitcoin_trade_pass(
     if not bitcoin_markets_configured(settings):
         raise ValueError(
             "Set TRADE_BITCOIN_KALSHI_TICKER to pin one contract, or leave it empty and set "
-            "TRADE_BITCOIN_TICKER_PREFIX (default KXBTC) to discover open Bitcoin markets."
+            "TRADE_CRYPTO_KALSHI_PREFIXES (e.g. KXBTC,KXETH) or TRADE_BITCOIN_TICKER_PREFIX (default discovery KXBTC)."
         )
 
     client = build_sdk_client(settings)
@@ -421,7 +453,7 @@ def run_bitcoin_trade_pass(
     candidates = resolve_bitcoin_candidate_tickers(client, settings)
     if not candidates:
         raise ValueError(
-            f"No open Kalshi markets matched prefix {settings.trade_bitcoin_ticker_prefix!r}. "
+            f"No open Kalshi markets matched prefixes {crypto_kalshi_prefixes_for_discovery(settings)!r}. "
             "Pin TRADE_BITCOIN_KALSHI_TICKER or widen TRADE_BITCOIN_DISCOVERY_MAX_PAGES / check Kalshi UI."
         )
     chosen = pick_next_bitcoin_ticker(candidates, rot)

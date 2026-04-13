@@ -52,6 +52,7 @@ from kalshi_bot.tape_runner import run_tape_rule_pipeline
 from kalshi_bot.bitcoin_runner import run_bitcoin_trade_pass
 from kalshi_bot.monitor import (
     heartbeat,
+    notify_portfolio_series_to_dashboard,
     record_portfolio_series_point,
     record_trade_pass_summary,
     start_dashboard,
@@ -212,6 +213,8 @@ def cmd_llm_trade(
                     )
                 except Exception:
                     pass
+            else:
+                notify_portfolio_series_to_dashboard(settings)
             maybe_clear_structured_log_every_other_pass(
                 log_path=settings.structured_log_path,
                 pass_number=iteration,
@@ -294,6 +297,8 @@ def cmd_discover_trade(
                     )
                 except Exception:
                     pass
+            else:
+                notify_portfolio_series_to_dashboard(settings)
             maybe_clear_structured_log_every_other_pass(
                 log_path=settings.structured_log_path,
                 pass_number=iteration,
@@ -380,6 +385,8 @@ def cmd_tape_trade(
                     )
                 except Exception:
                     pass
+            else:
+                notify_portfolio_series_to_dashboard(settings)
             maybe_clear_structured_log_every_other_pass(
                 log_path=settings.structured_log_path,
                 pass_number=iteration,
@@ -403,9 +410,9 @@ def cmd_bitcoin_trade(
 ) -> None:
     print(NO_GUARANTEE_DISCLAIMER)
     print(
-        "bitcoin-trade: CoinGecko BTC/USD spot + Kalshi BTC binary contracts. "
-        "Pin TRADE_BITCOIN_KALSHI_TICKER for one market, or leave it empty to discover open tickers "
-        "with prefix TRADE_BITCOIN_TICKER_PREFIX (default KXBTC) and rotate — contracts roll frequently.\n",
+        "bitcoin-trade: public BTC/ETH spot (TRADE_CRYPTO_SPOT_PRICE_SOURCE: auto/coingecko/binance) + Kalshi crypto "
+        "binaries. Pin TRADE_BITCOIN_KALSHI_TICKER for one market, or leave empty and set "
+        "TRADE_CRYPTO_KALSHI_PREFIXES (e.g. KXBTC,KXETH) or TRADE_BITCOIN_TICKER_PREFIX — contracts roll frequently.\n",
         flush=True,
     )
     log = get_logger("kalshi_bot", log_path=settings.structured_log_path, level=settings.log_level)
@@ -465,6 +472,8 @@ def cmd_bitcoin_trade(
                     )
                 except Exception:
                     pass
+            else:
+                notify_portfolio_series_to_dashboard(settings)
             maybe_clear_structured_log_every_other_pass(
                 log_path=settings.structured_log_path,
                 pass_number=iteration,
@@ -613,6 +622,48 @@ def cmd_exit_scan(
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         print("\nexit-scan loop stopped.", file=sys.stderr)
+
+
+def cmd_sell_bot(
+    settings: Settings,
+    *,
+    min_yes_bid_cents: int | None,
+    interval_seconds: float,
+    execute: bool,
+    web: bool = False,
+) -> None:
+    """Dedicated process: same as ``exit-scan --loop``. Does **not** open the Flask monitor unless ``--web``."""
+    print(NO_GUARANTEE_DISCLAIMER)
+    print()
+    dash_client = None
+    if web:
+        start_dashboard(settings)
+        dash_client = build_sdk_client(settings)
+        start_portfolio_series_poller(settings, dash_client)
+        try:
+            snap0 = fetch_portfolio_snapshot(dash_client, ticker=None)
+            record_portfolio_series_point(
+                snap0.balance_cents,
+                snap0.portfolio_value_cents,
+                exposure_sum_cents=float(snap0.total_exposure_cents),
+            )
+        except Exception:
+            pass
+    print(
+        "sell-bot: exit loop — same rules as post-pass auto-sell (TRADE_EXIT_*). "
+        + ("Submitting sells when rules pass." if execute else "Read-only summary (no sells).")
+        + f" Every {interval_seconds:.0f}s.\n"
+        "Tip: set TRADE_AUTO_SELL_AFTER_EACH_PASS=false on your trade command so that process only scans/opens positions; "
+        "this command owns exits.\n",
+        flush=True,
+    )
+    cmd_exit_scan(
+        settings,
+        min_yes_bid_cents=min_yes_bid_cents,
+        execute=execute,
+        loop=True,
+        interval_seconds=interval_seconds,
+    )
 
 
 def cmd_sell_all(settings: Settings, *, execute: bool) -> None:
@@ -783,7 +834,7 @@ def cmd_backtest(settings: Settings, path: Path) -> None:
     )
     params = {
         "ticker": settings.strategy_market_ticker or "BACKTEST",
-        "max_yes_ask_dollars": settings.strategy_max_yes_ask_dollars,
+        "max_yes_ask_dollars": settings.trade_entry_effective_max_yes_ask_dollars,
         "min_spread_dollars": settings.strategy_min_spread_dollars,
         "probability_gap": settings.strategy_probability_gap,
         "order_count": settings.strategy_order_count,
@@ -871,7 +922,7 @@ def cmd_walk_forward(settings: Settings, path: Path) -> None:
     )
     params = {
         "ticker": settings.strategy_market_ticker or "BACKTEST",
-        "max_yes_ask_dollars": settings.strategy_max_yes_ask_dollars,
+        "max_yes_ask_dollars": settings.trade_entry_effective_max_yes_ask_dollars,
         "min_spread_dollars": settings.strategy_min_spread_dollars,
         "probability_gap": settings.strategy_probability_gap,
         "order_count": settings.strategy_order_count,
@@ -899,7 +950,7 @@ def cmd_sensitivity(settings: Settings, path: Path) -> None:
     )
     params = {
         "ticker": settings.strategy_market_ticker or "BACKTEST",
-        "max_yes_ask_dollars": settings.strategy_max_yes_ask_dollars,
+        "max_yes_ask_dollars": settings.trade_entry_effective_max_yes_ask_dollars,
         "min_spread_dollars": settings.strategy_min_spread_dollars,
         "probability_gap": settings.strategy_probability_gap,
         "order_count": settings.strategy_order_count,
@@ -1008,7 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     btc = sub.add_parser(
         "bitcoin-trade",
-        help="BTC/USD spot + Kalshi BTC markets (pin one ticker or prefix discovery + rotation); same rules as tape-trade",
+        help="Crypto (BTC/ETH) spot ref + Kalshi crypto markets — pin ticker or TRADE_CRYPTO_KALSHI_PREFIXES; same rules as tape-trade",
     )
     btc.add_argument(
         "--execute",
@@ -1098,6 +1149,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Seconds between scans when --loop (default: 30; min 5)",
+    )
+
+    sb = sub.add_parser(
+        "sell-bot",
+        help="Parallel exit-only loop: batch auto-sell (same as exit-scan --loop --execute). Does not start the "
+        "Flask monitor unless --web. Set TRADE_AUTO_SELL_AFTER_EACH_PASS=false on the trade process.",
+    )
+    sb.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Seconds between scans (default: SELL_BOT_INTERVAL_SECONDS from .env, else 30; min 5)",
+    )
+    sb.add_argument(
+        "--min-yes-bid-cents",
+        type=int,
+        default=None,
+        help="Override min best YES bid (cents); else TRADE_EXIT_* / implied-pct rules",
+    )
+    sb.add_argument(
+        "--web",
+        action="store_true",
+        help="Start local dashboard + portfolio chart (sets DASHBOARD_ENABLED)",
+    )
+    sb.add_argument(
+        "--no-execute",
+        action="store_true",
+        help="Print cashout summary only (no sells) — same as exit-scan without --execute",
     )
 
     pw = sub.add_parser(
@@ -1192,6 +1272,8 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["DASHBOARD_ENABLED"] = "true"
     if cmd == "bitcoin-trade" and getattr(args, "web", False):
         os.environ["DASHBOARD_ENABLED"] = "true"
+    if cmd == "sell-bot" and getattr(args, "web", False):
+        os.environ["DASHBOARD_ENABLED"] = "true"
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -1259,6 +1341,17 @@ def main(argv: list[str] | None = None) -> None:
                 execute=bool(getattr(args, "execute", False)),
                 loop=bool(getattr(args, "loop", False)),
                 interval_seconds=max(5.0, float(getattr(args, "interval", 30.0))),
+            )
+        elif cmd == "sell-bot":
+            eff_iv = getattr(args, "interval", None)
+            if eff_iv is None:
+                eff_iv = float(settings.sell_bot_interval_seconds)
+            cmd_sell_bot(
+                settings,
+                min_yes_bid_cents=getattr(args, "min_yes_bid_cents", None),
+                interval_seconds=max(5.0, float(eff_iv)),
+                execute=not bool(getattr(args, "no_execute", False)),
+                web=bool(getattr(args, "web", False)),
             )
         elif cmd == "auto-sell":
             cmd_auto_sell(

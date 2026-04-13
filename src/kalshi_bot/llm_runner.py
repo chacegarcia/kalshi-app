@@ -29,7 +29,8 @@ from kalshi_bot.momentum import momentum_buy_intent_if_hot
 from kalshi_bot.spike_fade import detect_yes_spike_up
 from kalshi_bot.portfolio import PortfolioSnapshot, fetch_portfolio_snapshot, get_balance_cents
 from kalshi_bot.risk import RiskManager
-from kalshi_bot.sizing import effective_max_contracts
+from kalshi_bot.runtime_controls import get_order_size_multiplier
+from kalshi_bot.sizing import pre_mult_contract_cap
 from kalshi_bot.strategy import (
     choose_entry_side_and_ask_cents,
     entry_filter_timing_and_event,
@@ -67,6 +68,7 @@ class LLMTradeRunStats:
     skip_ticker_substring: int = 0
     skip_long_yes_cap: int = 0
     skip_theta_decay: int = 0
+    skip_resolution_too_far: int = 0
     skip_event_not_top_yes: int = 0
     skip_multi_choice_not_top_n: int = 0
     skip_multi_choice_below_min: int = 0
@@ -110,6 +112,7 @@ class LLMTradeRunStats:
                 f"  skip (ticker substring block):  {self.skip_ticker_substring}",
                 f"  skip (long-YES family cap):     {self.skip_long_yes_cap}",
                 f"  skip (theta / near-exp longshot): {self.skip_theta_decay}",
+                f"  skip (resolution > max horizon): {self.skip_resolution_too_far}",
                 f"  skip (not in event top-N YES):  {self.skip_event_not_top_yes}",
                 f"  skip (multi-choice not top-N):    {self.skip_multi_choice_not_top_n}",
                 f"  skip (multi-choice < min chance): {self.skip_multi_choice_below_min}",
@@ -167,7 +170,7 @@ def _passes_bot_edge(
     )
     if edge < need:
         return False
-    if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
+    if yes_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
         return False
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
     if spread < settings.strategy_min_spread_dollars:
@@ -199,7 +202,7 @@ def _passes_bot_edge_no(
     )
     if edge < need:
         return False
-    if no_ask_dollars > settings.strategy_max_yes_ask_dollars:
+    if no_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
         return False
     spread = max(0.0, no_ask_dollars - no_bid_dollars)
     if spread < settings.strategy_min_spread_dollars:
@@ -228,7 +231,7 @@ def _passes_bot_math_for_llm(
     """Strict fee-edge check, or when LLM declined but fair is near ask, only book-quality checks."""
     if entry_side == "no":
         spread = max(0.0, no_ask_dollars - no_bid_dollars)
-        if no_ask_dollars > settings.strategy_max_yes_ask_dollars:
+        if no_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
             return False
         if spread < settings.strategy_min_spread_dollars:
             return False
@@ -257,7 +260,7 @@ def _passes_bot_math_for_llm(
         )
 
     spread = max(0.0, yes_ask_dollars - yes_bid_dollars)
-    if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
+    if yes_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
         return False
     if spread < settings.strategy_min_spread_dollars:
         return False
@@ -553,6 +556,8 @@ def run_llm_opportunity_pipeline(
             if skip_te:
                 if te_reason == "theta_decay_longshot":
                     stats.skip_theta_decay += 1
+                elif te_reason == "resolution_too_far":
+                    stats.skip_resolution_too_far += 1
                 elif te_reason == "not_in_event_top_yes":
                     stats.skip_event_not_top_yes += 1
                 elif te_reason == "multi_choice_not_top_n":
@@ -571,9 +576,10 @@ def run_llm_opportunity_pipeline(
                 )
                 continue
 
-            base_max = effective_max_contracts(
-                settings, balance_cents=bal, yes_price_cents=chosen_ask_c
-            )
+            # Final max contracts after session mult is in effective_max_contracts; LLM/momentum use *base*
+            # lots so execute_intent's multiply does not double-apply the dashboard multiplier.
+            mult_od = max(1, int(get_order_size_multiplier()))
+            base_max = pre_mult_contract_cap(settings, balance_cents=bal, yes_price_cents=chosen_ask_c)
             add_room = 0
             if settings.trade_double_down_enabled and entry_side == "yes" and held > 0.5:
                 add_room = max(
@@ -581,7 +587,8 @@ def run_llm_opportunity_pipeline(
                     int(settings.trade_double_down_max_position_contracts) - int(held),
                 )
             if held > 0.5 and entry_side == "yes" and settings.trade_double_down_enabled:
-                max_allowed = min(base_max, add_room) if add_room > 0 else 0
+                room_base = add_room // mult_od if mult_od else add_room
+                max_allowed = min(base_max, room_base) if room_base > 0 else 0
             else:
                 max_allowed = base_max
             if max_allowed < 1:
@@ -786,6 +793,8 @@ def run_llm_opportunity_pipeline(
                 continue
             if wl_stress:
                 count = min(count, 1)
+            # Fee/edge math uses executed share count (base × session multiplier).
+            contracts_for_fee = max(1, count * mult_od)
             if entry_side == "yes":
                 limit_c = max(1, min(99, min(verdict.limit_yes_price_cents, yes_ask_c)))
             else:
@@ -808,7 +817,7 @@ def run_llm_opportunity_pipeline(
                 no_bid_dollars=no_bid_d,
                 no_ask_dollars=no_ask_d,
                 entry_side=entry_side,
-                contracts=count,
+                contracts=contracts_for_fee,
                 llm_decline_overridden=llm_decline_overridden,
                 adaptive_min_add=ad_min,
                 adaptive_mid_add=ad_mid,
@@ -828,7 +837,7 @@ def run_llm_opportunity_pipeline(
                         no_bid_dollars=no_bid_d,
                         no_ask_dollars=no_ask_d,
                         entry_side=entry_side,
-                        contracts=count,
+                        contracts=contracts_for_fee,
                         llm_decline_overridden=llm_decline_overridden,
                         adaptive_min_add=ad_min,
                         adaptive_mid_add=ad_mid,

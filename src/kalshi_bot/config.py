@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         description="Max total exposure (cents) when TRADE_BALANCE_SIZING_ENABLED=false or balance is unknown. With balance sizing + live balance, cap is balance×TRADE_TOTAL_RISK_PCT_OF_BALANCE instead.",
     )
     max_contracts_per_market: int = Field(
-        default=1,
+        default=5,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_MAX_CONTRACTS_PER_MARKET",
@@ -79,7 +79,10 @@ class Settings(BaseSettings):
             "MAX_POSITION_CONTRACTS",
             "max_contracts_per_market",
         ),
-        description="Max YES shares (Kalshi contracts) per market; values >1 are clamped to 1.",
+        description=(
+            "Max YES contracts per market (env clamped to 1–99). "
+            "Effective buy cap = this × session order-size multiplier (1–10) from the dashboard; balance sizing can lower it."
+        ),
     )
     max_daily_drawdown_usd: float = Field(
         default=25.0,
@@ -122,7 +125,20 @@ class Settings(BaseSettings):
             "STRATEGY_MAX_YES_ASK_DOLLARS",
             "strategy_max_yes_ask_dollars",
         ),
-        description="Max implied YES ask as a fraction of $1 (0–1). Example: 0.55 = 55¢, 0.98 = 98¢. Not a dollar amount like 5.00.",
+        description="Max implied YES ask as a fraction of $1 (0–1). Effective entry cap is min(this, TRADE_ENTRY_HARD_MAX_YES_ASK_CENTS/100).",
+    )
+    trade_entry_hard_max_yes_ask_cents: int = Field(
+        default=90,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_HARD_MAX_YES_ASK_CENTS",
+            "trade_entry_hard_max_yes_ask_cents",
+        ),
+        description=(
+            "Hard ceiling (¢): never buy YES/NO with limit price above this. Effective max ask = "
+            "min(STRATEGY_MAX_YES_ASK_DOLLARS, this/100). Default 90 blocks entries above 90¢ even if max dollars is higher."
+        ),
     )
     strategy_min_spread_dollars: float = Field(
         default=0.0,
@@ -310,6 +326,20 @@ class Settings(BaseSettings):
             "Binary (single-market) events use TRADE_ENTRY_MIN_YES_ASK_CENTS only."
         ),
     )
+    trade_entry_max_seconds_until_resolution: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=87658176.0,
+        validation_alias=AliasChoices(
+            "TRADE_ENTRY_MAX_SECONDS_UNTIL_RESOLUTION",
+            "trade_entry_max_seconds_until_resolution",
+        ),
+        description=(
+            "If >0: skip buy entries when the soonest Kalshi close/expiration is **more than** this many seconds away "
+            "(only trade markets resolving within this horizon). Example: 43200 = 12 hours. 0 = off. "
+            "If resolution time is unknown from the API, the market is **not** skipped."
+        ),
+    )
     trade_entry_prefer_higher_odds_side_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices(
@@ -335,7 +365,7 @@ class Settings(BaseSettings):
         ),
     )
     strategy_order_count: int = Field(
-        default=1,
+        default=5,
         ge=1,
         validation_alias=AliasChoices(
             "TRADE_BUY_CONTRACTS_PER_ORDER",
@@ -343,7 +373,7 @@ class Settings(BaseSettings):
             "STRATEGY_ORDER_COUNT",
             "strategy_order_count",
         ),
-        description="Shares per buy signal (sample strategies / momentum); values >1 are clamped to 1.",
+        description="Default shares per buy for rule-based runners (discover/tape/bitcoin); env clamped 1–99. llm-trade uses model `shares` up to max_contracts_per_market.",
     )
     trade_min_order_notional_usd: float | None = Field(
         default=0.0,
@@ -727,6 +757,29 @@ class Settings(BaseSettings):
         ),
         description="With TRADE_BITCOIN_SIDECAR_ENABLED: run Bitcoin Kalshi check every N tape/discover ticker iterations.",
     )
+    trade_crypto_kalshi_prefixes: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRADE_CRYPTO_KALSHI_PREFIXES",
+            "trade_crypto_kalshi_prefixes",
+        ),
+        description=(
+            "Comma-separated Kalshi ticker prefixes for crypto ``bitcoin-trade`` discovery (e.g. KXBTC,KXETH). "
+            "When empty, TRADE_BITCOIN_TICKER_PREFIX is used if set, otherwise KXBTC. "
+            "TRADE_BITCOIN_KALSHI_TICKER still pins a single market when set."
+        ),
+    )
+    trade_crypto_spot_price_source: str = Field(
+        default="auto",
+        validation_alias=AliasChoices(
+            "TRADE_CRYPTO_SPOT_PRICE_SOURCE",
+            "trade_crypto_spot_price_source",
+        ),
+        description=(
+            "Reference spot USD for logs: auto (try CoinGecko then Binance), coingecko, or binance. "
+            "BTC vs ETH is inferred from the contract ticker (KXETH → ETH)."
+        ),
+    )
 
     # Prior-chart momentum (REST candlesticks): buy YES when YES trade price rose quickly in recent bars.
     trade_momentum_enabled: bool = Field(
@@ -850,7 +903,11 @@ class Settings(BaseSettings):
             "TRADE_AUTO_SELL_AFTER_EACH_PASS",
             "trade_auto_sell_after_each_pass",
         ),
-        description="After each llm-trade / discover-trade / tape-trade / bitcoin-trade pass, scan long YES positions and run take-profit (same rules as auto-sell).",
+        description=(
+            "After each llm-trade / discover-trade / tape-trade / bitcoin-trade pass, scan long YES positions and run "
+            "take-profit (same rules as auto-sell). Set false if you run a dedicated `kalshi-bot sell-bot` (or "
+            "`exit-scan --loop --execute`) in another process so the trade bot only scans and submits entries."
+        ),
     )
     trade_position_watch_before_auto_sell: bool = Field(
         default=True,
@@ -861,6 +918,18 @@ class Settings(BaseSettings):
         description=(
             "When TRADE_AUTO_SELL_AFTER_EACH_PASS runs, print a short positions-watch table (book + tape lean) "
             "before the exit scan — same data as `positions-watch` without a second terminal."
+        ),
+    )
+    sell_bot_interval_seconds: float = Field(
+        default=30.0,
+        ge=5.0,
+        validation_alias=AliasChoices(
+            "SELL_BOT_INTERVAL_SECONDS",
+            "sell_bot_interval_seconds",
+        ),
+        description=(
+            "Default seconds between `sell-bot` loop iterations (parallel exit-only process). "
+            "Override with `kalshi-bot sell-bot --interval SEC`."
         ),
     )
     trade_exit_tape_no_heavy_relax_min_profit_cents: float = Field(
@@ -1070,7 +1139,7 @@ class Settings(BaseSettings):
         description="If true, sell long YES when best bid ≤ entry × TRADE_EXIT_STOP_LOSS_ENTRY_FRACTION (requires entry reference).",
     )
     trade_exit_stop_loss_entry_fraction: float = Field(
-        default=0.5,
+        default=0.8,
         gt=0.0,
         lt=1.0,
         validation_alias=AliasChoices(
@@ -1079,8 +1148,8 @@ class Settings(BaseSettings):
         ),
         description=(
             "Long YES stop: fire when best YES bid ≤ round(entry_cents × this). "
-            "0.5 = exit if bid is at or below half of estimated entry (e.g. 60¢ entry → floor 30¢). "
-            "Not ‘lose 50% of dollars’—it compares bid level to entry level in cents."
+            "0.8 = exit if bid is at or below 80% of estimated entry in ¢ (e.g. 50¢ entry → floor 40¢). "
+            "Higher fraction = tighter stop (cuts losses sooner)."
         ),
     )
     trade_exit_stop_loss_skip_suspect_portfolio_estimate: bool = Field(
@@ -1249,14 +1318,14 @@ class Settings(BaseSettings):
         ),
     )
     trade_double_down_max_position_contracts: int = Field(
-        default=2,
+        default=5,
         ge=2,
         le=99,
         validation_alias=AliasChoices(
             "TRADE_DOUBLE_DOWN_MAX_POSITION_CONTRACTS",
             "trade_double_down_max_position_contracts",
         ),
-        description="Max total YES contracts per market when adding to a winner (base max is still 1 for new entries).",
+        description="Max total YES contracts per market when adding to a winner (must be ≥ max_contracts_per_market if you double down to the cap).",
     )
     trade_double_down_extra_min_net_edge_after_fees: float = Field(
         default=0.0,
@@ -1378,6 +1447,25 @@ class Settings(BaseSettings):
             "in-process recording if nothing is listening."
         ),
     )
+    dashboard_ingest_trade_events: bool = Field(
+        default=True,
+        validation_alias=_env("DASHBOARD_INGEST_TRADE_EVENTS", "dashboard_ingest_trade_events"),
+        description=(
+            "If true, each order/trade dashboard event (dry-run, live submit, blocked, etc.) POSTs to the local "
+            "dashboard first so the Trades & orders feed updates when trading runs in a different process than "
+            "`--web`. On HTTP success the event is not duplicated in the sender's memory. Falls back to in-process "
+            "if nothing is listening. Heartbeats stay in-process only."
+        ),
+    )
+    dashboard_ingest_portfolio_series: bool = Field(
+        default=True,
+        validation_alias=_env("DASHBOARD_INGEST_PORTFOLIO_SERIES", "dashboard_ingest_portfolio_series"),
+        description=(
+            "If true, after each trading pass when the dashboard is not in-process (no --web), POST to the local "
+            "dashboard so it appends a portfolio chart point immediately. Same machine must run a dashboard with "
+            "API keys in .env for the snapshot fetch."
+        ),
+    )
 
     log_level: str = Field(default="INFO", validation_alias=_env("LOG_LEVEL", "log_level"))
     structured_log_path: Path = Field(
@@ -1419,17 +1507,25 @@ class Settings(BaseSettings):
         s = str(v).strip()
         return s if s else None
 
+    @field_validator("trade_crypto_spot_price_source", mode="before")
+    @classmethod
+    def _normalize_crypto_spot_source(cls, v: object) -> str:
+        s = str(v or "auto").strip().lower()
+        if s in ("auto", "coingecko", "binance"):
+            return s
+        return "auto"
+
     @field_validator("max_contracts_per_market", "strategy_order_count", mode="before")
     @classmethod
-    def _cap_order_shares_at_one(cls, v: object) -> object:
-        """Env may still say 10 from older configs; enforce max 1 share per policy."""
+    def _clamp_order_share_counts(cls, v: object) -> object:
+        """Clamp env integers to 1–99 (Kalshi contract counts)."""
         if v is None or (isinstance(v, str) and not str(v).strip()):
             return v
         try:
             n = int(v)
         except (TypeError, ValueError):
             return v
-        return min(1, max(1, n))
+        return min(99, max(1, n))
 
     @field_validator(
         "trade_exit_sell_time_in_force",
@@ -1463,6 +1559,8 @@ class Settings(BaseSettings):
         "dashboard_enabled",
         "dashboard_open_browser",
         "dashboard_ingest_auto_sell",
+        "dashboard_ingest_trade_events",
+        "dashboard_ingest_portfolio_series",
         "trade_use_edge_strategy",
         "trade_llm_screen_enabled",
         "trade_llm_auto_execute",
@@ -1544,9 +1642,15 @@ class Settings(BaseSettings):
         return self.live_trading and not self.dry_run
 
     @property
+    def trade_entry_effective_max_yes_ask_dollars(self) -> float:
+        """Min of ``strategy_max_yes_ask_dollars`` and ``trade_entry_hard_max_yes_ask_cents`` / 100 (actual entry ceiling)."""
+        cap = float(self.trade_entry_hard_max_yes_ask_cents) / 100.0
+        return min(float(self.strategy_max_yes_ask_dollars), cap)
+
+    @property
     def trade_buy_max_yes_ask_implied_pct(self) -> float:
-        """Entry cap `TRADE_BUY_MAX_YES_ASK_DOLLARS` as implied YES probability in 0–100 (e.g. 0.55 → 55)."""
-        return self.strategy_max_yes_ask_dollars * 100.0
+        """Effective max YES ask as implied probability 0–100 (uses ``trade_entry_effective_max_yes_ask_dollars``)."""
+        return self.trade_entry_effective_max_yes_ask_dollars * 100.0
 
     @property
     def trade_entry_min_edge_from_50_pct_points(self) -> float:

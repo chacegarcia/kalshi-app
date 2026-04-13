@@ -47,6 +47,7 @@ class DiscoverRuleRunStats:
     skip_ticker_substring: int = 0
     skip_long_yes_cap: int = 0
     skip_theta_decay: int = 0
+    skip_resolution_too_far: int = 0
     skip_event_not_top_yes: int = 0
     skip_multi_choice_not_top_n: int = 0
     skip_multi_choice_below_min: int = 0
@@ -73,6 +74,7 @@ class DiscoverRuleRunStats:
             f"  skip (ticker substring block):      {self.skip_ticker_substring}",
             f"  skip (long-YES family cap):         {self.skip_long_yes_cap}",
             f"  skip (theta / near-exp longshot):   {self.skip_theta_decay}",
+            f"  skip (resolution > max horizon):    {self.skip_resolution_too_far}",
             f"  skip (not in event top-N YES):      {self.skip_event_not_top_yes}",
             f"  skip (multi-choice not top-N):      {self.skip_multi_choice_not_top_n}",
             f"  skip (multi-choice < min chance):   {self.skip_multi_choice_below_min}",
@@ -212,6 +214,8 @@ def run_discover_rule_pipeline(
             if skip_te:
                 if te_reason == "theta_decay_longshot":
                     stats.skip_theta_decay += 1
+                elif te_reason == "resolution_too_far":
+                    stats.skip_resolution_too_far += 1
                 elif te_reason == "not_in_event_top_yes":
                     stats.skip_event_not_top_yes += 1
                 elif te_reason == "multi_choice_not_top_n":
@@ -276,7 +280,7 @@ def run_discover_rule_pipeline(
                         ticker=ticker,
                         yes_bid_dollars=yes_bid_d,
                         yes_ask_dollars=yes_ask_d,
-                        max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                        max_yes_ask_dollars=settings.trade_entry_effective_max_yes_ask_dollars,
                         min_spread_dollars=settings.strategy_min_spread_dollars,
                         probability_gap=settings.strategy_probability_gap,
                         order_count=settings.strategy_order_count,
@@ -289,7 +293,7 @@ def run_discover_rule_pipeline(
                         ticker=ticker,
                         no_bid_dollars=no_bid_d,
                         no_ask_dollars=no_ask_d,
-                        max_yes_ask_dollars=settings.strategy_max_yes_ask_dollars,
+                        max_yes_ask_dollars=settings.trade_entry_effective_max_yes_ask_dollars,
                         min_spread_dollars=settings.strategy_min_spread_dollars,
                         probability_gap=settings.strategy_probability_gap,
                         order_count=settings.strategy_order_count,

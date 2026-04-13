@@ -175,6 +175,9 @@ def llm_evaluate_opportunity(
 ) -> LLMOpportunityVerdict | None:
     """Ask the model to reason about a market; output must be JSON with ``shares`` (or legacy ``contracts``).
 
+    ``max_contracts_allowed`` is the **base** share cap (before the session order-size multiplier); execution
+    multiplies base × multiplier when submitting.
+
     When ``llm-trade --tape`` is used, pass tape fields so the model can weigh recent anonymous public flow
     (liquidity / attention proxy) alongside price and edge.
     """
@@ -204,8 +207,8 @@ def llm_evaluate_opportunity(
     params = (
         f"Enforced in code: {chance_line}{mi_line}"
         f"min_net_edge_after_fees={min_e}, mid_price_extra_edge={mid_x}, "
-        f"max_yes_ask={settings.strategy_max_yes_ask_dollars}, min_spread={settings.strategy_min_spread_dollars}, "
-        f"max_shares={max_contracts_allowed}, bal_cents={bal_s}"
+        f"max_yes_ask={settings.trade_entry_effective_max_yes_ask_dollars}, min_spread={settings.strategy_min_spread_dollars}, "
+        f"max_base_shares={max_contracts_allowed} (before session order-size multiplier), bal_cents={bal_s}"
     )
     perf_block = ""
     if session_performance_note.strip():
@@ -218,9 +221,13 @@ def llm_evaluate_opportunity(
         else ""
     )
     style_block = (
-        "Style: Treat each YES as a share of a $1 binary (max payoff $1). Share price = implied probability (the ask in ¢). "
-        "Estimate fair_yes in [0,1]. The bot rejects trades that fail fee-aware edge vs mid. Prefer smaller `shares` "
-        "when uncertain—many small wins, not home runs.\n"
+        "Style: Each YES is one share of a $1 binary (max **$1 payoff per share** if YES wins). Share price = implied probability (the ask in ¢). "
+        "Estimate fair_yes in [0,1]. The bot rejects trades that fail fee-aware edge vs mid. "
+        "`shares` is a **base** size in [1, max_base_shares]; the session order-size multiplier (e.g. 2×) is applied in "
+        "execution, so total contracts = shares × multiplier. "
+        "**Choose shares for expected profit:** use more when fee-adjusted edge (fair_yes vs lift YES ask) is clearly "
+        "above the hurdle and the thesis is strong; use 1 when edge is thin, liquidity is poor, or uncertainty is high. "
+        "Never exceed max_base_shares.\n"
     )
     flow_block = ""
     if (
@@ -256,8 +263,8 @@ def llm_evaluate_opportunity(
     if existing_long_yes_shares > 0.5 and entry_side == "yes":
         dd_block = (
             f"\n**Existing position:** ~{existing_long_yes_shares:.0f} YES share(s) already held in this market. "
-            f"You may approve adding up to {max_contracts_allowed} more share(s) on this order **only** if fee-adjusted "
-            "edge vs the ask is still clearly favorable — otherwise set approve=false.\n"
+            f"You may approve adding up to {max_contracts_allowed} more **base** share(s) on this order **only** if fee-adjusted "
+            "edge vs the ask is still clearly favorable — otherwise set approve=false. (Multiplier applies after.)\n"
         )
 
     spike_block = ""
@@ -275,6 +282,7 @@ def llm_evaluate_opportunity(
 {flow_block}{perf_block}{params}
 {style_block}{odds_block}JSON only:
 {{"approve":bool,"fair_yes":0-1,"buy_yes":bool,"limit_yes_price_cents":1-99,"shares":1-{max_contracts_allowed},"reason":"brief"}}
+(base `shares`; session order-size multiplier applied in the bot.)
 {_llm_approval_tail(settings)}"""
 
     raw = _openai_chat_json(key, settings.trade_llm_model, user)

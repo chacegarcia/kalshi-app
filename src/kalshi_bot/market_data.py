@@ -284,6 +284,53 @@ def fetch_open_markets_by_ticker_prefix(
     return rows[:want]
 
 
+def fetch_open_markets_by_ticker_prefixes(
+    client: KalshiSdkClient,
+    *,
+    prefixes: list[str],
+    max_results: int,
+    max_api_pages: int = 40,
+    page_limit: int = 200,
+    mve_filter: str | None = "exclude",
+) -> list[MarketSummary]:
+    """Collect **open** markets whose ticker starts with any of ``prefixes`` (union), de-duplicated by ticker.
+
+    Each prefix is scanned (same pagination cap per prefix as :func:`fetch_open_markets_by_ticker_prefix`);
+    results merge and sort by ``volume`` descending, then truncate to ``max_results``.
+    """
+    cleaned = [p.strip() for p in prefixes if p and str(p).strip()]
+    if not cleaned:
+        return []
+    want = max(1, max_results)
+    seen: dict[str, MarketSummary] = {}
+    for prefix in cleaned:
+        rows = fetch_open_markets_by_ticker_prefix(
+            client,
+            prefix=prefix,
+            max_results=want,
+            max_api_pages=max_api_pages,
+            page_limit=page_limit,
+            mve_filter=mve_filter,
+        )
+        for r in rows:
+            prev = seen.get(r.ticker)
+            if prev is None:
+                seen[r.ticker] = r
+                continue
+            pv = int(prev.volume) if prev.volume is not None else -1
+            nv = int(r.volume) if r.volume is not None else -1
+            if nv > pv:
+                seen[r.ticker] = r
+
+    out = list(seen.values())
+
+    def _vol_key(s: MarketSummary) -> int:
+        return int(s.volume) if s.volume is not None else -1
+
+    out.sort(key=_vol_key, reverse=True)
+    return out[:want]
+
+
 def fetch_open_markets_unique_up_to(
     client: KalshiSdkClient,
     *,

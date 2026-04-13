@@ -9,6 +9,7 @@ import math
 import threading
 
 from kalshi_bot.config import Settings
+from kalshi_bot.runtime_controls import get_order_size_multiplier
 
 _LOCK = threading.Lock()
 _NOTIONAL_SWEEP_I = 0
@@ -82,18 +83,43 @@ def effective_max_contracts(
 ) -> int:
     """Cap buy size in YES shares (Kalshi contracts).
 
-    With balance sizing and a positive balance: ``floor(balance × TRADE_RISK_PCT_OF_BALANCE_PER_TRADE / share_price)``,
-    or ``0`` if that budget cannot cover one share at the limit price.
+    The configured per-market ceiling ``max_contracts_per_market`` is multiplied by the session
+    ``order_size_multiplier`` (1–10 from dashboard / runtime), so 5× + cap 1 allows up to 5 contracts.
 
-    Otherwise: ``MAX_CONTRACTS_PER_MARKET`` / ``TRADE_MAX_SHARES_PER_MARKET`` (static fallback when balance is unknown or sizing is off).
+    With balance sizing and a positive balance: min(that budget in contracts at ``yes_price_cents``,
+    ``max_contracts_per_market × multiplier``). Without balance sizing: ``max_contracts_per_market × multiplier``.
+
+    This is the **final** max contracts **after** ``execute_intent`` applies the session multiplier to
+    strategy/LLM **base** share counts. For LLM prompts and caps, use :func:`pre_mult_contract_cap`.
     """
+    mult = max(1, int(get_order_size_multiplier()))
     base = settings.max_contracts_per_market
+    scaled_ceiling = max(0, int(base) * mult)
     if not settings.trade_balance_sizing_enabled or balance_cents is None or balance_cents <= 0:
-        return base
+        return scaled_ceiling
     price = max(1, min(99, yes_price_cents))
     budget = float(balance_cents) * settings.trade_risk_pct_of_balance_per_trade
     cap = int(budget // float(price))
-    return max(0, cap)
+    return max(0, min(cap, scaled_ceiling))
+
+
+def pre_mult_contract_cap(
+    settings: Settings,
+    *,
+    balance_cents: int | None,
+    yes_price_cents: int,
+) -> int:
+    """Max **base** contracts before ``execute_intent`` multiplies by the session order-size multiplier.
+
+    ``effective_max_contracts`` is the post-mult final ceiling; this is ``final // mult`` (0 if the
+    final budget fits fewer than one full mult lot). LLM / momentum should choose ``shares`` in
+    ``[1, pre_mult_contract_cap]`` so execution does not double-apply the multiplier.
+    """
+    final = effective_max_contracts(settings, balance_cents=balance_cents, yes_price_cents=yes_price_cents)
+    mult = max(1, int(get_order_size_multiplier()))
+    if final < 1:
+        return 0
+    return max(0, final // mult)
 
 
 def cap_buy_yes_count_for_notional(

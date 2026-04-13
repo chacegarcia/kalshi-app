@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from kalshi_python_sync.models.order import Order
 
@@ -96,6 +97,33 @@ def fetch_portfolio_snapshot(client: KalshiSdkClient, *, ticker: str | None = No
         total_exposure_cents=exposure,
         portfolio_value_cents=portfolio_value_cents,
     )
+
+
+@with_rest_retry
+def list_resting_orders_detail(client: KalshiSdkClient) -> list[dict[str, Any]]:
+    """All resting orders with fields for the dashboard (JSON-safe)."""
+    out: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        ords = client.orders.get_orders(status="resting", limit=200, cursor=cursor)
+        batch: list[Order] = list(getattr(ords, "orders", []) or [])
+        for o in batch:
+            out.append(
+                {
+                    "order_id": getattr(o, "order_id", None),
+                    "ticker": getattr(o, "ticker", None),
+                    "side": getattr(o, "side", None),
+                    "action": getattr(o, "action", None),
+                    "count": getattr(o, "count", None),
+                    "remaining_count": getattr(o, "remaining_count", None),
+                    "yes_price": getattr(o, "yes_price", None),
+                    "status": getattr(o, "status", None),
+                }
+            )
+        cursor = getattr(ords, "cursor", None)
+        if not cursor or not batch:
+            break
+    return out
 
 
 def count_long_yes_positions_matching_substring(snap: PortfolioSnapshot, substring: str) -> int:

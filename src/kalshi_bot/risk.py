@@ -107,9 +107,13 @@ class RiskManager:
         if self.state.last_balance_cents is not None and self.state.last_balance_cents <= 0:
             return RiskDecision(False, "account_balance_zero_or_negative")
 
-        max_c = max_contracts_override if max_contracts_override is not None else self._s.max_contracts_per_market
-        if projected_abs_position > max_c:
-            return RiskDecision(False, "max_contracts_per_market_exceeded")
+        # Per-market cap limits *entry* size (and scaled buys). Do not apply to sells/reduces: after a partial
+        # exit the remaining position can exceed max_contracts_per_market (e.g. 5 shares from 5× multiplier
+        # while MAX_CONTRACTS_PER_MARKET=1); blocking the next sell would strand inventory.
+        if order_increases_exposure:
+            max_c = max_contracts_override if max_contracts_override is not None else self._s.max_contracts_per_market
+            if projected_abs_position > max_c:
+                return RiskDecision(False, "max_contracts_per_market_exceeded")
 
         if resting_orders_on_market >= self._s.max_open_orders_per_market:
             return RiskDecision(False, "max_open_orders_per_market")

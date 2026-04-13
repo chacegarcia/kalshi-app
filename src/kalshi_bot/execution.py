@@ -164,6 +164,27 @@ def execute_intent(
             )
     market_title = market_title_for_ticker(client, intent.ticker)
     market_category = market_category_for_ticker(client, intent.ticker)
+    if intent.action == "buy" and intent.side in ("yes", "no"):
+        max_ask_c = int(round(settings.trade_entry_effective_max_yes_ask_dollars * 100.0))
+        max_ask_c = max(1, min(99, max_ask_c))
+        if intent.yes_price_cents > max_ask_c:
+            log.info(
+                "order_blocked",
+                reason="entry_above_hard_max_yes_ask",
+                ticker=intent.ticker,
+                market_title=market_title,
+                yes_price_cents=intent.yes_price_cents,
+                max_yes_ask_cents=max_ask_c,
+            )
+            record_event(
+                "blocked",
+                reason="entry_above_hard_max_yes_ask",
+                intent=intent,
+                market_title=market_title,
+                market_category=market_category,
+                order_contracts=intent.count,
+            )
+            return
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
 

@@ -377,7 +377,7 @@ def _maybe_rebuy_yes_after_stop_loss(
         log.info("stop_loss_rebuy_skip", ticker=ticker, reason="ticker_substring_blocklist")
         return
 
-    max_ask_cents = int(round(settings.strategy_max_yes_ask_dollars * 100.0))
+    max_ask_cents = int(round(settings.trade_entry_effective_max_yes_ask_dollars * 100.0))
     max_ask_cents = max(1, min(99, max_ask_cents))
 
     ob = get_orderbook(client, ticker)
@@ -727,7 +727,9 @@ def try_auto_sell_exit_for_ticker(
             )
         return "wait", None, None
 
-    count = min(int(signed), settings.max_contracts_per_market)
+    # Exit the full long YES size (share count). Do not cap by MAX_CONTRACTS_PER_MARKET — that limits *entry*
+    # batch size and order-size multiplier scaling, not how many shares we may flatten at one limit price.
+    count = int(signed)
     if count < 1:
         return "zero_contracts", None, None
 

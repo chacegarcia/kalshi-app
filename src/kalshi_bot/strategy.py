@@ -99,6 +99,20 @@ def should_skip_buy_due_to_long_yes_cap(
     return n >= m
 
 
+def should_skip_buy_resolution_too_far(
+    settings: Settings,
+    *,
+    seconds_until_resolution: float | None,
+) -> bool:
+    """Skip buys when the market resolves later than ``TRADE_ENTRY_MAX_SECONDS_UNTIL_RESOLUTION`` (0 = off)."""
+    cap = float(getattr(settings, "trade_entry_max_seconds_until_resolution", 0.0) or 0.0)
+    if cap <= 0.0:
+        return False
+    if seconds_until_resolution is None:
+        return False
+    return float(seconds_until_resolution) > cap
+
+
 def should_skip_buy_theta_decay(
     settings: Settings,
     *,
@@ -187,6 +201,9 @@ def entry_filter_timing_and_event(
         sec_until, ev_t = get_market_entry_timing_and_event(client, ticker)
     else:
         sec_until, ev_t = None, None
+
+    if should_skip_buy_resolution_too_far(settings, seconds_until_resolution=sec_until):
+        return True, "resolution_too_far"
 
     if settings.trade_entry_market_intelligence_enabled and ev_t:
         rows = ensure_event_markets_sorted(client, ev_t, event_data_cache)
@@ -343,7 +360,7 @@ def signal_edge_buy_yes_from_ticker(
     if edge < need:
         return None
 
-    if yes_ask_dollars > settings.strategy_max_yes_ask_dollars:
+    if yes_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
         return None
 
     limit_cents = int(max(1, min(99, round(yes_ask_dollars * 100.0))))
@@ -430,7 +447,7 @@ def signal_edge_buy_no_from_ticker(
     if edge < need:
         return None
 
-    if no_ask_dollars > settings.strategy_max_yes_ask_dollars:
+    if no_ask_dollars > settings.trade_entry_effective_max_yes_ask_dollars:
         return None
 
     limit_cents = int(max(1, min(99, round(no_ask_dollars * 100.0))))
@@ -474,7 +491,7 @@ class SampleSpreadGapStrategy:
             ticker=ticker,
             yes_bid_dollars=bid,
             yes_ask_dollars=ask,
-            max_yes_ask_dollars=self.settings.strategy_max_yes_ask_dollars,
+            max_yes_ask_dollars=self.settings.trade_entry_effective_max_yes_ask_dollars,
             min_spread_dollars=self.settings.strategy_min_spread_dollars,
             probability_gap=self.settings.strategy_probability_gap,
             order_count=self.settings.strategy_order_count,
