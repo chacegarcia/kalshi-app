@@ -786,6 +786,10 @@ _HTML = """<!DOCTYPE html>
     <h2>Open orders</h2>
     <div class="resting-orders" id="restingOrders">Loading…</div>
   </div>
+  <div class="chart-wrap">
+    <h2>Executed bets</h2>
+    <div class="resting-orders" id="betsWrap"><p class="sub" style="margin:0">Loading…</p></div>
+  </div>
   </main>
   </div>
   <script>
@@ -1240,6 +1244,93 @@ _HTML = """<!DOCTYPE html>
         renderRestingOrders({ orders: [], error: 'Could not load resting orders' });
       }
     }
+    function renderBets(bets) {
+      const wrap = document.getElementById('betsWrap');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      if (!bets || !bets.length) {
+        const p = document.createElement('p');
+        p.className = 'sub';
+        p.style.margin = '0';
+        p.textContent = 'No bets recorded yet.';
+        wrap.appendChild(p);
+        return;
+      }
+      const tbl = document.createElement('table');
+      const thead = document.createElement('thead');
+      const hr = document.createElement('tr');
+      ['Time', 'Ticker', 'Market', 'Side', 'Action', 'Qty', 'Price \u00a2', 'Status', 'Order ID'].forEach(function(h) {
+        const th = document.createElement('th');
+        th.textContent = h;
+        hr.appendChild(th);
+      });
+      thead.appendChild(hr);
+      tbl.appendChild(thead);
+      const tb = document.createElement('tbody');
+      for (const b of bets) {
+        const tr = document.createElement('tr');
+        const tdTime = document.createElement('td');
+        tdTime.textContent = b.created_at ? String(b.created_at).replace('T', ' ').slice(0, 19) : '\u2014';
+        const tdTicker = document.createElement('td');
+        tdTicker.innerHTML = '<code>' + String(b.ticker || '') + '</code>';
+        const tdMarket = document.createElement('td');
+        tdMarket.textContent = b.market_title || '\u2014';
+        tdMarket.style.maxWidth = '18rem';
+        tdMarket.style.overflow = 'hidden';
+        tdMarket.style.textOverflow = 'ellipsis';
+        tdMarket.style.whiteSpace = 'nowrap';
+        const tdSide = document.createElement('td');
+        tdSide.textContent = String(b.side || '');
+        const tdAction = document.createElement('td');
+        tdAction.textContent = String(b.action || '');
+        const tdQty = document.createElement('td');
+        tdQty.textContent = b.count != null ? String(b.count) : '\u2014';
+        const tdPrice = document.createElement('td');
+        tdPrice.textContent = b.yes_price_cents != null ? String(b.yes_price_cents) : '\u2014';
+        const tdStatus = document.createElement('td');
+        const st = String(b.status || '');
+        const badge = document.createElement('span');
+        badge.textContent = st;
+        badge.style.padding = '0.1rem 0.45rem';
+        badge.style.borderRadius = '0.25rem';
+        badge.style.fontSize = '0.7rem';
+        badge.style.fontWeight = '600';
+        badge.style.textTransform = 'uppercase';
+        if (st === 'live') {
+          badge.style.background = '#1a3a5c';
+          badge.style.color = '#5bc8f5';
+        } else if (st === 'dry_run') {
+          badge.style.background = '#0d3320';
+          badge.style.color = '#4caf7d';
+        } else if (st === 'error') {
+          badge.style.background = '#3a1a1a';
+          badge.style.color = '#f07070';
+          if (b.error_message) {
+            badge.title = String(b.error_message);
+            badge.style.cursor = 'help';
+            badge.style.textDecoration = 'underline dotted';
+          }
+        }
+        tdStatus.appendChild(badge);
+        const tdOid = document.createElement('td');
+        const oid = b.order_id || b.client_order_id || '\u2014';
+        const oidStr = String(oid);
+        tdOid.innerHTML = '<code style="font-size:0.65rem">' + oidStr.slice(0, 16) + (oidStr.length > 16 ? '\u2026' : '') + '</code>';
+        tdOid.title = oidStr;
+        [tdTime, tdTicker, tdMarket, tdSide, tdAction, tdQty, tdPrice, tdStatus, tdOid].forEach(function(td) {
+          tr.appendChild(td);
+        });
+        tb.appendChild(tr);
+      }
+      tbl.appendChild(tb);
+      wrap.appendChild(tbl);
+    }
+    async function refreshBets() {
+      try {
+        const r = await fetch('/api/bets', { cache: 'no-store' });
+        if (r.ok) { const data = await r.json(); renderBets(data); }
+      } catch (e) { /* SQL may not be configured - silent */ }
+    }
     document.getElementById('sidebarToggle').addEventListener('click', function() {
       document.getElementById('sidebar').classList.toggle('collapsed');
     });
@@ -1519,8 +1610,10 @@ _HTML = """<!DOCTYPE html>
     refreshControl();
     refreshPositions();
     refreshRestingOrders();
+    refreshBets();
     setInterval(poll, POLL_MS);
     setInterval(refreshControl, 8000);
+    setInterval(refreshBets, 15000);
   </script>
 </body>
 </html>"""
@@ -2019,6 +2112,18 @@ def _create_app() -> Any:
             _LOG.exception("api_positions_action_failed ticker=%s action=%s", ticker, action)
             return jsonify({"ok": False, "error": str(exc)}), 500
 
+    @app.get("/api/bets")
+    def api_bets() -> Any:
+        """Bet history from Azure SQL ``python_bets`` table (empty list when SQL not configured)."""
+        from kalshi_bot.config import get_settings as _gs
+
+        s = _gs()
+        if s.sql_connection_string:
+            from kalshi_bot import db as _db_mod
+
+            return jsonify(_db_mod.get_bets(s.sql_connection_string))
+        return jsonify([])
+
     return app
 
 
@@ -2026,6 +2131,14 @@ def start_dashboard(settings: Settings) -> threading.Thread | None:
     """Start Flask in a daemon thread; optionally open the default browser."""
     if not settings.dashboard_enabled:
         return None
+
+    if settings.sql_connection_string:
+        try:
+            from kalshi_bot import db as _db_mod
+
+            _db_mod.ensure_schema(settings.sql_connection_string)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _run() -> None:
         app.run(

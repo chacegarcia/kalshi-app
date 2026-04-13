@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from kalshi_python_sync.models.order import Order
 
+from kalshi_bot import db as _db
 from kalshi_bot.client import KalshiSdkClient, with_rest_retry
 from kalshi_bot.config import Settings
 from kalshi_bot.logger import StructuredLogger
@@ -332,6 +333,20 @@ def execute_intent(
             market_category=market_category,
             order_contracts=intent.count,
         )
+        if settings.sql_connection_string:
+            _db.insert_bet(
+                settings.sql_connection_string,
+                ticker=intent.ticker,
+                side=intent.side,
+                action=intent.action,
+                count=intent.count,
+                yes_price_cents=intent.yes_price_cents,
+                status="dry_run",
+                client_order_id=sim.client_order_id,
+                market_title=market_title,
+                kalshi_env=settings.kalshi_env,
+                dry_run=True,
+            )
         _spacing_after_submitted_buy_yes(settings, intent)
         return
 
@@ -364,7 +379,24 @@ def execute_intent(
         market_category=market_category,
         order_contracts=intent.count,
     )
-    resp = place_limit_order_live(client, intent)
+    try:
+        resp = place_limit_order_live(client, intent)
+    except Exception as _live_exc:
+        if settings.sql_connection_string:
+            _db.insert_bet(
+                settings.sql_connection_string,
+                ticker=intent.ticker,
+                side=intent.side,
+                action=intent.action,
+                count=intent.count,
+                yes_price_cents=intent.yes_price_cents,
+                status="error",
+                error_message=str(_live_exc),
+                market_title=market_title,
+                kalshi_env=settings.kalshi_env,
+                dry_run=False,
+            )
+        raise
     risk.record_order_submitted(intent.count)
     oid = getattr(resp, "order", None)
     order_id = getattr(oid, "order_id", None) if oid is not None else getattr(resp, "order_id", None)
@@ -378,4 +410,18 @@ def execute_intent(
         market_category=market_category,
         order_contracts=intent.count,
     )
+    if settings.sql_connection_string:
+        _db.insert_bet(
+            settings.sql_connection_string,
+            ticker=intent.ticker,
+            side=intent.side,
+            action=intent.action,
+            count=intent.count,
+            yes_price_cents=intent.yes_price_cents,
+            status="live",
+            order_id=str(order_id) if order_id is not None else None,
+            market_title=market_title,
+            kalshi_env=settings.kalshi_env,
+            dry_run=False,
+        )
     _spacing_after_submitted_buy_yes(settings, intent)

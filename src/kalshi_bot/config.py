@@ -497,6 +497,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"),
     )
+    sql_connection_string: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("SQL_CONNECTION_STRING", "sql_connection_string"),
+    )
     trade_llm_auto_execute: bool = Field(
         default=False,
         validation_alias=AliasChoices(
@@ -1773,9 +1777,9 @@ class Settings(BaseSettings):
         s = str(v).strip()
         return s if s else None
 
-    @field_validator("openai_api_key", mode="before")
+    @field_validator("openai_api_key", "sql_connection_string", mode="before")
     @classmethod
-    def _blank_openai_to_none(cls, v: object) -> str | None:
+    def _blank_str_to_none(cls, v: object) -> str | None:
         if v is None:
             return None
         s = str(v).strip()
