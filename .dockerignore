@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.git/
+*.user
+*.suo
+.env
+.env.*
+!.env.azure.example
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
