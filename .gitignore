@@ -15,3 +15,15 @@ logs/
 *.egg-info/
 dist/
 build/
+
+# .NET build output
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.runtimeconfig.dev.json
+publish/
+
