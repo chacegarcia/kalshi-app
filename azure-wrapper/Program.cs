@@ -1365,6 +1365,7 @@ static class DashboardResources
           }
 
           // Time remaining
+          const marketClosed = p.closeTime && (new Date(p.closeTime) - Date.now()) <= 0;
           let timeHtml = '';
           if (p.closeTime) {
             const msLeft = new Date(p.closeTime) - Date.now();
@@ -1388,7 +1389,7 @@ static class DashboardResources
             <div class="pos-meta">
               <span class="pos-badge ${sideClass}">${p.side.toUpperCase()}</span>
               <span class="pos-info">${p.contracts} cts${entry ? ' · ' + entry : ''}${pnl}</span>
-              <button class="btn-sell" onclick='openSell(${JSON.stringify(p)})'>Sell</button>
+              ${marketClosed ? '' : `<button class="btn-sell" onclick='openSell(${JSON.stringify(p)})'>Sell</button>`}
             </div>
             ${payoutHtml}
             ${timeHtml}`;
