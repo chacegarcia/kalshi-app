@@ -545,6 +545,10 @@ _HTML = """<!DOCTYPE html>
     .mini-pos__pl--pos { color: #5ee4a8; }
     .mini-pos__pl--neg { color: #ff8a8a; }
     .mini-pos__pl--zero { color: var(--muted); }
+    .mini-pos__group-hdr { font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; padding: 0.2rem 0.1rem 0.35rem; margin-top: 0.15rem; }
+    .mini-pos__group-hdr--neg { color: #f25151; }
+    .mini-pos__group-hdr--pos { color: #3ecf8e; }
+    .mini-pos__group-hdr--neutral { color: var(--muted); }
     .mini-pos__exit { font-size: 0.68rem; color: #8b9aab; line-height: 1.4; margin: 0.35rem 0 0.2rem; }
     .mini-pos__exit span.tp { color: #6ecf9a; }
     .mini-pos__exit span.sl { color: #f09090; }
@@ -1392,6 +1396,16 @@ _HTML = """<!DOCTYPE html>
         } else if (positionsFilter === 'negative') {
           pos = raw.filter(function(r) { return (r.pnl_sign || '') === 'negative'; });
         }
+        // Sort: losing first (worst first within group), then breakeven/unknown, then winning (best last)
+        const _PNL_ORDER = { negative: 0, unknown: 1, neutral: 2, positive: 3 };
+        pos = pos.slice().sort(function(a, b) {
+          const ao = _PNL_ORDER[a.pnl_sign] != null ? _PNL_ORDER[a.pnl_sign] : 1;
+          const bo = _PNL_ORDER[b.pnl_sign] != null ? _PNL_ORDER[b.pnl_sign] : 1;
+          if (ao !== bo) return ao - bo;
+          const ad = a.unrealized_delta_cents != null ? Number(a.unrealized_delta_cents) : 0;
+          const bd = b.unrealized_delta_cents != null ? Number(b.unrealized_delta_cents) : 0;
+          return ad - bd; // worst (most negative) first within each group
+        });
         const ddGlob = data && data.double_down_enabled;
         const mult = Math.max(1, Number(data && data.order_size_multiplier) || 1);
         if (!raw.length) {
@@ -1410,7 +1424,16 @@ _HTML = """<!DOCTYPE html>
           wrap.appendChild(p);
           return;
         }
+        var _lastGroup = null;
         for (const row of pos) {
+          const _group = (row.pnl_sign === 'positive') ? 'positive' : (row.pnl_sign === 'negative' ? 'negative' : 'neutral');
+          if (_group !== _lastGroup) {
+            _lastGroup = _group;
+            const hdr = document.createElement('div');
+            hdr.className = 'mini-pos__group-hdr mini-pos__group-hdr--' + _group;
+            hdr.textContent = _group === 'negative' ? '\u25bc Losing' : (_group === 'positive' ? '\u25b2 Profitable' : '\u25a0 Breakeven / Unknown');
+            wrap.appendChild(hdr);
+          }
         const card = document.createElement('div');
         card.className = 'mini-pos';
         const sign = row.pnl_sign || 'unknown';
@@ -1524,15 +1547,19 @@ _HTML = """<!DOCTYPE html>
         card.appendChild(r1);
         if (row.entry_yes_cents != null && row.best_yes_bid_cents != null && ud != null && ud !== '') {
           const pl = document.createElement('div');
-          pl.className = 'mini-pos__pl ' + (ud > 0 ? 'mini-pos__pl--pos' : ud < 0 ? 'mini-pos__pl--neg' : 'mini-pos__pl--zero');
-          const sgn = ud > 0 ? '+' : '';
-          pl.textContent = sgn + ud + '¢';
+          const udN = Number(ud);
+          pl.className = 'mini-pos__pl ' + (udN > 0 ? 'mini-pos__pl--pos' : udN < 0 ? 'mini-pos__pl--neg' : 'mini-pos__pl--zero');
+          const sgn = udN > 0 ? '+' : '';
+          const entN = Number(row.entry_yes_cents);
+          const pctN = entN > 0 ? Math.round((udN / entN) * 100) : null;
+          const pctStr = pctN != null ? ' (' + (pctN > 0 ? '+' : '') + pctN + '%)' : '';
+          pl.textContent = sgn + udN + '\u00a2' + pctStr;
           card.appendChild(pl);
         }
         card.appendChild(exitEl);
         card.appendChild(actions);
         wrap.appendChild(card);
-        }
+        } // end for row
       } finally {
         syncPosFilterButtons();
       }

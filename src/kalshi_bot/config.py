@@ -1381,6 +1381,21 @@ class Settings(BaseSettings):
             "(when TRADE_EXIT_HEDGE_LOSER_STOP_BOOST_ENABLED). Capped so effective fraction stays below 1."
         ),
     )
+    trade_scan_down_pct_sell: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        validation_alias=AliasChoices(
+            "TRADE_SCAN_DOWN_PCT_SELL",
+            "trade_scan_down_pct_sell",
+        ),
+        description=(
+            "If > 0: automatically sell a long YES position during each scan pass when the best YES bid "
+            "has fallen this many percent or more below the estimated entry price "
+            "(e.g. 20 = sell when bid ≤ entry − 20% of entry). "
+            "0 = disabled. Works independently of TRADE_EXIT_STOP_LOSS_ENABLED and its fraction."
+        ),
+    )
     trade_exit_trailing_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices(

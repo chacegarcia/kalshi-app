@@ -630,6 +630,14 @@ def _should_fire_exit(
     ):
         return True, "stop_loss_entry_fraction"
 
+    # 4) Scan down-percentage stop — independent of the fraction-based stop-loss enable flag.
+    #    Fires when bid has dropped by at least TRADE_SCAN_DOWN_PCT_SELL % below entry.
+    _down_pct = float(getattr(settings, "trade_scan_down_pct_sell", 0.0) or 0.0)
+    if _down_pct > 0 and entry_ref_cents is not None and 1 <= entry_ref_cents <= 99:
+        _down_floor = max(1, min(99, int(math.ceil(entry_ref_cents * (1.0 - _down_pct / 100.0) - 1e-9))))
+        if best_bid_cents <= _down_floor:
+            return True, "scan_down_pct_stop"
+
     if settings.trade_exit_only_profit_margin:
         if (
             skipped_suspect_stop
