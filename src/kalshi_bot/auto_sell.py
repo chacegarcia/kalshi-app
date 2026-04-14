@@ -69,6 +69,8 @@ from kalshi_bot.portfolio import (
     fetch_portfolio_snapshot,
     get_market_position_row,
 )
+from kalshi_bot.confirmed_bets_db import close_bet_for_ticker
+from kalshi_bot.position_scale import clear_state, run_position_scale_tick
 from kalshi_bot.monitor import notify_auto_sell_outcome
 from kalshi_bot.risk import RiskManager
 from kalshi_bot.strategy import should_skip_buy_ticker_substrings, skip_buy_yes_longshot
@@ -907,6 +909,9 @@ def try_auto_sell_exit_for_ticker(
         exit_reason=reason,
         note="vs portfolio entry estimate; taker fees approximated; IOC may partially fill",
     )
+    if settings.trade_scale_manage_enabled:
+        clear_state(settings, ticker)
+
     notify_auto_sell_outcome(
         settings,
         gross_profit_cents=gross_cents,
@@ -928,6 +933,14 @@ def try_auto_sell_exit_for_ticker(
             "note": "vs portfolio entry estimate; taker fees approximated; IOC may partially fill",
         },
     )
+    if settings.trade_master_enabled and pnl_outcome in ("win", "loss", "breakeven"):
+        close_bet_for_ticker(
+            settings,
+            ticker=ticker,
+            outcome=pnl_outcome,
+            pnl_cents=net_cents if net_cents is not None else float(gross_cents or 0),
+            exit_reason=reason,
+        )
     _maybe_rebuy_yes_after_stop_loss(
         client=client,
         settings=settings,
@@ -974,6 +987,19 @@ def auto_sell_scan_all_long_yes(
     sold = 0
     lines: list[str] = []
     for ticker in tickers:
+        er_ps = _resolve_entry_reference(settings, client, ticker, log)
+        try:
+            run_position_scale_tick(
+                client,
+                settings,
+                risk,
+                ledger,
+                log,
+                ticker,
+                entry_yes_cents=er_ps.cents,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("position_scale_tick_error", ticker=ticker, error=str(exc))
         tag, summary, exit_reason = try_auto_sell_exit_for_ticker(
             client,
             settings,
@@ -1075,6 +1101,19 @@ def run_auto_sell_loop(
 
     while max_cycles == 0 or cycle < max_cycles:
         cycle += 1
+        er_loop = _resolve_entry_reference(settings, client, ticker, log)
+        try:
+            run_position_scale_tick(
+                client,
+                settings,
+                risk,
+                ledger,
+                log,
+                ticker,
+                entry_yes_cents=er_loop.cents,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("position_scale_tick_error", ticker=ticker, error=str(exc))
         tag, _summary, _reason = try_auto_sell_exit_for_ticker(
             client,
             settings,

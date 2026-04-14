@@ -725,6 +725,8 @@ def run_llm_opportunity_pipeline(
                                 count=cnt,
                                 yes_price_cents=mintent.yes_price_cents,
                                 double_down=False,
+                                master_net_edge=None,
+                                master_source="llm_momentum_bypass",
                             )
                             log.info("llm_trade_momentum_bypass", ticker=ticker, detail=mwhy, count=cnt)
                             print(f"llm-trade: {ticker} momentum bypass — {mwhy}", flush=True)
@@ -903,6 +905,13 @@ def run_llm_opportunity_pipeline(
                     )
                     continue
     
+                master_ne: float | None = None
+                if entry_side == "yes":
+                    master_ne = net_edge_buy_yes_long(
+                        fair_yes=verdict.fair_yes,
+                        yes_ask_dollars=yes_ask_d,
+                        contracts=contracts_for_fee,
+                    )
                 intent = make_limit_intent(
                     ticker=ticker,
                     side=entry_side,
@@ -910,6 +919,8 @@ def run_llm_opportunity_pipeline(
                     count=count,
                     yes_price_cents=limit_c,
                     double_down=is_double_down,
+                    master_net_edge=master_ne,
+                    master_source="llm_trade",
                 )
     
                 if not execute:

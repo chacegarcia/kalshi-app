@@ -1180,6 +1180,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit price in cents (default: STRATEGY_LIMIT_PRICE_CENTS)",
     )
 
+    sub.add_parser(
+        "master-status",
+        help="Print master bot bet-ledger stats (SQLite rolling win rate, DB path; TRADE_MASTER_*)",
+    )
+
     sub.add_parser("cancel-all", help="Cancel all resting orders")
 
     sa = sub.add_parser(
@@ -1498,6 +1503,12 @@ def main(argv: list[str] | None = None) -> None:
                 max_cycles=args.max_cycles,
                 once=args.once,
             )
+        elif cmd == "master-status":
+            from kalshi_bot.confirmed_bets_db import export_summary
+
+            import json
+
+            print(json.dumps(export_summary(settings), indent=2))
         elif cmd == "cancel-all":
             cmd_cancel_all(settings)
         elif cmd == "sell-all":

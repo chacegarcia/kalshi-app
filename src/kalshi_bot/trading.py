@@ -36,6 +36,9 @@ def make_limit_intent(
     yes_price_cents: int,
     time_in_force: str = "good_till_canceled",
     double_down: bool = False,
+    master_net_edge: float | None = None,
+    master_source: str = "",
+    position_scale_addon: bool = False,
 ) -> TradeIntent:
     """Build a limit order intent for ``execute_intent`` / ``trade_execute``."""
     return TradeIntent(
@@ -46,6 +49,9 @@ def make_limit_intent(
         yes_price_cents=yes_price_cents,
         time_in_force=time_in_force,
         double_down=double_down,
+        master_net_edge=master_net_edge,
+        master_source=master_source,
+        position_scale_addon=position_scale_addon,
     )
 
 

@@ -436,6 +436,232 @@ class Settings(BaseSettings):
         description="After each submitted buy YES (dry-run or live), sleep this many seconds. 0 = off.",
     )
 
+    # --- Master bot: rolling win-rate target, 30–90¢ band, scaled size 1–100, SQLite bet ledger ---
+    trade_master_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_MASTER_ENABLED", "trade_master_enabled"),
+        description=(
+            "When true: enforce master YES-ask band, optional rolling win-rate gate, scale contracts by history+edge. "
+            "No market guarantees 75%% — this uses realized closed trades in TRADE_MASTER_DB_PATH."
+        ),
+    )
+    trade_master_db_path: str = Field(
+        default="",
+        validation_alias=AliasChoices("TRADE_MASTER_DB_PATH", "trade_master_db_path"),
+        description="SQLite path for confirmed_bets (default: data/master_bets.sqlite under project root).",
+    )
+    trade_master_target_win_rate: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("TRADE_MASTER_TARGET_WIN_RATE", "trade_master_target_win_rate"),
+        description="Rolling historical win-rate target vs last N closed trades (win|loss only).",
+    )
+    trade_master_min_closed_bets: int = Field(
+        default=20,
+        ge=0,
+        validation_alias=AliasChoices("TRADE_MASTER_MIN_CLOSED_BETS", "trade_master_min_closed_bets"),
+        description="Require this many closed rows in DB before applying win-rate gate / full scaling (cold-start uses TRADE_MASTER_COLD_START_MAX_CONTRACTS).",
+    )
+    trade_master_rolling_window: int = Field(
+        default=50,
+        ge=1,
+        le=10_000,
+        validation_alias=AliasChoices("TRADE_MASTER_ROLLING_WINDOW", "trade_master_rolling_window"),
+        description="Last N closed bets (win/loss) for rolling win rate.",
+    )
+    trade_master_max_contracts_cap: int = Field(
+        default=100,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices("TRADE_MASTER_MAX_CONTRACTS_CAP", "trade_master_max_contracts_cap"),
+        description="Upper bound for master scaling (also clipped by balance/risk max contracts). Env clamped 1–100.",
+    )
+    trade_master_yes_ask_min_cents: int = Field(
+        default=30,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices("TRADE_MASTER_YES_ASK_MIN_CENTS", "trade_master_yes_ask_min_cents"),
+        description="Master-only: minimum implied YES ask (¢) for buy YES when master enabled.",
+    )
+    trade_master_yes_ask_max_cents: int = Field(
+        default=90,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices("TRADE_MASTER_YES_ASK_MAX_CENTS", "trade_master_yes_ask_max_cents"),
+        description="Master-only: maximum implied YES ask (¢) for buy YES when master enabled.",
+    )
+    trade_master_hard_block_below_target: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_MASTER_HARD_BLOCK_BELOW_TARGET",
+            "trade_master_hard_block_below_target",
+        ),
+        description="If true and rolling win rate < target (after min closed bets): block new buy YES.",
+    )
+    trade_master_cold_start_max_contracts: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "TRADE_MASTER_COLD_START_MAX_CONTRACTS",
+            "trade_master_cold_start_max_contracts",
+        ),
+        description="Cap contracts until TRADE_MASTER_MIN_CLOSED_BETS history exists.",
+    )
+    trade_master_edge_scale_coeff: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=100.0,
+        validation_alias=AliasChoices("TRADE_MASTER_EDGE_SCALE_COEFF", "trade_master_edge_scale_coeff"),
+        description="Maps net edge (after fees) into [0,1] for sizing blend.",
+    )
+    trade_master_weight_win_rate: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("TRADE_MASTER_WEIGHT_WIN_RATE", "trade_master_weight_win_rate"),
+    )
+    trade_master_weight_edge: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("TRADE_MASTER_WEIGHT_EDGE", "trade_master_weight_edge"),
+    )
+    trade_master_weight_ask_favorite: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("TRADE_MASTER_WEIGHT_ASK_FAVORITE", "trade_master_weight_ask_favorite"),
+        description="Favors higher YES asks within the master band (larger when ask is closer to band max).",
+    )
+    trade_master_record_dry_run: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_MASTER_RECORD_DRY_RUN", "trade_master_record_dry_run"),
+        description="If true, insert open rows into master DB on DRY_RUN submits (default: live only).",
+    )
+    trade_master_apply_contract_scaling: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRADE_MASTER_APPLY_CONTRACT_SCALING",
+            "trade_master_apply_contract_scaling",
+        ),
+        description=(
+            "When false (with TRADE_MASTER_ENABLED): still enforce band + rolling win-rate gate, but do not change "
+            "contract count — use with TRADE_SCALE_MANAGE_ENABLED for probe→pyramid sizing."
+        ),
+    )
+
+    # --- Position scale: probe entry, add on strength, partial avg-down + recovery exit (see position_scale.py) ---
+    trade_scale_manage_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRADE_SCALE_MANAGE_ENABLED", "trade_scale_manage_enabled"),
+        description=(
+            "When true: optional first-entry probe size, REST loop can pyramid winners / small avg-down losers "
+            "and flatten if bid does not recover (requires portfolio entry estimate for marks)."
+        ),
+    )
+    trade_scale_state_db_path: str = Field(
+        default="",
+        validation_alias=AliasChoices("TRADE_SCALE_STATE_DB_PATH", "trade_scale_state_db_path"),
+        description="SQLite path for position_scale_state (default: data/position_scale.sqlite).",
+    )
+    trade_scale_probe_contracts: int = Field(
+        default=0,
+        ge=0,
+        le=99,
+        validation_alias=AliasChoices("TRADE_SCALE_PROBE_CONTRACTS", "trade_scale_probe_contracts"),
+        description=(
+            "When TRADE_SCALE_MANAGE_ENABLED and >0: cap **new** long-YES entries (flat ticker) to this many "
+            "contracts before session multiplier. 0 = no probe cap."
+        ),
+    )
+    trade_scale_max_position_contracts: int = Field(
+        default=100,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "TRADE_SCALE_MAX_POSITION_CONTRACTS",
+            "trade_scale_max_position_contracts",
+        ),
+        description="Ceiling for total YES contracts when adding via position-scale buys (add-on intents).",
+    )
+    trade_scale_cooldown_seconds: float = Field(
+        default=120.0,
+        ge=0.0,
+        validation_alias=AliasChoices("TRADE_SCALE_COOLDOWN_SECONDS", "trade_scale_cooldown_seconds"),
+        description="Minimum seconds between scale-up / avg-down actions per ticker.",
+    )
+    trade_scale_up_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("TRADE_SCALE_UP_ENABLED", "trade_scale_up_enabled"),
+    )
+    trade_scale_up_min_mark_vs_entry_cents: float = Field(
+        default=3.0,
+        validation_alias=AliasChoices(
+            "TRADE_SCALE_UP_MIN_MARK_VS_ENTRY_CENTS",
+            "trade_scale_up_min_mark_vs_entry_cents",
+        ),
+        description="Require (best YES bid − entry) ≥ this to pyramid (winner path).",
+    )
+    trade_scale_up_add_contracts: int = Field(
+        default=2,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices("TRADE_SCALE_UP_ADD_CONTRACTS", "trade_scale_up_add_contracts"),
+    )
+    trade_scale_up_max_steps: int = Field(
+        default=10,
+        ge=0,
+        le=500,
+        validation_alias=AliasChoices("TRADE_SCALE_UP_MAX_STEPS", "trade_scale_up_max_steps"),
+        description="Max pyramid add orders per ticker (lifetime in DB until cleared).",
+    )
+    trade_scale_avg_down_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("TRADE_SCALE_AVG_DOWN_ENABLED", "trade_scale_avg_down_enabled"),
+    )
+    trade_scale_avg_down_min_loss_mark_cents: float = Field(
+        default=3.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "TRADE_SCALE_AVG_DOWN_MIN_LOSS_MARK_CENTS",
+            "trade_scale_avg_down_min_loss_mark_cents",
+        ),
+        description="If (best bid − entry) ≤ −this, consider a small avg-down buy (loser path).",
+    )
+    trade_scale_avg_down_contracts: int = Field(
+        default=1,
+        ge=1,
+        le=99,
+        validation_alias=AliasChoices("TRADE_SCALE_AVG_DOWN_CONTRACTS", "trade_scale_avg_down_contracts"),
+    )
+    trade_scale_avg_down_max_rounds: int = Field(
+        default=3,
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices("TRADE_SCALE_AVG_DOWN_MAX_ROUNDS", "trade_scale_avg_down_max_rounds"),
+    )
+    trade_scale_recovery_wait_seconds: float = Field(
+        default=3600.0,
+        ge=1.0,
+        validation_alias=AliasChoices(
+            "TRADE_SCALE_RECOVERY_WAIT_SECONDS",
+            "trade_scale_recovery_wait_seconds",
+        ),
+        description="After avg-down: if mark does not clear by this deadline, flatten (recovery exit).",
+    )
+    trade_scale_recovery_clear_min_mark_vs_entry_cents: float = Field(
+        default=-1.0,
+        ge=-50.0,
+        le=50.0,
+        validation_alias=AliasChoices(
+            "TRADE_SCALE_RECOVERY_CLEAR_MIN_MARK_VS_ENTRY_CENTS",
+            "trade_scale_recovery_clear_min_mark_vs_entry_cents",
+        ),
+        description="Clear recovery watch when (best bid − entry) ≥ this (e.g. −1 = within 1¢ of breakeven).",
+    )
+
     # --- Edge-aware entry (fair value vs market + Kalshi taker fee curve) ---
     trade_fair_yes_prob: float | None = Field(
         default=None,

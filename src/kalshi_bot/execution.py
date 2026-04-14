@@ -11,7 +11,9 @@ from kalshi_python_sync.models.order import Order
 
 from kalshi_bot import db as _db
 from kalshi_bot.client import KalshiSdkClient, with_rest_retry
+from kalshi_bot.confirmed_bets_db import insert_open_bet
 from kalshi_bot.config import Settings
+from kalshi_bot.master_bot import apply_master_bot_to_intent
 from kalshi_bot.logger import StructuredLogger
 from kalshi_bot.market_data import market_category_for_ticker, market_title_for_ticker
 from kalshi_bot.monitor import record_event
@@ -192,10 +194,26 @@ def execute_intent(
     snap = fetch_portfolio_snapshot(client, ticker=intent.ticker)
     risk.record_balance_sample(snap.balance_cents)
 
+    if (
+        int(settings.trade_scale_probe_contracts) >= 1
+        and settings.trade_scale_manage_enabled
+        and intent.action == "buy"
+        and intent.side == "yes"
+        and not bool(getattr(intent, "double_down", False))
+        and not bool(getattr(intent, "position_scale_addon", False))
+    ):
+        signed0 = float(snap.positions_by_ticker.get(intent.ticker, 0.0))
+        if signed0 <= 0:
+            cap = int(settings.trade_scale_probe_contracts)
+            if cap >= 1:
+                intent = replace(intent, count=min(int(intent.count), cap))
+
     min_n = settings.trade_min_order_notional_usd
     max_n = settings.trade_max_order_notional_usd
     if intent.action == "buy" and intent.side in ("yes", "no"):
-        dd_buy = bool(getattr(intent, "double_down", False))
+        dd_buy = bool(getattr(intent, "double_down", False)) or (
+            bool(getattr(intent, "position_scale_addon", False)) and settings.trade_scale_manage_enabled
+        )
         min_n, max_n = next_buy_yes_notional_min_max(
             settings,
             balance_cents=snap.balance_cents,
@@ -214,6 +232,40 @@ def execute_intent(
                 sweep=settings.trade_notional_sweep_usd,
             )
 
+    max_exp = effective_max_exposure_cents(settings, snap.balance_cents)
+    max_c = effective_max_contracts(
+        settings, balance_cents=snap.balance_cents, yes_price_cents=intent.yes_price_cents
+    )
+    if intent.action == "buy" and intent.side == "yes":
+        signed_dd = float(snap.positions_by_ticker.get(intent.ticker, 0.0))
+        if signed_dd > 0:
+            if getattr(intent, "double_down", False) and settings.trade_double_down_enabled:
+                max_c = max(max_c, int(settings.trade_double_down_max_position_contracts))
+            if getattr(intent, "position_scale_addon", False) and settings.trade_scale_manage_enabled:
+                max_c = max(max_c, int(settings.trade_scale_max_position_contracts))
+
+    if intent.action == "buy" and intent.side == "yes":
+        adjusted = apply_master_bot_to_intent(
+            settings, intent, log=log, max_contracts_from_risk=max_c
+        )
+        if adjusted is None:
+            log.info(
+                "order_blocked",
+                reason="master_bot_gate",
+                ticker=intent.ticker,
+                market_title=market_title,
+            )
+            record_event(
+                "blocked",
+                reason="master_bot_gate",
+                intent=intent,
+                market_title=market_title,
+                market_category=market_category,
+                order_contracts=intent.count,
+            )
+            return
+        intent = adjusted
+
     capped = cap_buy_yes_count_for_notional(
         intent.count,
         yes_price_cents=intent.yes_price_cents,
@@ -224,19 +276,6 @@ def execute_intent(
     if capped != intent.count:
         intent = replace(intent, count=capped)
 
-    max_exp = effective_max_exposure_cents(settings, snap.balance_cents)
-    max_c = effective_max_contracts(
-        settings, balance_cents=snap.balance_cents, yes_price_cents=intent.yes_price_cents
-    )
-    if (
-        intent.action == "buy"
-        and intent.side == "yes"
-        and getattr(intent, "double_down", False)
-        and settings.trade_double_down_enabled
-    ):
-        signed = float(snap.positions_by_ticker.get(intent.ticker, 0.0))
-        if signed > 0:
-            max_c = max(max_c, int(settings.trade_double_down_max_position_contracts))
     # Balance-based contract cap is for *buys* only. Applying it to sells incorrectly
     # shrinks exit size to a per-trade cash budget unrelated to contracts held.
     if intent.action == "buy" and intent.count > max_c:
@@ -347,6 +386,17 @@ def execute_intent(
                 kalshi_env=settings.kalshi_env,
                 dry_run=True,
             )
+        if settings.trade_master_enabled and settings.trade_master_record_dry_run:
+            insert_open_bet(
+                settings,
+                ticker=intent.ticker,
+                side="yes",
+                entry_yes_cents=intent.yes_price_cents,
+                contracts=intent.count,
+                net_edge=intent.master_net_edge,
+                source=intent.master_source or "execute",
+                extra={"dry_run": True, "simulated_client_order_id": sim.client_order_id},
+            )
         _spacing_after_submitted_buy_yes(settings, intent)
         return
 
@@ -423,5 +473,16 @@ def execute_intent(
             market_title=market_title,
             kalshi_env=settings.kalshi_env,
             dry_run=False,
+        )
+    if settings.trade_master_enabled and intent.action == "buy" and intent.side == "yes":
+        insert_open_bet(
+            settings,
+            ticker=intent.ticker,
+            side="yes",
+            entry_yes_cents=intent.yes_price_cents,
+            contracts=intent.count,
+            net_edge=intent.master_net_edge,
+            source=intent.master_source or "execute",
+            extra={"order_id": order_id, "live": True},
         )
     _spacing_after_submitted_buy_yes(settings, intent)

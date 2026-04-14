@@ -252,6 +252,11 @@ class TradeIntent:
     time_in_force: str = "good_till_canceled"
     # If true: allow buy-YES to reach TRADE_DOUBLE_DOWN_MAX_POSITION_CONTRACTS (add-on to existing long).
     double_down: bool = False
+    # Master bot / learning DB: net edge (after fees) used for sizing; source tag for SQLite ledger.
+    master_net_edge: float | None = None
+    master_source: str = ""
+    # Position-scale manager add-on buys (pyramid / avg-down); raises per-market cap like double_down.
+    position_scale_addon: bool = False
 
 
 def signed_position_delta(intent: TradeIntent) -> float:
