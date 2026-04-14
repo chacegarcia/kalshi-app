@@ -530,7 +530,11 @@ app.MapGet("/api/positions", async (DashboardStore store, CancellationToken ct) 
                 ? (delta.Value > 0 ? "positive" : delta.Value < 0 ? "negative" : "neutral")
                 : "unknown";
 
-            var (closeTime, title, url) = store.GetMarketInfo(p.Ticker ?? "");
+            var (storeClose, storeTitle, storeUrl) = store.GetMarketInfo(p.Ticker ?? "");
+            // Fall back to live market data when the scanner hasn't cached this ticker yet
+            var closeTime = storeClose ?? mkt?.CloseTime;
+            var title     = storeTitle ?? mkt?.Title;
+            var url       = storeUrl   ?? mkt?.KalshiUrl;
             return new PositionDto(
                 p.Ticker ?? "",
                 side,
