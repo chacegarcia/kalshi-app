@@ -352,6 +352,7 @@ app.MapPost("/api/controls", async (HttpRequest req, DashboardStore store) =>
         NearFiftyMarginCents  = body.NearFiftyMarginCents  ?? cur.NearFiftyMarginCents,
         MinPayoutMarginCents  = body.MinPayoutMarginCents  ?? cur.MinPayoutMarginCents,
         MaxOpenPositions      = body.MaxOpenPositions      ?? cur.MaxOpenPositions,
+        StopLossDownPct       = body.StopLossDownPct       ?? cur.StopLossDownPct,
     };
     store.SetControls(updated);
     return Results.Json(updated);
@@ -499,30 +500,55 @@ app.MapGet("/api/positions", async (DashboardStore store, CancellationToken ct) 
             settings.KalshiApiKeyId, settings.KalshiPrivateKeyPath, settings.KalshiPrivateKeyPem);
         using var client = new KalshiRestClient(settings.RestBaseUrl, auth);
         var resp = await client.GetPositionsAsync(countFilter: "position", limit: 500, ct: ct);
-        var dtos = resp.MarketPositions
+        var nonZero = resp.MarketPositions
             .Where(p => p.Position is not null && Math.Abs(p.Position.Value) >= 0.5)
-            .Select(p =>
-            {
-                var contracts = (int)Math.Round(Math.Abs(p.Position!.Value));
-                var side      = p.Position.Value > 0 ? "yes" : "no";
-                int? estEntry = null;
-                if (p.TotalTraded.HasValue && contracts > 0)
-                    estEntry = Math.Clamp(
-                        (int)Math.Round(p.TotalTraded.Value / contracts * 100), 1, 99);
-                var (closeTime, title, url) = store.GetMarketInfo(p.Ticker ?? "");
-                return new PositionDto(
-                    p.Ticker ?? "",
-                    side,
-                    contracts,
-                    estEntry,
-                    Math.Round(p.MarketExposure ?? 0, 4),
-                    Math.Round(p.RealizedPnl    ?? 0, 4),
-                    closeTime?.ToString("o"),
-                    title,
-                    url);
-            })
-            .OrderByDescending(p => p.Contracts)
             .ToList();
+
+        // Fetch live market bid for each position concurrently (best-effort)
+        var marketTasks = nonZero.Select(p =>
+            client.GetMarketAsync(p.Ticker ?? "", ct)
+                  .ContinueWith(t => t.IsCompletedSuccessfully ? t.Result : null,
+                                TaskContinuationOptions.None));
+        var markets = await Task.WhenAll(marketTasks);
+
+        var dtos = nonZero.Select((p, i) =>
+        {
+            var contracts = (int)Math.Round(Math.Abs(p.Position!.Value));
+            var side      = p.Position.Value > 0 ? "yes" : "no";
+            int? estEntry = null;
+            if (p.TotalTraded.HasValue && contracts > 0)
+                estEntry = Math.Clamp(
+                    (int)Math.Round(p.TotalTraded.Value / contracts * 100), 1, 99);
+
+            var mkt = markets[i]?.Market;
+            int? currentBid = mkt?.YesBid ?? mkt?.YesBidFromNo;
+
+            int? delta = (estEntry.HasValue && currentBid.HasValue)
+                ? currentBid.Value - estEntry.Value
+                : null;
+            var pnlSign = delta.HasValue
+                ? (delta.Value > 0 ? "positive" : delta.Value < 0 ? "negative" : "neutral")
+                : "unknown";
+
+            var (closeTime, title, url) = store.GetMarketInfo(p.Ticker ?? "");
+            return new PositionDto(
+                p.Ticker ?? "",
+                side,
+                contracts,
+                estEntry,
+                Math.Round(p.MarketExposure ?? 0, 4),
+                Math.Round(p.RealizedPnl    ?? 0, 4),
+                closeTime?.ToString("o"),
+                title,
+                url,
+                currentBid,
+                delta,
+                pnlSign);
+        })
+        .OrderBy(p => p.PnlSign == "negative" ? 0 : p.PnlSign == "unknown" ? 1 : p.PnlSign == "neutral" ? 2 : 3)
+        .ThenBy(p => p.UnrealizedDeltaCents ?? 0)
+        .ToList();
+
         return Results.Json(dtos);
     }
     catch (KalshiApiException ex)
@@ -579,15 +605,18 @@ await app.RunAsync();
 // ── DTO for partial-update POST /api/controls ─────────────────────────────────
 
 record PositionDto(
-    [property: JsonPropertyName("ticker")]        string  Ticker,
-    [property: JsonPropertyName("side")]          string  Side,
-    [property: JsonPropertyName("contracts")]     int     Contracts,
-    [property: JsonPropertyName("estEntryCents")] int?    EstEntryCents,
-    [property: JsonPropertyName("marketExposure")]double  MarketExposure,
-    [property: JsonPropertyName("realizedPnl")]   double  RealizedPnl,
-    [property: JsonPropertyName("closeTime")]     string? CloseTime,
-    [property: JsonPropertyName("title")]         string? Title,
-    [property: JsonPropertyName("url")]           string? Url
+    [property: JsonPropertyName("ticker")]              string  Ticker,
+    [property: JsonPropertyName("side")]                string  Side,
+    [property: JsonPropertyName("contracts")]           int     Contracts,
+    [property: JsonPropertyName("estEntryCents")]       int?    EstEntryCents,
+    [property: JsonPropertyName("marketExposure")]      double  MarketExposure,
+    [property: JsonPropertyName("realizedPnl")]         double  RealizedPnl,
+    [property: JsonPropertyName("closeTime")]           string? CloseTime,
+    [property: JsonPropertyName("title")]               string? Title,
+    [property: JsonPropertyName("url")]                 string? Url,
+    [property: JsonPropertyName("currentBidCents")]     int?    CurrentBidCents,
+    [property: JsonPropertyName("unrealizedDeltaCents")]int?    UnrealizedDeltaCents,
+    [property: JsonPropertyName("pnlSign")]             string  PnlSign
 );
 
 record ExecuteOrderDto(
@@ -606,7 +635,8 @@ record BotControlsDto(
     [property: JsonPropertyName("maxHoursToClose")]      double? MaxHoursToClose,
     [property: JsonPropertyName("nearFiftyMarginCents")]  int?    NearFiftyMarginCents,
     [property: JsonPropertyName("minPayoutMarginCents")]  int?    MinPayoutMarginCents,
-    [property: JsonPropertyName("maxOpenPositions")]      int?    MaxOpenPositions
+    [property: JsonPropertyName("maxOpenPositions")]      int?    MaxOpenPositions,
+    [property: JsonPropertyName("stopLossDownPct")]       double? StopLossDownPct
 );
 
 // ── Dashboard HTML ────────────────────────────────────────────────────────────
@@ -869,8 +899,18 @@ static class DashboardResources
     .sidebar-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1rem; padding: 0; }
     .sidebar-close:hover { color: var(--text); }
     .sidebar-body { overflow-y: auto; flex: 1; padding: 0.5rem 0; }
+    .pos-group-hdr { padding: 0.3rem 1rem 0.2rem; font-size: 0.63rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; }
+    .pos-group-hdr--neg { color: var(--err); }
+    .pos-group-hdr--pos { color: var(--ok); }
+    .pos-group-hdr--neutral { color: var(--muted); }
     .pos-row { padding: 0.55rem 1rem; border-bottom: 1px solid var(--border); }
+    .pos-row--neg { background: rgba(242,81,81,0.05); }
+    .pos-row--pos { background: rgba(62,207,142,0.05); }
     .pos-row:last-child { border-bottom: none; }
+    .pos-pnl { font-size: 0.72rem; font-weight: 600; margin-top: 0.2rem; font-variant-numeric: tabular-nums; }
+    .pnl-pos  { color: var(--ok); }
+    .pnl-neg  { color: var(--err); }
+    .pnl-zero { color: var(--muted); }
     .pos-ticker { font-size: 0.78rem; color: var(--text); display: block;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       cursor: default; line-height: 1.3; }
@@ -1064,6 +1104,10 @@ static class DashboardResources
         <div class="ctrl-group">
           <label>Max open positions (0 = unlimited)</label>
           <input type="number" id="ctrl-maxpos" min="0" max="1000" oninput="markDirty()"/>
+        </div>
+        <div class="ctrl-group">
+          <label>Stop-loss: sell if position down % from entry (0 = off)</label>
+          <input type="number" id="ctrl-stopdown" min="0" max="100" step="1" oninput="markDirty()" placeholder="e.g. 20"/>
         </div>
       </div>
     </div>
@@ -1344,14 +1388,36 @@ static class DashboardResources
           return;
         }
         list.innerHTML = '';
+        // Positions arrive pre-sorted from the API (negative first); insert section headers
+        let lastGroup = null;
         for (const p of positions) {
+          const group = p.pnlSign === 'negative' ? 'negative' : p.pnlSign === 'positive' ? 'positive' : 'neutral';
+          if (group !== lastGroup) {
+            lastGroup = group;
+            const hdr = document.createElement('div');
+            hdr.className = 'pos-group-hdr pos-group-hdr--' + group;
+            hdr.textContent = group === 'negative' ? '▼ Losing' : group === 'positive' ? '▲ Profitable' : '■ Breakeven / Unknown';
+            list.appendChild(hdr);
+          }
+
           const row = document.createElement('div');
-          row.className = 'pos-row';
+          row.className = 'pos-row' + (p.pnlSign === 'negative' ? ' pos-row--neg' : p.pnlSign === 'positive' ? ' pos-row--pos' : '');
           const sideClass = p.side === 'yes' ? 'pos-badge-yes' : 'pos-badge-no';
           const entry = p.estEntryCents != null ? `entry ~${p.estEntryCents}¢` : '';
           const pnl   = p.realizedPnl  !== 0   ? ` · PnL $${p.realizedPnl.toFixed(2)}` : '';
 
-          // Cost + payout if win: entry × contracts spent, profit = (100 − entry) × contracts
+          // Unrealized P&L line
+          let pnlLine = '';
+          if (p.currentBidCents != null && p.estEntryCents != null && p.unrealizedDeltaCents != null) {
+            const ud  = p.unrealizedDeltaCents;
+            const pct = p.estEntryCents > 0 ? Math.round((ud / p.estEntryCents) * 100) : null;
+            const sgn = ud > 0 ? '+' : '';
+            const pctStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct}%)` : '';
+            const cls = ud > 0 ? 'pnl-pos' : ud < 0 ? 'pnl-neg' : 'pnl-zero';
+            pnlLine = `<div class="pos-pnl ${cls}">${sgn}${ud}¢${pctStr} · bid ${p.currentBidCents}¢</div>`;
+          }
+
+          // Cost + payout if win
           let payoutHtml = '';
           if (p.estEntryCents != null) {
             const costCents   = p.estEntryCents * p.contracts;
@@ -1391,6 +1457,7 @@ static class DashboardResources
               <span class="pos-info">${p.contracts} cts${entry ? ' · ' + entry : ''}${pnl}</span>
               ${marketClosed ? '' : `<button class="btn-sell" onclick='openSell(${JSON.stringify(p)})'>Sell</button>`}
             </div>
+            ${pnlLine}
             ${payoutHtml}
             ${timeHtml}`;
           list.appendChild(row);
@@ -1571,6 +1638,7 @@ static class DashboardResources
         document.getElementById('ctrl-margin').value    = c.nearFiftyMarginCents;
         document.getElementById('ctrl-minpayout').value = c.minPayoutMarginCents ?? 0;
         document.getElementById('ctrl-maxpos').value    = c.maxOpenPositions;
+        document.getElementById('ctrl-stopdown').value  = c.stopLossDownPct ?? 0;
         document.getElementById('exec-warning').style.display = c.executeEnabled ? '' : 'none';
         scanInterval = c.scanIntervalSeconds || 120;
         dirty = false;
@@ -1588,6 +1656,7 @@ static class DashboardResources
         nearFiftyMarginCents:  +document.getElementById('ctrl-margin').value,
         minPayoutMarginCents:  +document.getElementById('ctrl-minpayout').value,
         maxOpenPositions:      +document.getElementById('ctrl-maxpos').value,
+        stopLossDownPct:       +document.getElementById('ctrl-stopdown').value,
       };
       try {
         await fetch('/api/controls', {

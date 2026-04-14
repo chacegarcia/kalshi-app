@@ -403,6 +403,115 @@ public sealed class BotRunnerService : BackgroundService
         {
             _log.LogWarning(ex, "[portfolio] Could not fetch portfolio snapshot");
         }
+
+        // ── 8. Sell positions that are down by the configured stop-loss % ─────
+        await ScanAndSellDownPositionsAsync(client, controls, settings, ct);
+    }
+
+    /// <summary>
+    /// For each long YES position, fetches the current best YES bid from Kalshi and
+    /// places an immediate sell if the bid has fallen by at least
+    /// <see cref="BotControls.StopLossDownPct"/> percent below the estimated entry price.
+    /// Does nothing when <c>StopLossDownPct</c> is 0 or execute is disabled.
+    /// </summary>
+    private async Task ScanAndSellDownPositionsAsync(
+        KalshiRestClient client,
+        BotControls controls,
+        TradingSettings settings,
+        CancellationToken ct)
+    {
+        if (controls.StopLossDownPct <= 0) return;
+        if (!controls.ExecuteEnabled && !settings.DryRun) return;
+
+        GetPositionsResponse posResp;
+        try { posResp = await client.GetPositionsAsync(countFilter: "position", limit: 1000, ct: ct); }
+        catch (Exception ex) { _log.LogWarning(ex, "[stop-loss] Could not fetch positions"); return; }
+
+        foreach (var pos in posResp.MarketPositions
+            .Where(p => p.Position.HasValue && p.Position.Value >= 0.5)) // long YES only
+        {
+            var ticker    = pos.Ticker ?? "";
+            var contracts = (int)Math.Round(pos.Position!.Value);
+            if (contracts < 1 || string.IsNullOrWhiteSpace(ticker)) continue;
+
+            // Estimate entry from total traded (same logic as /api/positions)
+            if (!pos.TotalTraded.HasValue || pos.TotalTraded.Value <= 0) continue;
+            var estEntryCents = Math.Clamp(
+                (int)Math.Round(pos.TotalTraded.Value / contracts * 100), 1, 99);
+
+            // Compute the stop floor: entry × (1 − downPct/100)
+            var downFloor = Math.Max(1, Math.Min(99,
+                (int)Math.Ceiling(estEntryCents * (1.0 - controls.StopLossDownPct / 100.0) - 1e-9)));
+
+            // Fetch current market bid
+            int? bidCents;
+            try
+            {
+                var mkt = await client.GetMarketAsync(ticker, ct);
+                bidCents = mkt.Market?.YesBid ?? mkt.Market?.YesBidFromNo;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "[stop-loss] Could not fetch market for {Ticker}", ticker);
+                continue;
+            }
+
+            if (bidCents is null) continue;
+
+            if (bidCents.Value > downFloor)
+            {
+                _log.LogDebug("[stop-loss] {Ticker} bid={Bid}¢ entry={Entry}¢ floor={Floor}¢ — holding",
+                    ticker, bidCents.Value, estEntryCents, downFloor);
+                continue;
+            }
+
+            _log.LogWarning(
+                "[stop-loss] SELL {Ticker} — bid={Bid}¢ ≤ floor={Floor}¢ (entry={Entry}¢, down={Pct}%)",
+                ticker, bidCents.Value, downFloor, estEntryCents, controls.StopLossDownPct);
+
+            var limitPrice = Math.Max(1, bidCents.Value); // sell at current bid
+            try
+            {
+                if (settings.DryRun)
+                {
+                    _store.RecordEvent("stop_loss_dry_run", new
+                    {
+                        ticker, contracts, estEntryCents, bidCents = bidCents.Value,
+                        downFloor, downPct = controls.StopLossDownPct
+                    });
+                    _log.LogInformation("[stop-loss] DRY RUN sell {Contracts}x {Ticker} @ {Price}¢",
+                        contracts, ticker, limitPrice);
+                }
+                else
+                {
+                    var orderReq = new KalshiBotWrapper.Kalshi.CreateOrderRequest
+                    {
+                        Ticker        = ticker,
+                        ClientOrderId = Guid.NewGuid().ToString("N"),
+                        Side          = "yes",
+                        Action        = "sell",
+                        Count         = contracts,
+                        YesPrice      = limitPrice,
+                        TimeInForce   = "immediate_or_cancel",
+                        Type          = "limit",
+                    };
+                    var orderResp = await client.CreateOrderAsync(orderReq, ct);
+                    var orderId   = orderResp.Order?.OrderId ?? "(unknown)";
+                    _store.RecordEvent("stop_loss_sell", new
+                    {
+                        ticker, contracts, estEntryCents, bidCents = bidCents.Value,
+                        downFloor, downPct = controls.StopLossDownPct, orderId
+                    });
+                    _log.LogInformation(
+                        "[stop-loss] Sold {Contracts}x {Ticker} @ {Price}¢ — order {OrderId}",
+                        contracts, ticker, limitPrice, orderId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[stop-loss] Sell order failed for {Ticker}", ticker);
+            }
+        }
     }
 
     // ── Suggestion resolution ─────────────────────────────────────────────────

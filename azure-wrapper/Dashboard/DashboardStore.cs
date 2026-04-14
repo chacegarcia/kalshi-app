@@ -54,6 +54,14 @@ public sealed record BotControls
     /// </summary>
     [JsonPropertyName("maxOpenPositions")]
     public int MaxOpenPositions { get; init; } = 10;
+
+    /// <summary>
+    /// If &gt; 0: automatically sell a long YES position during each scan pass when the best YES bid
+    /// has fallen this many percent or more below the estimated entry price
+    /// (e.g. 20 = sell when bid ≤ entry − 20% of entry). 0 = disabled.
+    /// </summary>
+    [JsonPropertyName("stopLossDownPct")]
+    public double StopLossDownPct { get; init; } = 0.0;
 }
 
 // ── Suggestion record ─────────────────────────────────────────────────────────
